@@ -1,0 +1,34 @@
+# agent-env standalone profile — the all-local backend stack (no cloud services).
+#
+# Copy to .agentenv/config.toml (git-ignored — your own machine's config) to run
+# agent-env against local backends; generated state (document_store/, object_store/)
+# is git-ignored too.
+
+[stores]
+document = "local"   # SQLite      .agentenv/document_store/documents.db
+object   = "local"   # filesystem  .agentenv/object_store/
+image    = "local"   # local OCI registry (registry:2 at localhost:5000)
+secret   = "local"   # process env vars, or an optional flat YAML file
+
+[sandbox]
+default       = "local"   # envs run as containers on the host Docker daemon
+agent_default = "local"   # agents too
+
+[agents]
+default_a2a_agent_id = "a2a-default"   # what a deploy_agent step that names no agent deploys
+
+[runner]
+impl = "agent_env.runner.local_runner:LocalRunner"
+
+[runner.config]
+workers = 2
+
+[explorer]
+# The explorer is an unauthenticated local control plane, so `agent-env up` always binds
+# loopback (127.0.0.1) — there is no `host` knob. To reach it from another machine, use an
+# SSH tunnel or a loopback-published container port (`-p 127.0.0.1:8234:8234`). A genuinely
+# hosted deployment runs its own `uvicorn agent_env.explorer.app:create_app --factory --host …`
+# and lists its public hostname(s) under `allowed_hosts` below.
+port = 8234        # not 8233 — Temporal's dev-server UI uses 8233
+# allowed_hosts = ["explorer.mybox.internal"]   # extra Host values to accept (a hosted/tunnel bind)
+# static_dir = "path/to/built/ui"   # serve a built UI at /; omit for API-only (or the packaged UI)
