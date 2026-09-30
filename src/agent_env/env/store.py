@@ -7,7 +7,7 @@ import logging
 import random
 import string
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Optional, Self
+from typing import TYPE_CHECKING, Any, Optional, Self, TypeVar
 
 from agent_env.plugins import _registration
 from agent_env.store.base import ConcurrentModificationError, NotFoundError
@@ -26,6 +26,8 @@ from agent_env.store.query import QueryBuilder, to_document_query
 
 if TYPE_CHECKING:
     from agent_env.env.env import DeployedEnv, Env
+
+_E = TypeVar("_E", bound="Env")
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +92,7 @@ class EnvStore:
     def next_version(self, id: str) -> int:
         return self._versioned.next_version(id)
 
-    def put_document(self, env: Env) -> Env:
+    def put_document(self, env: _E) -> _E:
         store = self._doc_store
         existing = store.find_one(
             ENVS_COLLECTION, Filter.of(id=env.id), sort=Sort.by("version", descending=True)
@@ -249,10 +251,10 @@ class EnvInstanceStore:
     def get_loaded_environments(self, instance_id: str, universe_id: str, universe_version: int) -> list[str]:
         """Which of a universe's services are already loaded into this instance.
 
-        Durable rather than context-carried on purpose. The Temporal worker snapshots the
-        step context BEFORE running the step and re-sends that frozen copy on every
-        heartbeat, so progress recorded mid-step never reaches the heartbeat a retry
-        restores from. Mongo is the only place this survives an activity retry.
+        Durable rather than context-carried on purpose. A runner may retry a step from the
+        context as it was before the step started, so progress recorded mid-step never
+        reaches the context a retry restores. The document store is the only place this
+        survives a step retry.
 
         Keyed by universe id AND version, so loading a different universe -- or a new
         version of the same one -- correctly resumes from nothing.
@@ -351,6 +353,7 @@ class EnvInstanceStore:
 
 
 def register_env_instance(deployed_env: DeployedEnv, ttl_seconds: int) -> DeployedEnv:
+    _require_round_trip(deployed_env)
     try:
         return get_env_instance_store().create_instance(deployed_env, ttl_seconds=ttl_seconds)
     except Exception:
@@ -396,3 +399,13 @@ def set_env_instance_store(store: EnvInstanceStore) -> None:
 def reset_env_instance_store() -> None:
     global _env_instance_store
     _env_instance_store = None
+
+
+def _require_round_trip(deployed_env: DeployedEnv) -> None:
+    """Refuse a record that would load back as another class, dropping the fields its own class adds."""
+    from agent_env.env.env import _record_class
+
+    loads_as = _record_class(dataclasses.asdict(deployed_env))
+    if type(deployed_env) is not loads_as:
+        raise TypeError(f"a {type(deployed_env).__name__} record loads back as {loads_as.__name__}, dropping its own "
+                        f"fields; deploy() must return a {loads_as.__name__}")

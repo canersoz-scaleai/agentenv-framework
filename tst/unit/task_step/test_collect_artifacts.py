@@ -9,13 +9,19 @@ inside the a2a `agent-api` container.
 from __future__ import annotations
 
 import asyncio
+import json
+import tempfile
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from agent_env.task_step.context import DeployedAgent, PromptResponse, TaskStepContext
 from agent_env.task_step.task_steps.collect_artifacts import CollectArtifactsTaskStep, _is_url_entry
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, EnvCapabilityUnsupported
+from agent_env.env.gateway.constants import EXT_STEP_URI, GATEWAY_EXTENSIONS, WELL_KNOWN_PATH
+from tst.unit.event_loop_probe import on_event_loop
 
 
 def _run(coro):
@@ -23,24 +29,18 @@ def _run(coro):
 
 
 def _cua_context():
-    return TaskStepContext(
-        instance_id="inst-1",
-        deployed_envs=[DeployedEnv(
-            env_id="ubuntu-cua", env_version=1, gateway_url="http://gw",
-            mcp_url="http://gw", db_web_url=None, sandbox_id="vm-1",
-            metadata={"cua_vm_sandbox_id": "cua-vm-1"},  # CUA marker set by CuaEnv.deploy
-        )],
-    )
+    return TaskStepContext(instance_id="inst-1", deployed_envs=[_cua_record()])
 
 
 def _non_cua_context():
     """A deployed env that is NOT a CUA env (no cua_vm_* metadata marker)."""
     return TaskStepContext(
         instance_id="inst-1",
-        deployed_envs=[DeployedEnv(
+        deployed_envs=[DeployedGatewayEnv(
             env_id="ubuntu-cua", env_version=1, gateway_url="http://gw",
             mcp_url="http://gw", db_web_url=None, sandbox_id="vm-1",
             metadata={"some_other_env": True},
+            environment_card_url=f"http://gw{WELL_KNOWN_PATH}", environment_card=_gateway_card(),
         )],
     )
 
@@ -86,16 +86,7 @@ def _macos_cua_context():
     cua_controller_url (the osworld sidecar, 18768). cua_get_file must go to the
     gateway, not the sidecar — the sidecar's /step only accepts a ScaleCuaAction
     and 500s on a call_tool payload."""
-    return TaskStepContext(
-        instance_id="inst-1",
-        deployed_envs=[DeployedEnv(
-            env_id="macos-cua", env_version=1,
-            gateway_url="http://gw-18765", mcp_url="http://gw-18765/mcp",
-            db_web_url=None, sandbox_id="vm-1",
-            metadata={"cua_vm_sandbox_id": "cua-vm-1",
-                      "cua_controller_url": "http://ctrl-18768"},
-        )],
-    )
+    return TaskStepContext(instance_id="inst-1", deployed_envs=[_macos_record()])
 
 
 class TestControllerPath:
@@ -117,7 +108,7 @@ class TestControllerPath:
             universe.put.return_value = MagicMock(id="inst-1", version=1)
             _run(step.execute(_macos_cua_context()))
         # hit the gateway (18765), NOT the controller sidecar (18768)
-        get_file.assert_awaited_once_with("http://gw-18765", "/Users/admin/Desktop/report.docx")
+        get_file.assert_awaited_once_with(_macos_record(), "/Users/admin/Desktop/report.docx")
 
     def test_collects_via_controller_when_env_id_set(self):
         step = CollectArtifactsTaskStep(
@@ -136,13 +127,69 @@ class TestControllerPath:
             ctx = _run(step.execute(_cua_context()))
 
         # fetched the absolute Desktop path through the controller
-        get_file.assert_awaited_once_with("http://gw", "/home/docker/Desktop/report.pdf")
+        get_file.assert_awaited_once_with(_cua_record(), "/home/docker/Desktop/report.pdf")
         # uploaded and recorded the S3 URI
         assert ctx.metadata["artifacts"] == {"report.pdf": "s3://bucket/report.pdf"}
         assert ctx.metadata["collected_artifacts"]["collect-artifacts"]["artifacts"] == {
             "report.pdf": "s3://bucket/report.pdf"
         }
         store.put_object_file.assert_called_once()
+
+    def test_the_controller_path_uploads_off_the_event_loop(self):
+        step = CollectArtifactsTaskStep(
+            id="collect-artifacts", version=None, env_id="ubuntu-cua",
+            base_path="/home/docker/Desktop", artifact_paths=["report.pdf"],
+        )
+        on_loop: list[bool] = []
+        store = MagicMock()
+        store.put_object_file.side_effect = lambda **kw: on_loop.append(on_event_loop()) or "s3://bucket/report.pdf"
+        store.next_version.return_value = 1
+        with patch.object(step, "_controller_get_file", new_callable=AsyncMock, return_value=b"%PDF"), \
+             patch("agent_env.artifact.store.get_artifact_store", return_value=store), \
+             patch("agent_env.artifact.FileArtifactUniverse") as universe:
+            universe.put.return_value = MagicMock(id="inst-1", version=1)
+            _run(step.execute(_cua_context()))
+        assert on_loop == [False]
+
+    def test_a_cancel_mid_upload_leaves_the_file_to_the_upload(self, caplog, monkeypatch, tmp_path):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        step = CollectArtifactsTaskStep(
+            id="collect-artifacts", version=None, env_id="ubuntu-cua",
+            base_path="/home/docker/Desktop", artifact_paths=["report.pdf"],
+        )
+        uploading, release, uploaded = threading.Event(), threading.Event(), []
+
+        def put_object_file(**kw):
+            uploading.set()
+            release.wait(5)
+            with open(kw["file_path"], "rb") as fh:
+                uploaded.append(fh.read())
+            return "s3://bucket/report.pdf"
+
+        store = MagicMock()
+        store.put_object_file.side_effect = put_object_file
+        store.next_version.return_value = 1
+
+        async def run():
+            collect = asyncio.create_task(step.execute(_cua_context()))
+            await asyncio.to_thread(uploading.wait, 5)
+            collect.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await collect
+            release.set()
+            for _ in range(100):
+                if "finished after its caller was cancelled" in caplog.text:
+                    return
+                await asyncio.sleep(0.02)
+
+        with patch.object(step, "_controller_get_file", new_callable=AsyncMock, return_value=b"%PDF-1.4"), \
+             patch("agent_env.artifact.store.get_artifact_store", return_value=store), \
+             patch("agent_env.artifact.FileArtifactUniverse"), \
+             caplog.at_level("INFO", logger="agent_env.task_step.thread_work"):
+            _run(run())
+        assert uploaded == [b"%PDF-1.4"]
+        assert "finished after its caller was cancelled" in caplog.text
+        assert list(tmp_path.iterdir()) == []
 
     def test_enumeration_unwraps_the_cua_bash_json_envelope(self):
         """The regression: cua_bash wraps stdout, cua_get_file does not.
@@ -161,7 +208,7 @@ class TestControllerPath:
         )
         with patch.object(step, "_controller_call", new_callable=AsyncMock,
                           return_value=envelope):
-            names = _run(step._controller_list_dir("http://gw"))
+            names = _run(step._controller_list_dir(_cua_record()))
         assert names == ["smoke.txt", "nested/report.pdf"]
 
     def test_enumeration_tolerates_plain_stdout(self):
@@ -172,7 +219,7 @@ class TestControllerPath:
         )
         with patch.object(step, "_controller_call", new_callable=AsyncMock,
                           return_value="smoke.txt\nreport.pdf\n"):
-            names = _run(step._controller_list_dir("http://gw"))
+            names = _run(step._controller_list_dir(_cua_record()))
         assert names == ["smoke.txt", "report.pdf"]
 
     def test_enumeration_of_an_empty_desktop_yields_nothing(self):
@@ -182,7 +229,7 @@ class TestControllerPath:
         )
         with patch.object(step, "_controller_call", new_callable=AsyncMock,
                           return_value='{"error": "", "output": "", "returncode": 0}'):
-            names = _run(step._controller_list_dir("http://gw"))
+            names = _run(step._controller_list_dir(_cua_record()))
         assert names == []
 
     def test_absolute_paths_bypass_base_path(self):
@@ -205,7 +252,7 @@ class TestControllerPath:
             ctx = _run(step.execute(_cua_context()))
 
         # read at the exact absolute path — NOT joined to base_path
-        get_file.assert_awaited_once_with("http://gw", "/tmp/output/result.pdf")
+        get_file.assert_awaited_once_with(_cua_record(), "/tmp/output/result.pdf")
         # keyed by the full source path (so the UI can show where it came from)
         assert ctx.metadata["artifacts"] == {
             "/tmp/output/result.pdf": "s3://bucket/tmp/output/result.pdf"
@@ -222,7 +269,7 @@ class TestControllerPath:
         store.put_object_file.return_value = "s3://bucket/there.pdf"
         store.next_version.return_value = 1
 
-        async def fake_get(gateway_url, path):
+        async def fake_get(deployed_env, path):
             if path.endswith("gone.pdf"):
                 raise RuntimeError("cua_get_file failed: file not found")
             return b"data"
@@ -300,7 +347,7 @@ class TestControllerPath:
         with patch.object(step, "_controller_list_dir", new_callable=AsyncMock, return_value=[]) as list_dir, \
              patch("agent_env.artifact.store.get_artifact_store", return_value=MagicMock()):
             ctx = _run(step.execute(_cua_context()))
-        list_dir.assert_awaited_once_with("http://gw")
+        list_dir.assert_awaited_once_with(_cua_record())
         assert ctx.metadata["artifacts"] == {}
 
     def test_url_only_list_skips_enumeration_on_the_container_path(self):
@@ -356,7 +403,7 @@ class TestControllerPath:
              patch("agent_env.artifact.FileArtifactUniverse") as universe:
             universe.put.return_value = MagicMock(id="inst-1", version=1)
             ctx = _run(step.execute(ctx))
-        get_file.assert_awaited_once_with("http://gw", "/home/docker/Desktop/right.pdf")
+        get_file.assert_awaited_once_with(_cua_record(), "/home/docker/Desktop/right.pdf")
         assert ctx.metadata["artifacts"] == {"right.pdf": "s3://bucket/right.pdf"}
 
     def test_unknown_env_id_raises(self):
@@ -408,7 +455,7 @@ class TestAgentContainerPath:
         provider.get_sandbox = AsyncMock(return_value=sandbox)
         provider.close = AsyncMock()
         with patch(
-            "agent_env.providers.sandbox_provider.get_agent_sandbox_provider",
+            "agent_env.providers.sandbox_providers.sandbox_provider.get_agent_sandbox_provider",
             return_value=provider,
         ), patch("agent_env.artifact.store.get_artifact_store", return_value=MagicMock()):
             try:
@@ -641,7 +688,7 @@ class TestSandboxContainerPath:
 
         with patch.object(step, "_resolve_live_sandbox", AsyncMock(return_value=sandbox)), \
              patch.object(step, "_collect_items", AsyncMock(return_value=({"page.html": "s3://x"}, {}))) as collect, \
-             patch("agent_env.providers.sandbox_provider.build_sandbox_provider",
+             patch("agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider",
                    return_value=provider):
             collected, _ = _run(
                 step._collect_via_sandbox_container(self._context(), MagicMock(), "aid", 1)
@@ -650,3 +697,62 @@ class TestSandboxContainerPath:
         assert collected == {"page.html": "s3://x"}
         # The explicitly named container is used — never discovery, which would find nothing here.
         assert collect.await_args.args[2] == "scraper"
+
+
+class TestControllerWire:
+    def test_controller_call_posts_call_tool_to_the_cards_step_endpoint(self, monkeypatch):
+        """The #693 intent at the wire: call_tool goes to the gateway's step/v1 (18765), never the macOS sidecar (18768)."""
+        sent = _mock_gateway(monkeypatch, {"content": [{"type": "text", "text": "aGk="}]})
+        step = CollectArtifactsTaskStep(id="collect", version=None, env_id="macos-cua", artifact_paths=["/x"])
+
+        text = _run(step._controller_call(_macos_record(), "cua_get_file", {"path": "/Users/admin/Desktop/x"}))
+
+        [request] = sent
+        assert (request.method, str(request.url)) == ("POST", "http://gw-18765/step")
+        assert json.loads(request.content) == {"action": "call_tool", "tool_name": "cua_get_file",
+                                               "arguments": {"path": "/Users/admin/Desktop/x"}}
+        assert request.extensions["timeout"]["read"] == 600
+        assert text == "aGk="
+
+    def test_a_card_without_step_raises_before_any_read(self, monkeypatch):
+        sent = _mock_gateway(monkeypatch, {})
+        step = CollectArtifactsTaskStep(id="collect", version=None, env_id="ubuntu-cua",
+                                        base_path="/home/docker/Desktop")
+        no_step = [e for e in GATEWAY_EXTENSIONS if e["uri"] != EXT_STEP_URI]
+        ctx = TaskStepContext(instance_id="inst-1", deployed_envs=[_cua_record(no_step)])
+
+        with pytest.raises(EnvCapabilityUnsupported, match="does not offer 'step' on urn:agentenv:step/v1"):
+            _run(step.execute(ctx))
+        assert sent == []
+
+
+def _gateway_card(extensions: list = GATEWAY_EXTENSIONS) -> dict:
+    """The gateway's own card, advertising `extensions`."""
+    return {"name": "gw", "capabilities": {"extensions": extensions}}
+
+
+def _cua_record(extensions: list = GATEWAY_EXTENSIONS) -> DeployedEnv:
+    """An Ubuntu CUA env (the marker CuaEnv.deploy sets) whose stored card is the gateway's."""
+    return DeployedGatewayEnv(env_id="ubuntu-cua", env_version=1, gateway_url="http://gw", mcp_url="http://gw", db_web_url=None,
+                       sandbox_id="vm-1", metadata={"cua_vm_sandbox_id": "cua-vm-1"},
+                       environment_card_url=f"http://gw{WELL_KNOWN_PATH}", environment_card=_gateway_card(extensions))
+
+
+def _macos_record() -> DeployedEnv:
+    """A macOS CUA env: the gateway (CUA MCP server, 18765) plus a distinct osworld sidecar (18768)."""
+    return DeployedGatewayEnv(env_id="macos-cua", env_version=1, gateway_url="http://gw-18765", mcp_url="http://gw-18765/mcp",
+                       db_web_url=None, sandbox_id="vm-1",
+                       metadata={"cua_vm_sandbox_id": "cua-vm-1", "cua_controller_url": "http://ctrl-18768"},
+                       environment_card_url=f"http://gw-18765{WELL_KNOWN_PATH}", environment_card=_gateway_card())
+
+
+def _mock_gateway(monkeypatch, body: dict) -> list[httpx.Request]:
+    """Answer every request the protocol client sends with `body`; return the requests."""
+    sent, real = [], httpx.AsyncClient
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle)))
+    return sent

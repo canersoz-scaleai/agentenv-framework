@@ -9,6 +9,7 @@ import asyncio
 import click
 
 from agent_env.env import Env, MultiEnv
+from agent_env.store.routing import run_scope
 
 # A durable store can't be shorter-lived than a normal run, so the floor is the default run TTL
 # (agent-env's current default, mirrored from cli/env/deploy.py).
@@ -21,7 +22,7 @@ def _resolve_environment_names(env: Env) -> list[str]:
     """One schema per DB-client environment. A MultiEnv contributes its MCP + website environments; a
     standalone servicedb-backed env contributes its single one.
 
-    Must match the list the gateway passes to ``prepare`` at deploy (``GatewayProvider._all_environments``,
+    Must match the list the gateway passes to ``prepare`` at deploy (``EnvironmentGatewayProvider._all_environments``,
     the authoritative one) — including the ``website_browser`` server the gateway auto-adds whenever an
     env has websites. A name missing here yields a base without that schema, and the deploy then builds
     it a silently-empty overlay."""
@@ -41,7 +42,7 @@ def _resolve_environment_names(env: Env) -> list[str]:
 
 # TODO: right now this takes an `--id` param because the schemas to initialize the EnvStateInstance with is
 # derived from the env. Refactor this to use environment_cards, and consolidate _resolve_environment_names with the 
-# same logic in GatewayProvider._all_environments, so that the code can't drift
+# same logic in EnvironmentGatewayProvider._all_environments, so that the code can't drift
 @click.command(name="init-env-state")
 @click.option("--id", "env_id", required=True, help="Env id")
 @click.option("--env-state-type", "env_state_type", default=None,
@@ -54,7 +55,7 @@ def _resolve_environment_names(env: Env) -> list[str]:
                    f"default {DEFAULT_TTL_SECONDS} = 30 days)")
 def init_env_state(env_id: str, env_state_type: str | None, ttl_seconds: int):
     """Pre-initialize a durable remote state store for an env and print its instance id."""
-    from agent_env.providers.state import (
+    from agent_env.providers.env_state import (
         acquire_state_for_deploy,
         build_state_provider,
     )
@@ -90,7 +91,8 @@ def init_env_state(env_id: str, env_state_type: str | None, ttl_seconds: int):
             await build_state_provider(state_type).prepare(environment_names, instance=inst)
         return inst
 
-    instance = asyncio.run(_init())
+    with run_scope(env.id):
+        instance = asyncio.run(_init())
     if instance is None:
         raise click.BadParameter(
             f"env state type '{env_state_type}' cannot be pre-initialized out-of-band",

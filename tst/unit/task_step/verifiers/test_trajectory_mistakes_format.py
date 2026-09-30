@@ -175,7 +175,7 @@ def test_override_is_a_pure_parameter_not_step_config():
 
 # ── the shared rules are platform-neutral; product policy arrives via grading_policy_prompt ──
 
-# What an iOS task now puts in its `grading_policy_prompt` to get the rule the shared text used to carry.
+# What a task now puts in its `grading_policy_prompt` to get the rule the shared text used to carry.
 _AUTOCOMPLETE_POLICY = """ALWAYS A MISTAKE — autocomplete / suggestion shortcuts. The task prompt is the reference: the
 agent must type the prompt's target out IN FULL and end up on it. Severity "high", never lower.
 A recent search, suggestion chip, Siri Suggestion, Spotlight top hit, AutoFill prompt, or QuickType row
@@ -184,8 +184,8 @@ _PLATFORM_WORDS = ("autocomplete", "siri", "spotlight", "autofill", "quicktype",
 
 
 def test_shared_mistake_rules_carry_no_platform_policy():
-    """The autocomplete / suggestion-shortcut rule (Siri Suggestion, Spotlight top hit, QuickType...) was iOS
-    product policy living in the shared instructions, so every trajectory_mistakes and
+    """The autocomplete / suggestion-shortcut rule (Siri Suggestion, Spotlight top hit, QuickType...) was
+    one platform's product policy living in the shared instructions, so every trajectory_mistakes and
     rubric_evidence_with_mistakes user got it whether or not it applied. It now belongs in the task's
     grading_policy_prompt; the shared text keeps only what is true of any trajectory."""
     shared = [_TRAJECTORY_MISTAKES_INSTRUCTIONS]
@@ -282,8 +282,8 @@ def test_severity_ladder_is_defined_for_every_rung():
 
 
 def test_high_severity_finding_renders_the_marker_the_gate_reads():
-    """The CUA harness repo's golden_judge._stored_signals greps "[high]" out of the justification to
-    compute fb_high; keep that contract pinned from this side."""
+    """A downstream gate greps "[high]" out of the justification; keep that contract pinned from
+    this side."""
     resp = json.dumps({
         "findings": [{"severity": "high", "step": 5, "should": "type the full query",
                       "description": "typed 'piz' then tapped the suggestion"}],
@@ -296,7 +296,7 @@ def test_high_severity_finding_renders_the_marker_the_gate_reads():
 
 
 # --- harness faults must not be charged to the agent (2026-08-12) --------------------------------
-# Measured over the ios-cua-l1-current-prompts corpus: 178 runs have judge findings quoting a harness
+# In a corpus of recorded runs, 178 have judge findings quoting a harness
 # error, and 9 of 1161 [high]/[critical] findings ARE the harness error itself. An independent harness
 # review of 16 runs found tool 500s / Server-disconnected as its #2 ranked bug and noted "invisible
 # tool errors need tool-log detectors, not vision-only prompting" — i.e. the agent is being penalised
@@ -324,7 +324,7 @@ def test_carve_out_does_not_excuse_blind_repetition():
 
 
 def test_verified_false_is_explicitly_not_a_mistake():
-    """The agent is INSTRUCTED to treat verified:false as entered (ios_cua_core.py section 8), so
+    """The agent is INSTRUCTED to treat verified:false as entered (by its harness's system prompt), so
     flagging it punishes the agent for following its own instructions."""
     p = _mistakes_prompt()
     i = p.index("verified:false in particular")

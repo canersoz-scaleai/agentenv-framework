@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 
+from agent_env.config import set_object_store
+from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox
 from agent_env.task_step.task_steps.run_docker_container import (
     RunDockerContainerTaskStep as Step,
 )
+from tst.unit.store.fakes import FakeObjectStore
 
 
 def _step(**kw):
@@ -116,3 +122,88 @@ def test_device_fields_default_empty():
     # None normalizes to empty lists through a to_dict/from_dict roundtrip
     restored = Step.from_dict(_step(devices=None, cap_add=None, volumes=None).to_dict())
     assert restored.devices == [] and restored.cap_add == [] and restored.volumes == []
+
+
+class _StagingSandbox:
+    def __init__(self):
+        self.loaded: list[tuple[str, str]] = []
+        self.scripts: list[str] = []
+
+    async def load_s3_file(self, url, destination_path):
+        self.loaded.append((url, destination_path))
+
+    async def exec_script(self, script):
+        self.scripts.append(script)
+        return ""
+
+
+@pytest.fixture
+def fake_store():
+    store = FakeObjectStore()
+    set_object_store(store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_a_context_zip_in_the_configured_store_loads_through_the_store(fake_store):
+    """Recognised by the store, not by an s3:// prefix; a '#' in the key is kept."""
+    url = fake_store.object_url("contexts/build#2.zip")
+    sandbox = _StagingSandbox()
+
+    await Step._stage_zip_from_url(sandbox, url, "/work")
+
+    assert sandbox.loaded == [(url, "/work/_context.zip")]
+    assert len(sandbox.scripts) == 1 and sandbox.scripts[0].startswith("unzip ")
+
+
+@pytest.mark.asyncio
+async def test_a_context_zip_from_a_non_s3_store_unpacks_in_a_real_local_sandbox(fake_store, tmp_path):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("Dockerfile", "FROM scratch\n")
+    url = fake_store.put("contexts/build#2.zip", buffer.getvalue())
+
+    await Step._stage_zip_from_url(LocalSandbox(work_dir=tmp_path / "work"), url, "/app/ctx")
+
+    assert (tmp_path / "work" / "ctx" / "Dockerfile").read_text() == "FROM scratch\n"
+    assert not (tmp_path / "work" / "ctx" / "_context.zip").exists()
+
+
+@pytest.mark.asyncio
+async def test_an_https_context_zip_is_fetched_with_curl(fake_store):
+    sandbox = _StagingSandbox()
+
+    await Step._stage_zip_from_url(sandbox, "https://example.test/ctx.zip?sig=1", "/work")
+
+    assert sandbox.loaded == []
+    assert sandbox.scripts[0].startswith("curl ") and "https://example.test/ctx.zip?sig=1" in sandbox.scripts[0]
+
+
+@pytest.mark.asyncio
+async def test_a_context_url_outside_the_stores_own_root_is_still_read_through_the_store(fake_store):
+    """The store reaches whatever its backend can, another bucket say; callers don't pre-filter."""
+    sandbox = _StagingSandbox()
+
+    await Step._stage_zip_from_url(sandbox, "fake://shared/ctx.zip", "/work")
+
+    assert sandbox.loaded == [("fake://shared/ctx.zip", "/work/_context.zip")]
+
+
+@pytest.mark.asyncio
+async def test_a_context_url_without_a_scheme_is_refused(fake_store):
+    sandbox = _StagingSandbox()
+
+    with pytest.raises(ValueError, match="must be an object store url or an http"):
+        await Step._stage_zip_from_url(sandbox, "contexts/ctx.zip", "/work")
+    assert sandbox.loaded == [] and sandbox.scripts == []
+
+
+@pytest.mark.asyncio
+async def test_a_store_context_that_is_not_a_zip_is_refused(fake_store):
+    sandbox = _StagingSandbox()
+
+    with pytest.raises(NotImplementedError, match="tar archives"):
+        await Step._stage_zip_from_url(sandbox, fake_store.object_url("ctx.tar.gz"), "/work")
+    with pytest.raises(ValueError, match="Unsupported archive format"):
+        await Step._stage_zip_from_url(sandbox, fake_store.object_url("ctx.bin"), "/work")
+    assert sandbox.loaded == []

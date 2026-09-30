@@ -6,7 +6,7 @@ import click
 
 from agent_env.a2a_agent import A2AAgent
 from agent_env.artifact import DockerImageArtifact
-from agent_env.cli.utils import build_platform_option, detect_env_metadata, docker_build_platform_args
+from agent_env.cli.utils import build_platform_option, detect_env_metadata, docker_build_platform_args, skips_local_validation
 
 
 @click.command()
@@ -80,7 +80,7 @@ def put(agent_id: str, dockerfile: str, context_path: str | None, env_var_pairs:
     )
     click.echo(f"Created A2A agent: id={agent.id} version={agent.version} image={artifact.id}:{artifact.version}")
 
-    if not skip_validation:
+    if not skip_validation and not skips_local_validation(agent_id, "agent"):
         from agent_env.cli.a2a_agent.validate import run_validation
         click.echo()
         run_validation(agent, litellm_api_key=litellm_api_key)

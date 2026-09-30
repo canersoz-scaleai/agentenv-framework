@@ -5,7 +5,7 @@ That the agent gets a *working* isolated daemon end-to-end is covered by
 test_enable_docker_e2e.py against a real sandbox VM.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -51,15 +51,9 @@ async def test_enable_docker_refuses_non_vm_sandbox():
     agent = _agent()
     sandbox = AsyncMock()
     sandbox.mode = "modal"
-    # boto3 (AWS creds) and get_config (secrets) are the external seams deploy()
-    # hits before the guard; stub them so the test is hermetic.
-    with patch("agent_env.a2a_agent.a2a_agent.boto3.Session") as session, patch(
-        "agent_env.config.get_config"
-    ):
-        session.return_value.get_credentials.return_value = None
-        with pytest.raises(ValueError, match="VM sandbox"):
-            await agent.deploy(
-                sandbox=sandbox,
-                enable_docker=True,
-                env_vars={"LITELLM_API_KEY": "k", "LITELLM_BASE_URL": "http://x"},
-            )
+    with pytest.raises(ValueError, match="VM sandbox"):
+        await agent.deploy(
+            sandbox=sandbox,
+            enable_docker=True,
+            env_vars={"LITELLM_API_KEY": "k", "LITELLM_BASE_URL": "http://x"},
+        )

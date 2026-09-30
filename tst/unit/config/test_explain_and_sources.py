@@ -22,6 +22,7 @@ from agent_env.cli.config import render_explain
 from agent_env.config import loader as config_loader
 from agent_env.config import snapshot
 from agent_env.config.errors import ConfigError
+from agent_env.config.paths import state_root
 from agent_env.config.describe import (
     env_sources,
     MASK,
@@ -43,6 +44,9 @@ config = { uri = "secret:mongodb_uri", database = "agent_env_dev" }
 [model]
 provider = "litellm"
 api_key = "hunter2"
+
+[plugins.agentenv-demo]
+timeout = 30
 """
 
 
@@ -135,12 +139,13 @@ def test_sources_masks_an_env_override(config_file, monkeypatch):
     assert layer.present and layer.detail == MASK
 
 
-def test_neither_command_creates_the_agentenv_dir(tmp_path, monkeypatch):
+def test_neither_command_creates_the_agentenv_dir_or_the_state_root(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(config_loader.ENV_CONFIG_PATH, raising=False)
     sources()
     explain_path("stores.document")
     assert not (tmp_path / ".agentenv").exists()
+    assert not state_root().exists()
 
 
 def test_sources_says_how_the_file_was_found(config_file, tmp_path, monkeypatch):
@@ -162,9 +167,9 @@ _NOT_CONFIGURATION = {"USER"}
 def _env_vars_read_by(root):
     """Every environment variable name agent-env reads, resolved through module constants.
 
-    The whole package, not just `agent_env.config`: `AGENT_ENV_RDS_*` overrides the state
-    provider's own credential lookup from `providers/`, and a checklist scoped to the
-    config package would call itself complete while omitting it.
+    The whole package, not just `agent_env.config`: the Modal provider reads
+    `AGENT_ENV_MODAL_APP_NAME` from `providers/`, and a checklist scoped to the config
+    package would call itself complete while omitting it.
     """
     found = set()
     for module in root.rglob("*.py"):
@@ -205,14 +210,6 @@ def test_the_guard_resolves_a_variable_hidden_behind_a_module_constant():
     # LITELLM_API_KEY is only ever read as `os.getenv(_ENV_API_KEY)`, so a guard that
     # matched literals alone would never have seen it.
     assert "LITELLM_API_KEY" in _env_vars_read_by(pathlib.Path(agent_env.__file__).parent)
-
-
-def test_the_rds_override_group_is_listed(config_file):
-    # It overrides the state provider's own lookup all-or-nothing, from outside the
-    # config package — the exact shape a package-scoped checklist would miss.
-    rds = {s.where for s in sources() if "RDS" in s.where}
-    assert "$AGENT_ENV_RDS_HOST" in rds and len(rds) == 8
-    assert all(s.shadows == "state.providers" for s in sources() if "RDS" in s.where)
 
 
 def test_an_ancestor_path_reports_its_sections_not_the_file_table(config_file, monkeypatch):
@@ -458,6 +455,7 @@ def test_every_explain_response_carries_the_same_json_keys(config_file):
     """Splitting the types was for this module's clarity; a caller that indexes the keys
     should not be able to tell. An ancestor answered with a different key set breaks it."""
     shapes = {p: set(json.loads(_run(["explain", p, "--json"]).output))
-              for p in ("stores", "stores.document", "model.api_key", "nothing.here")}
+              for p in ("stores", "stores.document", "model.api_key", "nothing.here",
+                        "plugins", "plugins.agentenv-demo.timeout")}
     assert len(set(map(frozenset, shapes.values()))) == 1, shapes
     assert "children" in next(iter(shapes.values()))

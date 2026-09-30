@@ -1,0 +1,609 @@
+"""How agent-env and an A2A agent move objects: the form each extension call takes, the grants it
+carries, the call itself, and the limits and time budget that bound it."""
+from __future__ import annotations
+
+import logging
+import math
+import re
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, TypeVar
+
+import httpx
+from agentenv_protocol.a2a_agent import (
+    BundleSkillRequest,
+    ChangelogIncrement,
+    ContextObjectTrajectoryRequest,
+    ContextTrajectoryRequest,
+    InlineSkillRequest,
+    NamespaceChangelogEnableRequest,
+    ObjectChangelogApplyRequest,
+    ObjectChangelogApplyResponse,
+    ObjectSnapshotLoadRequest,
+    ObjectSnapshotSaveRequest,
+    SkillBundle,
+    SkillBundleFile,
+    SnapshotReadObjects,
+    SnapshotWriteObjects,
+    TaskObjectTrajectoryRequest,
+    TaskTrajectoryRequest,
+    TrajectoryObjectsResponse,
+    TrajectoryWriteObjects,
+    card_request_accepts,
+    request_fields,
+)
+from agentenv_protocol.transfers import ReadObject, WriteNamespaceGrant, WriteObject
+from pydantic import BaseModel, ValidationError
+
+from agent_env.a2a_agent.protocol import raise_for_extension_status
+from agent_env.store.base import GrantUnavailableError
+from agent_env.store.object_store import DEFAULT_CONTENT_TYPE, ObjectStore
+
+logger = logging.getLogger(__name__)
+
+# "objects": the call carries grants and the agent moves the bytes. "legacy": every form that
+# carries none, the inline ones and the older S3 ones.
+TransferMode = Literal["objects", "legacy"]
+_Response = TypeVar("_Response", bound=BaseModel)
+_MEDIA_TYPE = re.compile(r"[!#$&^_.+\-|~0-9a-z]+/[!#$&^_.+\-|~0-9a-z]+")
+_INCREMENT_NAME = re.compile(r"^(?P<sequence>[0-9]{6})(?:\.[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+
+# The time budget of one transfer, outermost first: a grant outlives agent-env's wait for the
+# agent's answer, which outlasts the SDK's retries of stalled connections
+# (agentenv_protocol.transfers.TRANSFER_STALL_BUDGET_SECONDS).
+GRANT_LIFETIME_SECONDS = 3600
+TRANSFER_TIMEOUT_SECONDS = 600  # a call during which the agent moves objects
+REPLY_TIMEOUT_SECONDS = 120  # a call during which it moves none
+
+
+@dataclass(frozen=True)
+class ObjectLimits:
+    max_objects: int
+    max_object_bytes: int
+    max_total_bytes: int
+
+
+_GIB = 1024 * 1024 * 1024
+DEFAULT_TRAJECTORY_MAX_BYTES = _GIB
+DEFAULT_SNAPSHOT_TRAJECTORY_MAX_BYTES = _GIB
+DEFAULT_SNAPSHOT_WORKSPACE_MAX_BYTES = 5 * _GIB
+SKILL_BUNDLE_LIMITS = ObjectLimits(max_objects=1_000, max_object_bytes=_GIB, max_total_bytes=_GIB)
+CHANGELOG_LIMITS = ObjectLimits(
+    max_objects=10_000, max_object_bytes=_GIB, max_total_bytes=10 * _GIB
+)
+
+SNAPSHOT_TRAJECTORY_OBJECT_NAME = "trajectory"
+SNAPSHOT_WORKSPACE_OBJECT_NAME = "workspace"
+# A portable snapshot's objects, each opaque bytes, and the most each may hold.
+_SNAPSHOT_OBJECTS = {
+    SNAPSHOT_TRAJECTORY_OBJECT_NAME: DEFAULT_SNAPSHOT_TRAJECTORY_MAX_BYTES,
+    SNAPSHOT_WORKSPACE_OBJECT_NAME: DEFAULT_SNAPSHOT_WORKSPACE_MAX_BYTES,
+}
+_OPAQUE = "application/octet-stream"
+
+# The S3 forms the SDK retired; older and hand-written Agent Cards still take them.
+_S3_PREFIX = ("s3_prefix",)
+_SKILL_S3_URL = ("name", "description", "skill_s3_url")
+_SNAPSHOT_SAVE_S3_PREFIX = ("context_id", "s3_prefix")
+
+
+def _fields(model: type[BaseModel]) -> tuple[str, ...]:
+    return request_fields(model).required
+
+
+def is_portable_snapshot(file_names: Collection[str]) -> bool:
+    """Whether a snapshot was captured through the object form, which names its trajectory
+    object ``trajectory``; an older capture holds the runtime's own files."""
+    return SNAPSHOT_TRAJECTORY_OBJECT_NAME in file_names
+
+
+def choose_transfer(
+    method: Mapping[str, Any] | None,
+    *,
+    objects: Collection[str] | None = None,
+    legacy: Collection[str] | None = None,
+    store: ObjectStore,
+) -> TransferMode | None:
+    """How one extension call moves its objects, given the fields each form it can take sends.
+
+    Objects need a store that issues grants. A method without a declared request predates
+    variant negotiation and takes the legacy form. None: the agent takes neither form.
+    """
+    if objects is not None and _accepts(method, objects) and store.supports_transfer_grants:
+        return "objects"
+    if legacy is not None and (
+        method is None or "request" not in method or _accepts(method, legacy)
+    ):
+        return "legacy"
+    return None
+
+
+def _accepts(method: Mapping[str, Any] | None, fields: Collection[str]) -> bool:
+    request = method.get("request") if method is not None else None
+    return isinstance(request, Mapping) and card_request_accepts(request, fields)
+
+
+@dataclass(frozen=True)
+class TransferCall:
+    """One extension call ready to send: the form it takes and its body."""
+
+    mode: TransferMode
+    payload: dict[str, Any]
+
+
+async def invoke_transfer(
+    url: str,
+    call: TransferCall,
+    *,
+    verb: Literal["POST", "PUT"],
+    operation: str,
+    timeout: float,
+    response_model: type[_Response] | None = None,
+) -> Any:
+    """Send ``call`` and return the agent's answer, validated against ``response_model`` when
+    the call carried grants. An error never quotes the answer to such a call, which may echo a
+    grant."""
+    async with httpx.AsyncClient() as client:
+        send = client.post if verb == "POST" else client.put
+        resp = await send(url, json=call.payload, timeout=timeout)
+    raise_for_extension_status(resp, operation=operation, include_body=call.mode == "legacy")
+    body = resp.json()
+    if call.mode == "objects" and response_model is not None:
+        return parse_response(response_model, body, operation=operation)
+    return body
+
+
+def parse_response(model: type[_Response], body: Any, *, operation: str) -> _Response:
+    """Validate an agent's ``operation`` response, ignoring fields this release does not know."""
+    try:
+        return model.model_validate(body, extra="ignore")
+    except ValidationError as exc:
+        raise RuntimeError(f"{operation} returned an invalid object response") from exc
+
+
+def write_object(store: ObjectStore, url: str, *, media_type: str, max_bytes: int) -> WriteObject:
+    """A write grant for one object, promising no more than one upload to the store can create."""
+    if store.max_single_upload_bytes is not None:
+        max_bytes = min(max_bytes, store.max_single_upload_bytes)
+    return WriteObject(
+        media_type=media_type,
+        max_bytes=max_bytes,
+        write=store.issue_write_grant(
+            url, media_type=media_type, max_bytes=max_bytes, expires_in=GRANT_LIFETIME_SECONDS
+        ),
+    )
+
+
+def read_object(
+    store: ObjectStore, url: str, *, media_type: str | None = None, max_bytes: int | None = None
+) -> ReadObject:
+    """A read grant for the stored object at ``url``, bounded by its size unless ``max_bytes``
+    is given. ``media_type`` defaults to the stored content type."""
+    metadata = store.get_object_metadata_at(url)
+    if metadata is None or metadata.size is None:
+        raise ValueError(f"object metadata is unavailable for {url}")
+    stored_type = (metadata.content_type or "").partition(";")[0].strip().lower()
+    if not _MEDIA_TYPE.fullmatch(stored_type):
+        stored_type = DEFAULT_CONTENT_TYPE
+    return ReadObject(
+        media_type=media_type or stored_type,
+        max_bytes=max_bytes or max(metadata.size, 1),
+        size_bytes=metadata.size,
+        read=store.issue_read_grant(url, expires_in=GRANT_LIFETIME_SECONDS),
+    )
+
+
+def read_objects_under(
+    store: ObjectStore,
+    prefix: str,
+    *,
+    limits: ObjectLimits,
+    media_type: str | None = None,
+    select: Callable[[str], bool] | None = None,
+) -> list[tuple[str, ReadObject]]:
+    """Read grants for the objects below ``prefix`` that ``select`` keeps, keyed and ordered by
+    their path relative to it. The limits count stored bytes, as a namespace uploader does."""
+    prefix = prefix.rstrip("/") + "/"
+    prefix_key = store.get_object_key(prefix).rstrip("/") + "/"
+    listed = sorted(
+        (store.get_object_key(url)[len(prefix_key):], url) for url in store.list_at(prefix)
+    )
+    if select is not None:
+        listed = [(path, url) for path, url in listed if select(path)]
+    if len(listed) > limits.max_objects:
+        raise ValueError(
+            f"{len(listed)} objects under {prefix}; the limit is {limits.max_objects}"
+        )
+    described: list[tuple[str, ReadObject]] = []
+    total_bytes = 0
+    for path, url in listed:
+        descriptor = read_object(store, url, media_type=media_type)
+        if descriptor.size_bytes > limits.max_object_bytes:
+            raise ValueError(f"{url} exceeds the {limits.max_object_bytes}-byte object limit")
+        total_bytes += descriptor.size_bytes
+        if total_bytes > limits.max_total_bytes:
+            raise ValueError(
+                f"objects under {prefix} exceed the {limits.max_total_bytes}-byte limit"
+            )
+        described.append((path, descriptor))
+    return described
+
+
+def namespace_grant(
+    store: ObjectStore, namespace_url: str, *, limits: ObjectLimits, expires_in: int
+) -> WriteNamespaceGrant:
+    """A grant for uploads below ``namespace_url``: the store signs the upload policy, and the
+    uploader holds to the object count and total size."""
+    policy = store.issue_upload_policy(
+        namespace_url.rstrip("/") + "/",
+        max_object_bytes=limits.max_object_bytes,
+        expires_in=expires_in,
+    )
+    return WriteNamespaceGrant(
+        root_path=store.get_object_key(namespace_url).rstrip("/"),
+        expires_at=policy.expires_at,
+        max_objects=limits.max_objects,
+        max_object_bytes=limits.max_object_bytes,
+        max_total_bytes=limits.max_total_bytes,
+        write=policy.write,
+    )
+
+
+def bounded_echo(issued: str, echoed: str) -> str:
+    """Where a legacy agent says it wrote, clamped to the prefix agent-env issued.
+
+    Sidecars uploading with their own client nest under it and echo that; registering the
+    issued prefix instead points the artifact a level too high, which `put_existing`'s
+    recursive list hides until a restore cannot find its files.
+
+    Escaping is still refused — `put_existing` registers everything under what it is handed,
+    with the worker's credentials. Nesting is free to allow: the presigned POST's
+    `starts-with $key` already admits any depth under the issued prefix.
+    """
+    issued_norm, echoed_norm = issued.rstrip("/"), echoed.rstrip("/")
+    if echoed_norm == issued_norm:
+        return issued
+    if echoed_norm.startswith(issued_norm + "/"):
+        return echoed
+    logger.warning(
+        "the agent echoed a prefix outside the one issued; registering the "
+        "issued one (issued=%s returned=%s)", issued, echoed,
+    )
+    return issued
+
+
+def skill_bundle_request(
+    store: ObjectStore, *, name: str, description: str, object_url: str
+) -> BundleSkillRequest:
+    """A portable skill bundle of every object under ``object_url``."""
+    described = read_objects_under(store, object_url, limits=SKILL_BUNDLE_LIMITS)
+    if not described:
+        raise ValueError(f"no objects under {object_url} to send as a skill bundle")
+    files = [SkillBundleFile(path=path, object=descriptor) for path, descriptor in described]
+    return BundleSkillRequest(
+        name=name,
+        description=description,
+        skill_bundle=SkillBundle(
+            max_total_bytes=sum(file.object.max_bytes for file in files), files=files
+        ),
+    )
+
+
+def skill_add_call(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    name: str,
+    description: str,
+    skill_md: str | None = None,
+    object_url: str | None = None,
+    forms: Collection[TransferMode] = ("objects", "legacy"),
+) -> TransferCall:
+    """The skill ``add`` call for a skill given as SKILL.md text or as the objects under
+    ``object_url``, in a form the agent and the store allow; ``forms`` narrows the choice."""
+    base = {"name": name, "description": description}
+    if object_url is not None:
+        mode = choose_transfer(
+            method,
+            objects=_fields(BundleSkillRequest) if "objects" in forms else None,
+            legacy=_SKILL_S3_URL if "legacy" in forms else None,
+            store=store,
+        )
+        if mode is None:
+            raise RuntimeError(
+                "Agent advertises no object-backed skill form this object store can serve"
+            )
+        if mode == "legacy":
+            return TransferCall("legacy", {**base, "skill_s3_url": object_url})
+        request = skill_bundle_request(
+            store, name=name, description=description, object_url=object_url
+        )
+        return TransferCall("objects", request.model_dump(mode="json"))
+    if skill_md is not None:
+        if choose_transfer(method, legacy=_fields(InlineSkillRequest), store=store) is None:
+            raise RuntimeError("Agent does not advertise the inline skill variant")
+        return TransferCall("legacy", {**base, "skill_md": skill_md})
+    return TransferCall("legacy", base)
+
+
+def snapshot_save_call(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    agent_name: str,
+    context_id: str,
+    capture_prefix: str,
+) -> TransferCall:
+    """The snapshot ``save`` call that writes one capture below ``capture_prefix``."""
+    mode = choose_transfer(
+        method,
+        objects=_fields(ObjectSnapshotSaveRequest),
+        legacy=_SNAPSHOT_SAVE_S3_PREFIX,
+        store=store,
+    )
+    if mode is None:
+        raise RuntimeError(
+            f"Agent '{agent_name}' advertises no snapshot save form this object store can serve"
+        )
+    if mode == "legacy":
+        # Signed with the step's fresh credentials: the sidecar's are the deployer's STS
+        # session, frozen at deploy and expired on a long run.
+        presigned_post = store.signed_post(capture_prefix)
+        return TransferCall(
+            "legacy",
+            {
+                "context_id": context_id,
+                "s3_prefix": capture_prefix,
+                # Absent, not null, when the backend cannot sign: the sidecar then uploads
+                # with its own client.
+                **({"presigned_post": presigned_post} if presigned_post else {}),
+            },
+        )
+    objects = {
+        name: write_object(store, url, media_type=_OPAQUE, max_bytes=max_bytes)
+        for name, url, max_bytes in _snapshot_objects(store, capture_prefix)
+    }
+    request = ObjectSnapshotSaveRequest(
+        context_id=context_id, objects=SnapshotWriteObjects(**objects)
+    )
+    return TransferCall("objects", request.model_dump(mode="json"))
+
+
+def snapshot_load_call(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    agent_name: str,
+    bundle_url: str,
+    file_names: Collection[str],
+    target_context_id: str | None,
+) -> TransferCall:
+    """The snapshot ``load`` call that restores the capture at ``bundle_url`` in the form it was
+    captured in. An older capture is sent as ``bundle_url`` itself, whatever form it is stored in."""
+    portable = is_portable_snapshot(file_names)
+    mode = (
+        choose_transfer(method, objects=_fields(ObjectSnapshotLoadRequest), store=store)
+        if portable
+        else choose_transfer(method, legacy=_S3_PREFIX, store=store)
+    )
+    if mode is None:
+        raise RuntimeError(
+            f"Agent '{agent_name}' cannot load the configured "
+            f"{'portable' if portable else 'legacy'} snapshot"
+        )
+    if mode == "legacy":
+        payload: dict[str, Any] = {"s3_prefix": bundle_url}
+        if target_context_id:
+            payload["target_context_id"] = target_context_id
+        return TransferCall("legacy", payload)
+    objects = {
+        name: read_object(store, url, media_type=_OPAQUE, max_bytes=max_bytes)
+        for name, url, max_bytes in _snapshot_objects(store, bundle_url)
+        if name in file_names
+    }
+    request = ObjectSnapshotLoadRequest(
+        objects=SnapshotReadObjects(**objects), target_context_id=target_context_id
+    )
+    return TransferCall("objects", request.model_dump(mode="json", exclude_none=True))
+
+
+def _snapshot_objects(store: ObjectStore, prefix_url: str) -> list[tuple[str, str, int]]:
+    prefix_key = store.get_object_key(prefix_url).rstrip("/") + "/"
+    return [
+        (name, store.object_url(prefix_key + name), max_bytes)
+        for name, max_bytes in _SNAPSHOT_OBJECTS.items()
+    ]
+
+
+def changelog_enable_call(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    agent_name: str,
+    namespace_url: str,
+    expires_in: int,
+) -> TransferCall:
+    """The ``enable-changelog`` call that captures below ``namespace_url``. When the store cannot
+    sign a namespace grant that lasts ``expires_in``, an agent that also takes ``s3_prefix``
+    gets that form; one that does not fails with GrantUnavailableError."""
+    mode = choose_transfer(
+        method, objects=_fields(NamespaceChangelogEnableRequest), legacy=_S3_PREFIX, store=store
+    )
+    if mode is None:
+        raise RuntimeError(
+            f"Agent '{agent_name}' advertises no changelog enable form this object store can serve"
+        )
+    if mode == "objects":
+        try:
+            grant = namespace_grant(
+                store, namespace_url, limits=CHANGELOG_LIMITS, expires_in=expires_in
+            )
+        except GrantUnavailableError as exc:
+            if choose_transfer(method, legacy=_S3_PREFIX, store=store) is None:
+                raise GrantUnavailableError(
+                    f"Agent '{agent_name}' takes only the object changelog enable form, and "
+                    f"the object store cannot issue its namespace grant: {exc}"
+                ) from exc
+            logger.warning(
+                "Portable changelog grant is unavailable for agent '%s' (%s); "
+                "using its legacy s3_prefix variant",
+                agent_name,
+                exc,
+            )
+        else:
+            request = NamespaceChangelogEnableRequest(write_namespace=grant)
+            return TransferCall("objects", request.model_dump(mode="json", exclude_none=True))
+    return TransferCall("legacy", {"s3_prefix": namespace_url})
+
+
+def changelog_apply_call(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    agent_name: str,
+    source_url: str,
+    portable: bool,
+    up_to_tool_call_exclusive: int | None = None,
+    resume_conversation: bool = False,
+    target_context_id: str | None = None,
+) -> TransferCall:
+    """The ``apply-changelog`` call that replays the capture at ``source_url`` in the form it was
+    captured in: a portable one sends read grants for its increments before the cutoff, in
+    sequence order, and none when the cutoff precedes the first tool call."""
+    mode = (
+        choose_transfer(method, objects=_fields(ObjectChangelogApplyRequest), store=store)
+        if portable
+        else choose_transfer(method, legacy=_S3_PREFIX, store=store)
+    )
+    if mode is None:
+        raise RuntimeError(
+            f"Agent '{agent_name}' cannot apply the configured "
+            f"{'portable' if portable else 'legacy'} changelog"
+        )
+    if mode == "legacy":
+        payload: dict[str, Any] = {"s3_prefix": source_url}
+        if resume_conversation:
+            payload["resume_conversation"] = True
+        if up_to_tool_call_exclusive is not None:
+            payload["up_to_tool_call_exclusive"] = up_to_tool_call_exclusive
+        if target_context_id:
+            payload["target_context_id"] = target_context_id
+        return TransferCall("legacy", payload)
+    cutoff = math.inf if up_to_tool_call_exclusive is None else up_to_tool_call_exclusive
+    described = read_objects_under(
+        store,
+        source_url,
+        limits=CHANGELOG_LIMITS,
+        media_type=_OPAQUE,
+        select=lambda path: _increment_sequence(path) < cutoff,
+    )
+    request = ObjectChangelogApplyRequest(
+        increments=[
+            ChangelogIncrement(sequence=_increment_sequence(path), object=descriptor)
+            for path, descriptor in described
+        ],
+        resume_conversation=resume_conversation,
+        target_context_id=target_context_id,
+    )
+    return TransferCall("objects", request.model_dump(mode="json", exclude_none=True))
+
+
+def check_changelog_applied(
+    result: ObjectChangelogApplyResponse, call: TransferCall, *, agent_name: str
+) -> None:
+    """Refuse an ``apply-changelog`` answer that does not account for every increment sent."""
+    sent = len(call.payload["increments"])
+    if result.count != sent:
+        raise RuntimeError(
+            f"changelog apply on agent '{agent_name}' reported {result.count} increments "
+            f"applied; {sent} were sent"
+        )
+
+
+def _increment_sequence(path: str) -> int:
+    match = _INCREMENT_NAME.fullmatch(path)
+    if match is None:
+        raise ValueError("portable changelog objects must use zero-padded sequence names")
+    return int(match["sequence"])
+
+
+_TRAJECTORY_FORMS: dict[str, tuple[type[BaseModel], type[BaseModel]]] = {
+    "task_id": (TaskObjectTrajectoryRequest, TaskTrajectoryRequest),
+    "context_id": (ContextObjectTrajectoryRequest, ContextTrajectoryRequest),
+}
+
+
+def trajectory_mode(
+    method: Mapping[str, Any] | None,
+    store: ObjectStore,
+    *,
+    by: Literal["task_id", "context_id"],
+) -> TransferMode | None:
+    """How a trajectory ``get`` selecting by ``by`` moves the trajectory: uploaded by the agent
+    through a grant, or returned inline."""
+    objects_model, inline_model = _TRAJECTORY_FORMS[by]
+    return choose_transfer(
+        method, objects=_fields(objects_model), legacy=_fields(inline_model), store=store
+    )
+
+
+@dataclass(frozen=True)
+class TrajectoryUpload:
+    """Where the agent uploads a trajectory, and the grant it uploads with."""
+
+    object_url: str
+    write: WriteObject
+
+    @classmethod
+    def to(cls, store: ObjectStore, object_url: str) -> TrajectoryUpload:
+        write = write_object(
+            store,
+            object_url,
+            media_type="application/json",
+            max_bytes=DEFAULT_TRAJECTORY_MAX_BYTES,
+        )
+        return cls(object_url, write)
+
+
+@dataclass(frozen=True)
+class FetchedTrajectory:
+    """Where a trajectory ``get`` left the trajectory: uploaded by the agent through the grant
+    (``object_url``), below a prefix a legacy agent uploaded to itself (``legacy_prefix``), or in
+    the answer (``inline``). All None: the agent returned none."""
+
+    object_url: str | None = None
+    legacy_prefix: str | None = None
+    inline: Any = None
+
+
+async def fetch_trajectory(
+    endpoint: str,
+    selector: Mapping[str, str],
+    *,
+    upload: TrajectoryUpload | None = None,
+    timeout: float | None = None,
+) -> FetchedTrajectory:
+    """POST one trajectory ``get``. With ``upload`` the agent uploads the trajectory through its
+    grant and the answer is checked. The default wait covers that upload."""
+    payload: dict[str, Any] = dict(selector)
+    if upload is not None:
+        objects = TrajectoryWriteObjects(trajectory=upload.write)
+        payload["objects"] = objects.model_dump(mode="json")
+    call = TransferCall("objects" if upload is not None else "legacy", payload)
+    if timeout is None:
+        timeout = TRANSFER_TIMEOUT_SECONDS if upload is not None else REPLY_TIMEOUT_SECONDS
+    body = await invoke_transfer(
+        endpoint,
+        call,
+        verb="POST",
+        operation="trajectory get",
+        timeout=timeout,
+        response_model=TrajectoryObjectsResponse,
+    )
+    if upload is not None:
+        return FetchedTrajectory(object_url=upload.object_url)
+    if not isinstance(body, Mapping):
+        return FetchedTrajectory()
+    return FetchedTrajectory(
+        legacy_prefix=body.get("trajectory_s3_prefix") or None, inline=body.get("trajectory")
+    )

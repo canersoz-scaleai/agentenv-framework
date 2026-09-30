@@ -27,7 +27,7 @@ from agent_env.env.registry import get_env_registry
 from agent_env.env.snapshot_store import get_env_snapshot_store
 from agent_env.env.store import get_env_instance_store, get_env_store
 from agent_env.eval.store import get_eval_store
-from agent_env.providers.state.store import get_env_state_instance_store
+from agent_env.providers.env_state.store import get_env_state_instance_store
 from agent_env.task.store import get_task_instance_store, get_task_store
 from agent_env.task_step.review_store import get_review_store
 from agent_env.task_step.store import get_task_step_store
@@ -37,6 +37,10 @@ _HERE = "tst.unit.config.test_reset_config"
 
 class _ResetProbeEnv(Env):
     type = "reset_probe_env"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "_ResetProbeEnv":
+        return cls(data["id"], data.get("version"))
 
     @classmethod
     def _create(cls, **kwargs):  # pragma: no cover - never deployed

@@ -1,6 +1,7 @@
-"""Run all tasks in an eval concurrently."""
+"""Run all tasks in an eval concurrently, tearing down each run's sandboxes as it ends."""
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -11,6 +12,8 @@ import click
 from agent_env.cli.banner import print_banner
 from agent_env.cli.identity import get_agent_env_client_id
 from agent_env.store.ids import fs_safe
+from agent_env.task.interrupts import Interrupts
+from agent_env.task.teardown import TeardownReport, kind, teardown_run
 from agent_env.task_step.context import TaskStepContext
 
 
@@ -49,21 +52,31 @@ def _write_context(context, task_id, output_dir, prefix=""):
     click.echo(click.style(f"{prefix}Output written to: {output_path}", fg="blue"))
 
 
+def _echo_teardown(tag: str, report: TeardownReport) -> None:
+    if report.terminated:
+        n = len(report.terminated)
+        click.echo(click.style(f"{tag} Tore down {n} sandbox{'es' if n != 1 else ''}", fg="blue"))
+    for sandbox, why in report.failed:
+        click.echo(click.style(f"{tag} Couldn't tear down {sandbox.sandbox_id}: {why}", fg="red"))
+    for sandbox in report.left:
+        click.echo(click.style(f"{tag} Still up: {sandbox.sandbox_id} ({kind(sandbox)})", fg="red"))
+
+
 async def _run_single(task, tag, output_dir, agent_model=None, agent_artifact_id=None, base_metadata=None):
-    """Execute a single task run with logging callbacks."""
+    """Execute a single task run with logging callbacks, then tear down what it deployed, even when it
+    raised or was cancelled."""
     on_start, on_complete = _make_callbacks(tag)
-    initial_context = (
-        TaskStepContext(metadata=copy.deepcopy(base_metadata))
-        if base_metadata
-        else None
-    )
-    context = await task.run(
-        on_step_start=on_start,
-        on_step_complete=on_complete,
-        agent_model=agent_model,
-        agent_artifact_id=agent_artifact_id,
-        context=initial_context,
-    )
+    context = TaskStepContext(metadata=copy.deepcopy(base_metadata or {}))
+    try:
+        await task.run(
+            on_step_start=on_start,
+            on_step_complete=on_complete,
+            agent_model=agent_model,
+            agent_artifact_id=agent_artifact_id,
+            context=context,
+        )
+    finally:
+        _echo_teardown(tag, await teardown_run(context))
     if output_dir:
         _write_context(context, task.id, output_dir, prefix=f"{tag} ")
     return task.id, tag, context
@@ -111,22 +124,28 @@ def run(eval_id: str, eval_version: int | None, output_dir: str | None, k: int, 
     client_id = get_agent_env_client_id()
     base_metadata = {"agent_env_hub": {"caller": client_id}} if client_id else None
 
-    async def _run_safe(task, tag, output_dir, agent_model=None, agent_artifact_id=None):
-        """Wrap _run_single so failures carry task identity."""
+    async def _run_safe(task, tag, slot):
+        """Wrap _run_single so failures, and a cancel while it waits for its slot, carry task identity."""
         try:
-            return await _run_single(
-                task,
-                tag,
-                output_dir,
-                agent_model=agent_model,
-                agent_artifact_id=agent_artifact_id,
-                base_metadata=base_metadata,
-            )
+            async with slot:
+                return await _run_single(
+                    task,
+                    tag,
+                    output_dir,
+                    agent_model=agent_model,
+                    agent_artifact_id=agent_artifact_id,
+                    base_metadata=base_metadata,
+                )
         except BaseException as exc:
             return (task.id, tag, exc)
 
-    async def _run_all():
-        semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    def _on_signal(count):
+        message = "Cancelling the runs and tearing them down (Ctrl-C again to stop now)" if count == 1 else (
+            "Stopping the teardown now")
+        click.echo(click.style(message, fg="yellow"))
+
+    async def _run_all(interrupts):
+        slot = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
         coros = []
         for task in tasks:
             for run_idx in range(1, k + 1):
@@ -134,16 +153,11 @@ def run(eval_id: str, eval_version: int | None, output_dir: str | None, k: int, 
                     tag = f"[{task.id} run {run_idx}]"
                 else:
                     tag = f"[{task.id}]"
-                if semaphore:
-                    async def _limited(t=task, tg=tag, od=output_dir, am=agent_model, aa=agent_artifact_id):
-                        async with semaphore:
-                            return await _run_safe(t, tg, od, agent_model=am, agent_artifact_id=aa)
-                    coros.append(_limited())
-                else:
-                    coros.append(_run_safe(task, tag, output_dir, agent_model=agent_model, agent_artifact_id=agent_artifact_id))
-        return await asyncio.gather(*coros)
+                coros.append(_run_safe(task, tag, slot))
+        return [run.result() for run in await interrupts.gather(coros, _on_signal)]
 
-    results = asyncio.run(_run_all())
+    with Interrupts() as interrupts:
+        results = interrupts.run(_run_all(interrupts))
 
     click.echo()
 
@@ -166,11 +180,15 @@ def run(eval_id: str, eval_version: int | None, output_dir: str | None, k: int, 
 
     if failures:
         for task_id, tag, exc in failures:
-            click.echo(click.style(f"  {tag} FAILED: {exc}", fg="red"))
+            outcome = "CANCELLED" if isinstance(exc, asyncio.CancelledError) else f"FAILED: {exc}"
+            click.echo(click.style(f"  {tag} {outcome}", fg="red"))
         click.echo(click.style(
             f"\n{len(successes)}/{total_runs} runs completed, {len(failures)}/{total_runs} failed.",
             fg="red",
         ))
-        raise SystemExit(1)
     else:
         click.echo(click.style(f"\nAll {total_runs} runs completed!", fg="blue"))
+    if interrupts.count:
+        raise SystemExit(128 + interrupts.signum)
+    if failures:
+        raise SystemExit(1)

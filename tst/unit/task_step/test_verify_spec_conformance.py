@@ -5,9 +5,17 @@ Covers the pure functions (`normalize_tool_params`, `diff_conformance`) that bac
 Tool object stands in for the live MCP surface.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from unittest.mock import MagicMock, patch
 
+import httpx
+import pytest
+
+from agent_env.env.env import DeployedGatewayEnv
+from agent_env.env.gateway.constants import WELL_KNOWN_PATH
+from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.mcp_env_validator.verify_spec_conformance import (
     VerifySpecConformanceTaskStep,
     diff_conformance,
@@ -583,3 +591,41 @@ class TestRecordLogging:
         env, context, _ = self._record(result, caplog)
         assert env.merged == {"mcp_spec_conformance": result}
         assert context.metadata["verifications"]["spec_conformance"] is result
+
+
+class TestSpecAddress:
+    """The spec is fetched at the server's base on the stored env card; a server the card doesn't list keeps today's path."""
+
+    @pytest.mark.parametrize("gateway_url, child, spec_url", [
+        ("https://gw", "items", "https://gw/svc/mcp-items/openapi.yaml"),
+        ("https://gw/", "items", "https://gw/svc/mcp-items/openapi.yaml"),
+        ("https://sandbox.example.com/sandbox/sandbox-vm-1-18765", "items",
+         "https://sandbox.example.com/sandbox/sandbox-vm-1-18765/svc/mcp-items/openapi.yaml"),
+        ("https://gw", "other", "https://gw/svc/mcp-items/openapi.yaml"),
+    ])
+    def test_fetches_the_spec_at_the_servers_base(self, gateway_url, child, spec_url):
+        card = {"name": "gw", "url": "/agentenv", "children_environments": [{"name": child, "url": f"/svc/mcp-{child}/agentenv"}]}
+        sent, result = self._run(gateway_url, card)
+        assert sent == [("GET", spec_url)]
+        assert result["skipped"] is True
+
+    def test_a_record_without_a_stored_card_reads_the_servers_card_first(self):
+        sent, _ = self._run("https://gw", None)
+        assert sent == [("GET", f"https://gw/svc/mcp-items{WELL_KNOWN_PATH}"), ("GET", "https://gw/svc/mcp-items/openapi.yaml")]
+
+    @staticmethod
+    def _run(gateway_url, card):
+        """Execute against a spec endpoint that 404s, so the step records a skip before any MCP call."""
+        sent, real = [], httpx.AsyncClient
+
+        def handle(request):
+            sent.append((request.method, str(request.url)))
+            return httpx.Response(200, json={"name": "items"}) if request.url.path.endswith(WELL_KNOWN_PATH) else httpx.Response(404)
+
+        record = DeployedGatewayEnv(env_id="e1", env_version=1, gateway_url=gateway_url, mcp_url="", db_web_url=None, sandbox_id="sb",
+                             environment_card_url=f"{gateway_url}{WELL_KNOWN_PATH}", environment_card=card)
+        env = MagicMock(environment_name="items")
+        with patch.object(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle))), \
+             patch("agent_env.env.env.Env.get", return_value=env):
+            asyncio.run(VerifySpecConformanceTaskStep(id="s", version=None, env_id="e1").execute(TaskStepContext(deployed_envs=[record])))
+        return sent, env.merge_metadata.call_args[0][0]["mcp_spec_conformance"]

@@ -97,7 +97,7 @@ async def test_failed_steps_mark_the_run_failed(docs, monkeypatch):
     finally:
         await runner.stop()
     # a step can fail without raising (fail_task_on_error=False); failed_steps is the
-    # authoritative signal, same as the hub reads from a Temporal run
+    # authoritative signal, whichever runner executed the task
     assert rec.status is RunStatus.FAILED
     assert "deploy_env" in rec.error and "AttributeError" not in rec.error
 

@@ -405,7 +405,7 @@ class VerifySpecConformanceTaskStep(TaskStep):
         return cls(**cls._base_from_dict(data), env_id=data["env_id"])
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        from agent_env.env.env import Env
+        from agent_env.env.env import Env, gateway_url_of
 
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
@@ -414,8 +414,9 @@ class VerifySpecConformanceTaskStep(TaskStep):
         env = Env.get(self.env_id, deployed.env_version)
         environment_name = env.environment_name
 
-        # 1. Fetch the baked OpenAPI spec; no spec = skip, not block.
-        base_url = legacy_protocol.environment_base_url(deployed.gateway_url, environment_name, mcp=True)
+        # 1. Fetch the baked OpenAPI spec; no spec = skip, not block. A server the card doesn't list keeps today's path.
+        base_url = (await legacy_protocol.v1_base_url(deployed, gateway_url_of(deployed), environment_name)
+                    or legacy_protocol.environment_base_url(gateway_url_of(deployed), environment_name))
         spec_url = f"{base_url}/openapi.yaml"
         logger.info(f"Fetching OpenAPI spec for '{environment_name}' at {spec_url}")
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as client:

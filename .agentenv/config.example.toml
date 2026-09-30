@@ -1,12 +1,12 @@
 # agent-env standalone profile — the all-local backend stack (no cloud services).
 #
 # Copy to .agentenv/config.toml (git-ignored — your own machine's config) to run
-# agent-env against local backends; generated state (document_store/, object_store/)
-# is git-ignored too.
+# agent-env against local backends. Generated state is not kept in the project: the
+# local stores live under ~/.local/state/agent-env/ ($XDG_STATE_HOME/agent-env/ when set).
 
 [stores]
-document = "local"   # SQLite      .agentenv/document_store/documents.db
-object   = "local"   # filesystem  .agentenv/object_store/
+document = "local"   # SQLite      ~/.local/state/agent-env/document_store/documents.db
+object   = "local"   # filesystem  ~/.local/state/agent-env/object_store/
 image    = "local"   # local OCI registry (registry:2 at localhost:5000)
 secret   = "local"   # process env vars, or an optional flat YAML file
 
@@ -32,3 +32,7 @@ workers = 2
 port = 8234        # not 8233 — Temporal's dev-server UI uses 8233
 # allowed_hosts = ["explorer.mybox.internal"]   # extra Host values to accept (a hosted/tunnel bind)
 # static_dir = "path/to/built/ui"   # serve a built UI at /; omit for API-only (or the packaged UI)
+
+# A plugin's own settings go under its distribution name; agent-env reads none of it.
+# [plugins.agentenv-browser]
+# timeout = 30

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
 from agent_env.plugins import _registration
+from agent_env.store.routing import run_scope
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
 from agent_env.task_step.task_step import RetryConfig, TaskStep
@@ -405,8 +406,26 @@ class Task:
     ) -> TaskStepContext:
         """Run steps per their depends_on DAG. Per-step `fail_task_on_error`
         (default True) controls halt-on-failure; failures land in
-        context.metadata['failed_steps'].
+        context.metadata['failed_steps']. The run is scoped to this task's id, so under namespace
+        routing an ``@local`` task's records stay in the local stores.
         """
+        with run_scope(self.id):
+            return await self._run(
+                on_step_start, on_step_complete, agent_model, agent_artifact_id,
+                start_step, end_step, context, instance_id,
+            )
+
+    async def _run(
+        self,
+        on_step_start: Callable[[int, int, TaskStep, TaskStepContext], None] | None,
+        on_step_complete: Callable[[int, int, TaskStep, TaskStepContext, float], None] | None,
+        agent_model: str | None,
+        agent_artifact_id: str | None,
+        start_step: int,
+        end_step: int | None,
+        context: TaskStepContext | None,
+        instance_id: str | None,
+    ) -> TaskStepContext:
         from .store import (
             TaskStepResult,
             TaskStepStatus,

@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.env.envs.multi_env import MultiEnv
-from agent_env.providers.gateway_provider import GatewayProvider
-from agent_env.providers.state import LocalPostgresStateProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider
+from agent_env.providers.env_state import LocalPostgresStateProvider
 from agent_env.config import set_document_store
-from tst.unit.providers.state.fakes import ExternalDbStateProvider
+from tst.unit.providers.env_state.fakes import ExternalDbStateProvider
 
 
 def _empty_universe():
@@ -28,9 +29,9 @@ def _empty_universe():
 def _multi_env_with_backend(provider):
     env = MultiEnv(id="env-1", version=1, mcp_server_envs=[])
     env._instance_id = None  # skip the env-instance environment_universe update
-    gp = GatewayProvider()
+    gp = EnvironmentGatewayProvider()
     gp._state_provider = provider  # as rehydrate_state would set on reattach
-    env._gateway_provider = gp
+    env._env_provider = gp
     env._load_from_snapshot = AsyncMock()
     return env
 
@@ -84,17 +85,18 @@ async def test_snapshot_capture_gated_off_for_remote_backend():
     early with a clear error — not a cryptic 'servicedb container not found' deep in the capture."""
     from agent_env.env.snapshot_store import EnvSnapshot
 
-    deployed = MagicMock(env_id="env-1", env_version=1, sandbox_id="sb-1")
+    deployed = DeployedGatewayEnv(env_id="env-1", env_version=1, sandbox_id="sb-1", gateway_url="https://gw", mcp_url="https://gw/mcp",
+                                  db_web_url=None)
     inst_store = MagicMock()
     inst_store.get.return_value = deployed
     inst_store.get_environment_universe.return_value = {"id": "universe-1", "version": 1}
 
     # A reattached MultiEnv whose rehydrated backend is remote (no servicedb to commit).
-    gp = GatewayProvider()
+    gp = EnvironmentGatewayProvider()
     gp._state_provider = ExternalDbStateProvider()
     reattached = MagicMock()
     reattached._sandbox = MagicMock(mode="vm")
-    reattached._gateway_provider = gp
+    reattached._env_provider = gp
 
     with patch("agent_env.env.store.get_env_instance_store", return_value=inst_store), \
          patch("agent_env.env.env.Env.get", return_value=MultiEnv(id="env-1", version=1, mcp_server_envs=[])), \
@@ -110,13 +112,14 @@ async def test_snapshot_capture_gated_off_for_remote_backend():
 async def test_from_deployed_env_rehydrates_state_provider():
     """Reattach doesn't re-acquire, so from_deployed_env restores gp._state_provider inline from the
     recorded instance's state_type — powering the capability check + install_changelog on reattach."""
-    from agent_env.providers.state import (
+    from agent_env.providers.env_state import (
         EnvStateInstance,
         EnvStateInstanceStore,
         register_env_state_instance,
         reset_env_state_instance_store,
         set_env_state_instance_store,
     )
+    from agent_env.env.env import DeployedGatewayEnv
     from tst.unit.store.fakes import FakeDocumentStore
 
     store = EnvStateInstanceStore()
@@ -129,17 +132,16 @@ async def test_from_deployed_env_rehydrates_state_provider():
         provider = MagicMock()
         provider.get_sandbox = AsyncMock(return_value=fake_sandbox)
 
-        deployed = MagicMock(
-            env_id="env-1", env_version=1, sandbox_type=None, sandbox_id="sb-1",
-            sandbox_ids={}, env_state_instance_ids=[record.instance_id],
-            gateway_url="http://gw", instance_id="inst-1",
+        deployed = DeployedGatewayEnv(
+            env_id="env-1", env_version=1, sandbox_id="sb-1",
+            env_state_instance_ids=[record.instance_id], gateway_url="http://gw", instance_id="inst-1",
         )
 
         with patch("agent_env.env.env.Env.get", return_value=MultiEnv(id="env-1", version=1, mcp_server_envs=[])), \
              patch("agent_env.providers.get_env_sandbox_provider", return_value=provider):
             env = await MultiEnv.from_deployed_env(deployed)
 
-        assert isinstance(env._gateway_provider._state_provider, LocalPostgresStateProvider)
-        assert env._gateway_provider._state_instance.instance_id == record.instance_id
+        assert isinstance(env._env_provider._state_provider, LocalPostgresStateProvider)
+        assert env._env_provider._state_instance.instance_id == record.instance_id
     finally:
         reset_env_state_instance_store()

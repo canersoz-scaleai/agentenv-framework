@@ -1,4 +1,4 @@
-from .env import DeployedEnv, Env, LoadEnvironmentUniverseArtifactResult
+from .env import DeployedEnv, DeployedGatewayEnv, DeployedSandboxEnv, Env, EnvCapabilityUnsupported, EnvNeedsGateway, LoadEnvironmentUniverseArtifactResult
 from .envs import GatewayEnv, MCPServerEnv, MultiEnv
 from .snapshot_store import (
     EnvSnapshot,
@@ -22,7 +22,11 @@ from .store import (
 
 __all__ = [
     "DeployedEnv",
+    "DeployedGatewayEnv",
+    "DeployedSandboxEnv",
     "Env",
+    "EnvCapabilityUnsupported",
+    "EnvNeedsGateway",
     "LoadEnvironmentUniverseArtifactResult",
     "GatewayEnv",
     "MCPServerEnv",

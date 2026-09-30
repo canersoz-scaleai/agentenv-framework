@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent_env.a2a_agent import A2AAgent
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.a2a_agent_validator import verify_a2a_agent_mcp
 from agent_env.task_step.task_steps.a2a_agent_validator.verify_a2a_agent_mcp import (
@@ -57,7 +58,7 @@ async def test_mcp_verifier_recognizes_typed_usage_telemetry(
         deployed_agents=[
             SimpleNamespace(a2a_url="http://agent", api_url="", a2a_card={})
         ],
-        deployed_envs=[SimpleNamespace(sandbox_id="sandbox-1")],
+        deployed_envs=[DeployedGatewayEnv(env_id="env-1", env_version=1, gateway_url="https://gw.example", sandbox_id="sandbox-1")],
     )
 
     result = await step.execute(context)
@@ -73,3 +74,16 @@ async def test_mcp_verifier_recognizes_typed_usage_telemetry(
     assert metadata["validated_data_extensions"]["tool_call_count"] == {
         "supported": True
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_verifier_needs_a_gateway_before_it_prompts_the_agent() -> None:
+    """It counts tool calls in the gateway's trajectory, so an env without one is refused before the agent runs."""
+    step = VerifyA2AAgentMCPStep(id="verify-mcp", version=None, a2a_agent_id="agent-1")
+    context = TaskStepContext(deployed_agents=[SimpleNamespace(a2a_url="http://agent", api_url="", a2a_card={})],
+                              deployed_envs=[SimpleNamespace(env_id="env-1", sandbox_id="srv")])
+
+    from agent_env.env.env import EnvNeedsGateway
+
+    with pytest.raises(EnvNeedsGateway, match="verify_a2a_agent_mcp needs a gateway; env 'env-1' was deployed without one"):
+        await step.execute(context)

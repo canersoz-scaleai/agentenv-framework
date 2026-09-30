@@ -15,15 +15,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_env.env.envs.multi_env import MultiEnv
-from agent_env.providers.gateway_provider import GatewayProvider
-from agent_env.providers.state import LocalPostgresStateProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider
+from agent_env.providers.env_state import LocalPostgresStateProvider
 
 
 def _env(nproc: str | None = "8", *, sandbox: bool = True):
     env = MultiEnv(id="env-1", version=1, mcp_server_envs=[])
-    gp = GatewayProvider()
+    gp = EnvironmentGatewayProvider()
     gp._state_provider = LocalPostgresStateProvider()
-    env._gateway_provider = gp
+    env._env_provider = gp
     if sandbox:
         s = MagicMock()
         if nproc is None:

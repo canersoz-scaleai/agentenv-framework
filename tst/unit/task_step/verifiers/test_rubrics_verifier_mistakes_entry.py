@@ -88,7 +88,7 @@ def _standalone_mistakes_step(**kw) -> RubricsVerifierTaskStep:
 
 def _capture_judge(monkeypatch, v: RubricsVerifierTaskStep, rows_for, retries: int = 0, discrepancies: list | None = None) -> dict:
     monkeypatch.setattr(v, "_read_trajectory_text",
-                        lambda uri: json.dumps([_span("ios_tap", {"x": i}) for i in range(1, 12)]))
+                        lambda uri: json.dumps([_span("gui_tap", {"x": i}) for i in range(1, 12)]))
     captured: dict = {"calls": 0}
 
     async def fake_run(*, eval_prompt, context, model, criteria, image_blocks=None, **kw):

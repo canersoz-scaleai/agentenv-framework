@@ -20,7 +20,6 @@ def _kwargs(**over):
         version=1,
         backend_docker_image_artifact=_art("be"),
         frontend_docker_image_artifact=_art("fe"),
-        service_version=1,
     )
     base.update(over)
     return base
@@ -43,21 +42,11 @@ def test_missing_name_raises():
         WebsiteEnv(**_kwargs())
 
 
-def test_missing_service_version_defaults_to_one():
-    """__init__ coerces rather than tolerating: to_dict writes the key unconditionally."""
-    kwargs = _kwargs(environment_name="shop")
-    kwargs.pop("service_version")
-    e = WebsiteEnv(**kwargs)
-    assert e.service_version == 1
-    assert e.to_dict()["service_version"] == 1
-
-
 def test_to_dict_writes_both_name_keys():
-    e = WebsiteEnv(**_kwargs(environment_name="shop", service_version=3))
+    e = WebsiteEnv(**_kwargs(environment_name="shop"))
     d = e.to_dict()
     assert d["service_name"] == "shop"
     assert d["environment_name"] == "shop"  # dual-write
-    assert d["service_version"] == 3
 
 
 def test_from_dict_dual_reads_both_keys(monkeypatch):
@@ -69,7 +58,6 @@ def test_from_dict_dual_reads_both_keys(monkeypatch):
         "version": 1,
         "backend_docker_image_artifact": be,
         "frontend_docker_image_artifact": fe,
-        "service_version": 1,
         "metadata": {},
     }
     legacy = WebsiteEnv.from_dict({**common, "service_name": "shop"})
@@ -104,7 +92,7 @@ async def test_put_from_github_forwards_environment_name_no_service_name(monkeyp
         id="w",
         backend_dockerfile_github_url="https://github.com/o/r/tree/main/b/Dockerfile",
         frontend_dockerfile_github_url="https://github.com/o/r/tree/main/f/Dockerfile",
-        environment_name="shop", service_version=1,
+        environment_name="shop",
     )
     assert result == "ENV"
     assert captured["environment_name"] == "shop"

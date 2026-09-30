@@ -1,0 +1,64 @@
+{
+  "format_version": 1,
+  "agent_env": {
+    "version": "<version>",
+    "environment": "<environment>",
+    "location": "<location>"
+  },
+  "config": {
+    "path": "<tmp>/.agentenv/config.toml",
+    "error": null
+  },
+  "loaded": true,
+  "group_errors": {},
+  "discovery_errors": {},
+  "plugins": [
+    {
+      "name": "agentenv-bundles",
+      "version": "1.0",
+      "contributions": [
+        {
+          "group": "agent_env.bundles",
+          "name": "bad_field",
+          "value": "report_bundles_steps",
+          "status": "failed",
+          "code": "invalid-plugin",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.bundles",
+          "name": "empty",
+          "value": "report_bundles_only",
+          "status": "failed",
+          "code": "invalid-plugin",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.bundles",
+          "name": "tools",
+          "value": "report_bundles_only",
+          "status": "active",
+          "code": null,
+          "reason": null,
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.bundles",
+          "name": "unknown_step",
+          "value": "report_bundles_steps",
+          "status": "failed",
+          "code": "invalid-plugin",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": []
+        }
+      ]
+    }
+  ],
+  "config_effect": "<text>"
+}

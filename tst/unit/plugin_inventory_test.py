@@ -1,27 +1,38 @@
 """``agent_env.plugins.inventory()``: every installed plugin's contributions and their status.
 
 The registries are built on a throwaway Config reading the caller's document, so the Config in use
-keeps its registries and its ``load_failures()``. A conflict is reported rather than raised, while a
-real build of that group stays strict, and the rest of the group reads as blocked.
+keeps its registries and its ``load_failures()``. A conflict is reported for both claimants, and the
+rest of the group loads, as in a real build.
 """
 
 import importlib
 import sys
 
 import pytest
+from fastapi import APIRouter
 
 from agent_env import plugins
 from agent_env.config import get_config, reset_config
-from agent_env.env.env import Env
-from agent_env.explorer.plugin import load_plugins
-from agent_env.plugins import PluginConflictError, _inventory, inventory
-from tst.unit.plugins_test import _EP, _HERE, _ReentrantEP, _fresh, _install, _use_config  # noqa: F401  (_fresh: autouse)
+from agent_env.explorer.plugin import ExplorerPlugin, load_plugins
+from agent_env.plugins import Claimant, Replacement, _inventory, inventory
+from tst.unit.plugins_test import _EP, _HERE, _Env, _ReentrantEP, _fresh, _install, _use_config  # noqa: F401  (_fresh: autouse)
 
 _THIS = "tst.unit.plugin_inventory_test"
 
 
-class _ExtraEnv(Env):
+class _ExtraEnv(_Env):
     type = "extra_env"
+
+
+class _ExitingRoutes(ExplorerPlugin):
+    type = "exiting_routes"
+
+    def __init__(self):
+        raise SystemExit(3)
+
+    @property
+    def router(self) -> APIRouter:
+        return APIRouter()
 
 
 def _ep(name: str, attr: str, **kwargs) -> _EP:
@@ -78,8 +89,47 @@ def test_a_plugin_that_fails_to_import_is_failed_with_the_error(monkeypatch):
 
     found = _contribution(inventory(), plugins.ENVS, "browser")
 
-    assert found.status == "failed"
+    assert (found.status, found.code) == ("failed", "load-failed")
     assert found.reason.startswith("failed to load: ModuleNotFoundError")
+
+
+@pytest.mark.parametrize("load", [True, False])
+def test_a_plugin_whose_agent_env_requirement_is_not_met_is_failed_without_importing_it(monkeypatch, load):
+    def imported():
+        raise AssertionError("the plugin was imported")
+
+    _install(monkeypatch, envs=[_EP("browser", "_BrowserEnv", on_load=imported, requires=["agentenv-framework>=999"])])
+
+    found = _contribution(inventory(load=load), plugins.ENVS, "browser")
+
+    assert (found.status, found.code) == ("failed", "incompatible-core")
+    assert found.reason.startswith("needs agentenv-framework>=999 (installed: ")
+
+
+@pytest.mark.parametrize("load", [True, False])
+def test_a_claim_that_cannot_load_takes_no_part_in_a_conflict(monkeypatch, load):
+    needs_more = ["agentenv-framework>=999"]
+    _install(monkeypatch, envs=[
+        _EP("browser", "_BrowserEnv", dist="agentenv-a"),
+        _EP("browser", "_OtherBrowserEnv", dist="agentenv-b", requires=needs_more),
+    ], task_steps=[
+        _EP("plugin_step", "_PluginStep", dist="agentenv-c"),
+        _EP("plugin_step", "_PluginStep", dist="agentenv-d"),
+        _EP("plugin_step", "_PluginStep", dist="agentenv-e", requires=needs_more),
+    ])
+
+    inv = inventory(load=load)
+
+    statuses = {(d.name, c.name): (c.status, c.code) for d in inv.distributions for c in d.contributions}
+    assert statuses[("agentenv-a", "browser")] == (("active", None) if load else ("unloaded", "not-loaded"))
+    assert statuses[("agentenv-b", "browser")] == ("failed", "incompatible-core")
+    assert plugins.ENVS not in inv.group_errors
+    assert statuses[("agentenv-c", "plugin_step")] == statuses[("agentenv-d", "plugin_step")] == ("conflict", "name-conflict")
+    assert statuses[("agentenv-e", "plugin_step")] == ("failed", "incompatible-core")
+    conflicting = _contribution(inv, plugins.TASK_STEPS, "plugin_step", "agentenv-c")
+    assert [c.package for c in conflicting.conflicts_with] == ["agentenv-d"]
+    assert plugins.TASK_STEPS not in inv.group_errors
+    assert "agentenv-e" not in conflicting.reason
 
 
 def test_a_plugin_that_fails_validation_is_failed(monkeypatch):
@@ -87,8 +137,19 @@ def test_a_plugin_that_fails_validation_is_failed(monkeypatch):
 
     found = _contribution(inventory(), plugins.ENVS, "not_browser")
 
-    assert found.status == "failed"
+    assert (found.status, found.code) == ("failed", "invalid-plugin")
     assert "its entry point must be named 'browser'" in found.reason
+
+
+def test_a_plugin_that_leaves_a_required_method_unimplemented_is_failed(monkeypatch):
+    _install(monkeypatch, task_steps=[_EP("bare", "_BareStep")])
+
+    found = _contribution(inventory(), plugins.TASK_STEPS, "bare")
+    unloaded = _contribution(inventory(load=False), plugins.TASK_STEPS, "bare")
+
+    assert (found.status, found.code) == ("failed", "invalid-plugin")
+    assert "_BareStep must implement execute and from_dict" in found.reason
+    assert (unloaded.status, unloaded.code) == ("unloaded", "not-loaded")
 
 
 def test_a_built_in_name_is_skipped_for_every_claimant_before_any_conflict(monkeypatch):
@@ -96,7 +157,9 @@ def test_a_built_in_name_is_skipped_for_every_claimant_before_any_conflict(monke
 
     inv = inventory()
 
-    assert [_contribution(inv, plugins.ENVS, "website", dist).status for dist in ("a", "b")] == ["skipped", "skipped"]
+    assert [(c.status, c.code) for c in (_contribution(inv, plugins.ENVS, "website", dist) for dist in ("a", "b"))] == [
+        ("skipped", "builtin-name"), ("skipped", "builtin-name"),
+    ]
     assert not inv.group_errors
 
 
@@ -105,8 +168,16 @@ def test_an_explorer_plugin_that_fails_to_construct_is_failed(monkeypatch):
 
     found = _contribution(inventory(), plugins.EXPLORER_PLUGINS, "broken_routes")
 
-    assert found.status == "failed"
+    assert (found.status, found.code) == ("failed", "load-failed")
     assert found.reason == "failed to construct: RuntimeError('boom in ctor')"
+
+
+def test_an_explorer_plugin_that_exits_while_constructed_is_failed_not_fatal(monkeypatch):
+    _install(monkeypatch, explorer_plugins=[_ep("exiting_routes", "_ExitingRoutes")])
+
+    found = _contribution(inventory(), plugins.EXPLORER_PLUGINS, "exiting_routes")
+
+    assert (found.status, found.code, found.reason) == ("failed", "load-failed", "failed to construct: SystemExit(3)")
 
 
 def test_an_artifact_legacy_name_config_strands_is_failed(monkeypatch, tmp_path):
@@ -121,6 +192,7 @@ def test_an_artifact_legacy_name_config_strands_is_failed(monkeypatch, tmp_path)
     assert _contribution(inv, plugins.ARTIFACTS, "plugin_art").status == "replaced"
     stranded = _contribution(inv, plugins.ARTIFACTS, "plugin_art_legacy")
     assert stranded.status == "failed" and "resolves to _OtherPluginArtifact" in stranded.reason
+    assert stranded.code == "invalid-plugin"
 
 
 # ---------------------------------------------------------------- config taking a name over
@@ -135,9 +207,10 @@ def test_config_naming_a_different_class_replaces_the_plugin_and_says_where(monk
 
     found = _contribution(inventory(), plugins.ENVS, "browser")
 
-    assert found.status == "replaced"
-    assert found.replaced_in == f"[envs] impl '{_HERE}:_OtherBrowserEnv' in {tmp_path / '.agentenv' / 'config.toml'}"
-    assert found.replacement == f"{_HERE}:_OtherBrowserEnv"
+    config = tmp_path / ".agentenv" / "config.toml"
+    assert (found.status, found.code) == ("replaced", "replaced-by-config")
+    assert found.replaced_by == Replacement(config, "envs", f"{_HERE}:_OtherBrowserEnv")
+    assert found.reason == f"config names '{_HERE}:_OtherBrowserEnv' in [envs] of {config}"
 
 
 def test_config_naming_the_plugins_own_class_leaves_it_active(monkeypatch, tmp_path):
@@ -159,9 +232,10 @@ def test_a_provider_table_with_impl_replaces_a_provider_plugin(monkeypatch, tmp_
 
     found = _contribution(inventory(), plugins.SANDBOX_PROVIDERS, "plugin_box")
 
-    assert found.status == "replaced"
-    assert found.replaced_in.startswith("[sandbox.providers.plugin_box] in ")
-    assert found.replacement == f"{_HERE}:_GuardedProvider"
+    assert (found.status, found.code) == ("replaced", "replaced-by-config")
+    assert found.replaced_by == Replacement(
+        tmp_path / ".agentenv" / "config.toml", "sandbox.providers.plugin_box", f"{_HERE}:_GuardedProvider"
+    )
 
 
 def test_a_config_only_provider_table_configures_the_plugin_without_replacing_it(monkeypatch, tmp_path):
@@ -174,10 +248,10 @@ def test_a_config_only_provider_table_configures_the_plugin_without_replacing_it
     assert _contribution(inventory(), plugins.STATE_PROVIDERS, "plugin_state").status == "active"
 
 
-# ---------------------------------------------------------------- conflicts stay strict, and are reported
+# ---------------------------------------------------------------- conflicts are strict, and contained to the name
 
 
-def test_a_conflict_is_reported_and_blocks_the_rest_of_its_group(monkeypatch):
+def test_a_conflict_is_reported_and_the_rest_of_its_group_loads(monkeypatch):
     _install(monkeypatch, envs=[
         _EP("browser", "_BrowserEnv", dist="agentenv-browser"),
         _EP("browser", "_OtherBrowserEnv", dist="agentenv-web", version="2.1.0"),
@@ -187,15 +261,16 @@ def test_a_conflict_is_reported_and_blocks_the_rest_of_its_group(monkeypatch):
     inv = inventory()
 
     browser = _contribution(inv, plugins.ENVS, "browser", "agentenv-browser")
-    assert browser.status == "conflict"
-    assert browser.conflicts_with == (f"'browser' from agentenv-web 2.1.0 ({_HERE}:_OtherBrowserEnv)",)
+    assert (browser.status, browser.code) == ("conflict", "name-conflict")
+    assert browser.conflicts_with == (Claimant("agentenv-web", "2.1.0", f"{_HERE}:_OtherBrowserEnv"),)
+    assert browser.reason == (f"also registered by 'browser' from agentenv-web 2.1.0 ({_HERE}:_OtherBrowserEnv); "
+                              "remove all but one with `agent-env plugin remove <package>`")
     assert _contribution(inv, plugins.ENVS, "browser", "agentenv-web").status == "conflict"
-    extra = _contribution(inv, plugins.ENVS, "extra_env", "agentenv-browser")
-    assert extra.status == "blocked" and extra.reason == inv.group_errors[plugins.ENVS]
+    assert _contribution(inv, plugins.ENVS, "extra_env", "agentenv-browser").status == "active"
     assert _contribution(inv, plugins.TASK_STEPS, "plugin_step", "agentenv-web").status == "active"
-    with pytest.raises(PluginConflictError) as raised:
-        get_config().env_registry()
-    assert str(raised.value) == inv.group_errors[plugins.ENVS]
+    assert not inv.group_errors
+    registry = get_config().env_registry()
+    assert "browser" not in registry and registry["extra_env"] is _ExtraEnv
 
 
 def test_without_loading_conflicts_and_built_in_clashes_are_still_reported(monkeypatch):
@@ -210,9 +285,11 @@ def test_without_loading_conflicts_and_built_in_clashes_are_still_reported(monke
 
     assert not inv.loaded
     assert _contribution(inv, plugins.ENVS, "browser", "a").status == "conflict"
-    assert _contribution(inv, plugins.ENVS, "extra_env", "a").status == "blocked"
+    assert _contribution(inv, plugins.ENVS, "extra_env", "a").status == "unloaded"
+    assert not inv.group_errors
     assert _contribution(inv, plugins.ENVS, "website", "a").status == "skipped"
-    assert _contribution(inv, plugins.TASK_STEPS, "plugin_step", "a").status == "unloaded"
+    step = _contribution(inv, plugins.TASK_STEPS, "plugin_step", "a")
+    assert (step.status, step.code) == ("unloaded", "not-loaded")
 
 
 # ---------------------------------------------------------------- isolation from the Config in use
@@ -254,7 +331,8 @@ def test_a_plugin_that_reenters_its_registry_on_import_leaves_no_failure_behind(
 
 def test_without_loading_no_plugin_module_is_imported(tmp_path, monkeypatch):
     (tmp_path / "agentenv_inventory_demo.py").write_text(
-        "from agent_env.env.env import Env\n\n\nclass DemoEnv(Env):\n    type = 'inventory_demo'\n"
+        "from agent_env.env.env import Env\n\n\nclass DemoEnv(Env):\n    type = 'inventory_demo'\n\n"
+        "    @classmethod\n    def from_dict(cls, data):\n        return cls(data['id'], data.get('version'))\n"
     )
     dist_info = tmp_path / "agentenv_inventory_demo-0.1.0.dist-info"
     dist_info.mkdir()
@@ -283,10 +361,10 @@ def test_a_config_file_that_cannot_be_found_blocks_every_group_but_plugins_are_s
 
     inv = inventory()
 
-    assert "missing.toml" in inv.config_error
+    assert inv.config_error.code == "config-not-found" and "missing.toml" in inv.config_error.reason
     assert inv.config_path is None
     browser = _contribution(inv, plugins.ENVS, "browser")
-    assert browser.status == "blocked" and "missing.toml" in browser.reason
+    assert (browser.status, browser.code) == ("blocked", "config-not-found") and "missing.toml" in browser.reason
     assert _contribution(inv, plugins.TASK_STEPS, "broken_step").status == "failed"
 
 
@@ -296,7 +374,7 @@ def test_a_malformed_config_file_is_reported_even_with_no_plugins(monkeypatch, t
 
     inv = inventory()
 
-    assert inv.config_error is not None and "Malformed" in inv.config_error
+    assert inv.config_error.code == "config-unreadable" and "Malformed" in inv.config_error.reason
     assert inv.config_path == tmp_path / ".agentenv" / "config.toml"
 
 
@@ -308,23 +386,32 @@ def test_a_malformed_config_file_blocks_what_its_real_build_would_not_reach(monk
 
     inv = inventory()
 
-    # The envs build raises the conflict while merging, before it reads the file.
-    assert inv.group_errors[plugins.ENVS].startswith("2 installed plugins register 'browser'")
-    assert inv.group_errors[plugins.TASK_STEPS].startswith("ConfigError: Malformed")
-    assert _contribution(inv, plugins.TASK_STEPS, "plugin_step").status == "blocked"
+    # A conflict is no group error, so the file's is, as in a real build.
+    envs, steps = inv.group_errors[plugins.ENVS], inv.group_errors[plugins.TASK_STEPS]
+    assert envs == steps and steps.code == "config-unreadable" and steps.reason.startswith("ConfigError: Malformed")
+    assert _contribution(inv, plugins.ENVS, "browser", "a").status == "conflict"
+    assert _contribution(inv, plugins.TASK_STEPS, "plugin_step").code == "config-unreadable"
 
 
 _REAL_BUILDS = {
     plugins.ENVS: lambda config: config.env_registry(),
     plugins.TASK_STEPS: lambda config: config.task_step_registry(),
+    plugins.ARTIFACTS: lambda config: config.artifact_registry(),
+    plugins.SANDBOX_PROVIDERS: lambda config: config.sandbox_registry(),
+    plugins.STATE_PROVIDERS: lambda config: config.state_registry(),
     plugins.EXPLORER_PLUGINS: lambda config: load_plugins(source=config),
 }
 
 
 @pytest.mark.parametrize(
     "config_body",
-    [None, "", "[envs\n", f'[envs]\nimpls = ["{_HERE}:_OtherBrowserEnv"]\n', '[explorer.plugins]\nimpls = "x"\n'],
-    ids=["no-file", "empty", "malformed", "config-names-the-conflicted-class", "explorer-reads-config-first"],
+    [None, "", "[envs\n", f'[envs]\nimpls = ["{_HERE}:_OtherBrowserEnv"]\n', '[explorer.plugins]\nimpls = "x"\n',
+     f'[sandbox.providers.plugin_box]\nimpl = "{_HERE}:_RecordingProvider"\n',
+     '[artifacts.type_aliases]\nplugin_art = "file"\n', '[artifacts.type_aliases]\nplugin_art_old = "plugin_art"\n',
+     '[state.providers.plugin_state.config]\nsecret_name = "demo"\n'],
+    ids=["no-file", "empty", "malformed", "config-names-the-conflicted-class", "explorer-reads-config-first",
+         "provider-table-names-the-conflicted-name", "alias-from-the-conflicted-name", "alias-to-the-conflicted-name",
+         "state-table-names-the-conflicted-name"],
 )
 def test_group_errors_are_the_errors_a_real_build_raises(monkeypatch, tmp_path, config_body):
     _install(
@@ -332,6 +419,10 @@ def test_group_errors_are_the_errors_a_real_build_raises(monkeypatch, tmp_path, 
         envs=[_EP("browser", "_BrowserEnv", dist="a"), _EP("browser", "_OtherBrowserEnv", dist="b")],
         task_steps=[_EP("plugin_step", "_PluginStep")],
         # The explorer reads its config before merging, the others after: each order is checked.
+        sandbox_providers=[_EP("plugin_box", "_RecordingProvider", dist="a"),
+                           _EP("plugin_box", "_OtherRecordingProvider", dist="b")],
+        artifacts=[_EP("plugin_art", "_PluginArtifact", dist="a"), _EP("plugin_art", "_OtherPluginArtifact", dist="b")],
+        state_providers=[_EP("plugin_state", "_PluginState", dist="a"), _EP("plugin_state", "_OtherPluginState", dist="b")],
         explorer_plugins=[_EP("plugin_routes", "_Routes", dist="a"), _EP("plugin_routes", "_OtherRoutes", dist="b")],
     )
     if config_body is None:
@@ -346,16 +437,15 @@ def test_group_errors_are_the_errors_a_real_build_raises(monkeypatch, tmp_path, 
         reset_config()
         try:
             build(get_config())
-        except PluginConflictError as exc:
-            expected = str(exc)
         except Exception as exc:
             expected = f"{type(exc).__name__}: {exc}"
         else:
             expected = None
-        assert inv.group_errors.get(group) == expected, group
+        error = inv.group_errors.get(group)
+        assert (error.reason if error else None) == expected, group
 
 
-def test_without_loading_a_malformed_config_blocks_only_a_proven_conflict(monkeypatch, tmp_path):
+def test_without_loading_a_malformed_config_blocks_nothing(monkeypatch, tmp_path):
     _install(monkeypatch, envs=[
         _EP("browser", "_BrowserEnv", dist="a"), _EP("browser", "_OtherBrowserEnv", dist="b"),
     ], task_steps=[_EP("plugin_step", "_PluginStep")])
@@ -363,10 +453,11 @@ def test_without_loading_a_malformed_config_blocks_only_a_proven_conflict(monkey
 
     inv = inventory(load=False)
 
-    assert "Malformed" in inv.config_error
-    assert list(inv.group_errors) == [plugins.ENVS]
+    assert "Malformed" in inv.config_error.reason
+    assert not inv.group_errors
+    assert _contribution(inv, plugins.ENVS, "browser", "a").status == "conflict"
     step = _contribution(inv, plugins.TASK_STEPS, "plugin_step")
-    assert (step.status, step.reason) == ("unloaded", None)
+    assert (step.status, step.code) == ("unloaded", "not-loaded")
 
 
 def test_a_status_the_build_did_not_record_is_visible_not_silent(monkeypatch):
@@ -387,7 +478,7 @@ def test_a_status_the_build_did_not_record_is_visible_not_silent(monkeypatch):
 
     found = _contribution(inventory(), plugins.ENVS, "browser")
 
-    assert (found.status, found.reason) == ("unloaded", "its status could not be determined")
+    assert (found.status, found.code, found.reason) == ("unloaded", "status-unknown", "its status could not be determined")
 
 
 def test_a_config_error_in_a_group_blocks_its_plugins(monkeypatch, tmp_path):
@@ -399,8 +490,24 @@ def test_a_config_error_in_a_group_blocks_its_plugins(monkeypatch, tmp_path):
 
     inv = inventory()
 
-    assert inv.group_errors[plugins.ENVS].startswith("ConfigError: [envs] impls must be a list")
+    assert inv.group_errors[plugins.ENVS].code == "config-invalid"
+    assert inv.group_errors[plugins.ENVS].reason.startswith("ConfigError: [envs] impls must be a list")
     assert _contribution(inv, plugins.ENVS, "browser").status == "blocked"
+
+
+def test_a_config_impl_that_exits_while_imported_blocks_its_group_not_the_report(monkeypatch, tmp_path):
+    (tmp_path / "agentenv_exits_demo.py").write_text("raise SystemExit('exits on import')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _install(monkeypatch, envs=[_EP("browser", "_BrowserEnv")])
+    _use_config(monkeypatch, tmp_path, """
+        [envs]
+        impls = ["agentenv_exits_demo:Anything"]
+    """)
+
+    inv = inventory()
+
+    assert inv.group_errors[plugins.ENVS].code == "group-build-failed"
+    assert _contribution(inv, plugins.ENVS, "browser").code == "group-build-failed"
 
 
 def test_packages_with_unreadable_metadata_are_not_merged(monkeypatch):
@@ -424,9 +531,10 @@ def test_entry_points_that_cannot_be_read_are_reported_with_the_package_at_fault
 
     assert set(inv.discovery_errors) == {
         plugins.ENVS, plugins.ARTIFACTS, plugins.TASK_STEPS,
-        plugins.SANDBOX_PROVIDERS, plugins.STATE_PROVIDERS, plugins.EXPLORER_PLUGINS,
+        plugins.SANDBOX_PROVIDERS, plugins.STATE_PROVIDERS, plugins.ENV_PROVIDERS, plugins.EXPLORER_PLUGINS,
     }
-    assert str(info) in inv.discovery_errors[plugins.ENVS]
+    assert inv.discovery_errors[plugins.ENVS].code == "entry-points-unreadable"
+    assert str(info) in inv.discovery_errors[plugins.ENVS].reason
     assert inv.distributions == ()
 
 
@@ -435,8 +543,10 @@ def test_a_name_one_package_declares_twice_says_so(monkeypatch):
 
     found = [c for d in inventory().distributions for c in d.contributions]
 
-    assert {c.status for c in found} == {"conflict"}
-    assert {c.reason for c in found} == {"this package declares the name more than once"}
+    assert {(c.status, c.code) for c in found} == {("conflict", "name-conflict")}
+    assert all(c.reason.startswith("this package declares the name more than once: 'browser' from agentenv-demo 1.0")
+               for c in found)
+    assert [c.conflicts_with[0].value for c in found] == [f"{_HERE}:_OtherBrowserEnv", f"{_HERE}:_BrowserEnv"]
 
 
 def test_no_plugins_installed_is_an_empty_inventory(monkeypatch):
@@ -448,5 +558,6 @@ def test_no_plugins_installed_is_an_empty_inventory(monkeypatch):
 
 
 def test_the_public_types_name_the_public_module():
-    for public in (plugins.Inventory, plugins.Distribution, plugins.Contribution, PluginConflictError):
+    for public in (plugins.Inventory, plugins.Distribution, plugins.Contribution, plugins.Diagnostic, plugins.Claimant,
+                   plugins.Replacement):
         assert public.__module__ == "agent_env.plugins"

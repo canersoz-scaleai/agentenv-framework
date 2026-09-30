@@ -40,10 +40,6 @@ import {
   type VerificationResults,
 } from './rubric-grading-results';
 import {
-  CuaAgentJudgeResult,
-  parseCuaAgentJudgeMessage,
-} from './cua-agent-judge-result';
-import {
   classifyVerifier,
   renderJudgeOutputFormatVerifier,
 } from '../lib/verifier-visualizers';
@@ -52,102 +48,7 @@ import {
   shouldCollapseBarDownloads,
   type BarDownload,
 } from '../lib/bar-downloads';
-
-const OSWORLD_V2_OUTPUT_START = '--- verifier output ---';
-const OSWORLD_V2_OUTPUT_END = '--- end verifier output ---';
-
-function OSWorldV2VerifierMessage({
-  message,
-  topLineScore,
-}: {
-  message: string;
-  topLineScore: number;
-}) {
-  const start = message.indexOf(OSWORLD_V2_OUTPUT_START);
-  if (start < 0) {
-    return (
-      <CuaAgentJudgeResult message={message} topLineScore={topLineScore} />
-    );
-  }
-
-  const outputStart = start + OSWORLD_V2_OUTPUT_START.length;
-  const end = message.indexOf(OSWORLD_V2_OUTPUT_END, outputStart);
-  const summary = message.slice(0, start).trim();
-  const output = message.slice(outputStart, end < 0 ? undefined : end).trim();
-
-  return (
-    <div className="flex flex-col gap-3">
-      {summary && (
-        <p className="text-sm text-[var(--muted-foreground)] whitespace-pre-wrap">
-          {summary}
-        </p>
-      )}
-      <div className="rounded-md border border-[var(--border)] overflow-hidden">
-        <div className="px-3 py-2 text-xs font-semibold bg-[var(--secondary)] border-b border-[var(--border)]">
-          Verifier output
-        </div>
-        <pre className="p-3 max-h-96 overflow-auto text-xs whitespace-pre-wrap break-words font-mono">
-          {output}
-        </pre>
-      </div>
-    </div>
-  );
-}
-
-/** Flatten CUA's nested verifier shape (`[{func, results:[{id,score,result}]}]`) into flat per-check
- *  items — without unwrapping, the per-check counter reads 0/2 even when the score is 1.0. Stamps `func` onto each. */
-function flattenCuaVerifierResults(
-  rawResults: unknown[],
-): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  rawResults.forEach((entry, funcIndex) => {
-    if (!entry || typeof entry !== 'object') return;
-    const rec = entry as Record<string, unknown>;
-    if (Array.isArray(rec.results) && typeof rec.func === 'string') {
-      for (const inner of rec.results) {
-        if (inner && typeof inner === 'object') {
-          // Stamp __funcIndex so the viewer can index the parallel config arrays (options/result/expected) per-check.
-          out.push({
-            __funcIndex: funcIndex,
-            func: rec.func,
-            ...(inner as Record<string, unknown>),
-          });
-        }
-      }
-    } else {
-      out.push(rec);
-    }
-  });
-  return out;
-}
-
-/** The agent judge produces a continuous rubric score, so a pass can land just under 1.0 (e.g. 0.9957);
- *  identifying it lets the UI key pass/fail off the per-check `result` flag instead of `score >= 1`. */
-function isAgentJudgeFunc(func: unknown): boolean {
-  return typeof func === 'string' && func.startsWith('agent_judge');
-}
-
-// CUA agent-judge verifiers return a continuous score; a task passes above this threshold (80%) rather
-// than requiring 1.0. Exact-match/probe verifiers emit 0/1 scores and keep the strict `score >= 1` gate.
-const CUA_AGENT_JUDGE_PASS_THRESHOLD = 0.8;
-
-/** Pick the options dict for one check row. CUA writes `evaluator.options` as an array indexed by func;
- *  others use a single object. Slice the per-func entry or pass through; undefined hides the Options row. */
-function selectCheckOptions(
-  allOptions: unknown,
-  funcIndex: number | undefined,
-): Record<string, unknown> | undefined {
-  if (!allOptions || typeof allOptions !== 'object') return undefined;
-  if (Array.isArray(allOptions)) {
-    if (typeof funcIndex !== 'number') return undefined;
-    const entry = allOptions[funcIndex];
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-      return undefined;
-    }
-    return entry as Record<string, unknown>;
-  }
-  return allOptions as Record<string, unknown>;
-}
+import { collectedZipFiles, isAbsoluteArtifactPath } from '../lib/collected-zip-files';
 
 function renderRubricVerifierPanel(
   verifierId: string,
@@ -174,16 +75,12 @@ function renderRubricVerifierPanel(
   );
 }
 
-import {
-  TrajectoryViewer,
-  type ActionCoverage,
-} from './trajectory-viewer';
+import { TrajectoryViewer } from './trajectory-viewer';
 import {
   type ParsedTrajectory,
   type OtelSpan,
   parseOtelTrajectory,
 } from '../lib/parse-trajectory';
-import { safeHref } from '../lib/safe-url';
 
 interface PromptResponseData {
   prompt_id: string;
@@ -212,9 +109,6 @@ interface TrajectoryState {
   promptText?: string;
   trajectory?: ParsedTrajectory;
   error?: string;
-  // The env type the trajectory was parsed under. resolvedEnvType can start undefined then become e.g.
-  // 'ios_cua' (a different parser), so a parse under a stale type is refetched, not rendered wrong.
-  parsedEnvType?: string;
 }
 
 interface FetchState {
@@ -241,22 +135,16 @@ export interface TaskStepRef {
   target?: string;
   base_path?: string;
   artifact_paths?: string[];
-  init_config?: unknown;
-  evaluator?: unknown;
   // Trigger-registration step fields, threaded through for the badge
   // popovers' authored-config index.
   env_id?: string | null;
   agent_name?: string | null;
   triggers?: unknown;
-  osworld_v2_task_url?: string;
-  osworld_v2_task_path?: string;
 }
 
 export function TaskInstanceViewer({
   instance,
   taskId: taskIdProp,
-  envType,
-  evaluatorConfig,
   rubricsCriteria,
   rubricsAggregator,
   taskSteps,
@@ -270,8 +158,6 @@ export function TaskInstanceViewer({
   // List-derived instances may omit task_id; callers that know it (runner/detail
   // pages) pass it so downstream calls can't send task_id=undefined.
   taskId?: string;
-  envType?: string;
-  evaluatorConfig?: Record<string, unknown>;
   rubricsCriteria?: Record<string, unknown>[];
   /** `score_aggregator` from the rubrics_verifier step ('all_pass' | 'any_pass' | 'weighted_average').
    *  Suppresses the redundant Score badge when it's implied by the pass count. Undefined = all_pass (default). */
@@ -282,22 +168,6 @@ export function TaskInstanceViewer({
 }) {
   const instanceId = instance.instance_id as string;
   const taskId = taskIdProp ?? (instance.task_id as string);
-  // Pick the trajectory renderer from the deployed env's env_type, falling back to the envType prop until
-  // the full instance loads. Prefer a screenshot env (cua/ios_cua) if deployed — it's the only type that changes the parser.
-  const deployedEnvTypes = (
-    ((instance.context as Record<string, unknown> | null)?.deployed_envs as
-      | Record<string, unknown>[]
-      | undefined) ?? []
-  )
-    .map(e => e.env_type)
-    .filter((t): t is string => typeof t === 'string' && t.length > 0);
-  const resolvedEnvType =
-    deployedEnvTypes.find(t => t === 'cua' || t === 'ios_cua') ??
-    deployedEnvTypes[0] ??
-    envType;
-  // Latest resolvedEnvType, readable from in-flight fetches, so a manual Load can drop a parse whose env type went stale.
-  const resolvedEnvTypeRef = useRef(resolvedEnvType);
-  resolvedEnvTypeRef.current = resolvedEnvType;
   const [trajectories, setTrajectories] = useState<
     {
       label: string;
@@ -467,12 +337,7 @@ export function TaskInstanceViewer({
 
       return ordered.map((pr, i) => {
         const resolvedStepId = stepIdByPrompt[pr.prompt_id] ?? pr.step_id;
-        const prevState = prevByUri.get(pr._entryS3Uri);
-        // Reuse a prior parse only if done under the current env type; else drop it to re-fetch with the right parser.
-        const carryover =
-          prevState && prevState.parsedEnvType === resolvedEnvType
-            ? prevState
-            : undefined;
+        const carryover = prevByUri.get(pr._entryS3Uri);
         const initialStatus: TrajectoryState['status'] =
           carryover?.status ?? (ordered.length === 1 ? 'loading' : 'idle');
         const turnSuffix =
@@ -525,30 +390,23 @@ export function TaskInstanceViewer({
             promptText,
             trajectory: carryover?.trajectory,
             error: carryover?.error,
-            parsedEnvType: carryover?.parsedEnvType,
           },
         };
       });
     });
 
-    // Auto-fetch only when there's exactly one (single-step UX). `cancelled` guards the race where
-    // resolvedEnvType changes mid-flight so a stale parse can't overwrite the re-fetch.
+    // Auto-fetch only when there's exactly one (single-step UX). `cancelled` drops a parse that lands
+    // after the effect re-fired, so it can't overwrite the newer fetch.
     let cancelled = false;
     if (ordered.length === 1) {
       const pr = ordered[0]!;
-      const fetchEnvType = resolvedEnvType;
-      fetchTrajectory(pr._entryS3Uri, fetchEnvType, pr.model)
+      fetchTrajectory(pr._entryS3Uri, pr.model)
         .then(parsed => {
           if (cancelled) return;
           setTrajectories(prev =>
             prev.map(t => ({
               ...t,
-              state: {
-                ...t.state,
-                status: 'loaded',
-                trajectory: parsed,
-                parsedEnvType: fetchEnvType,
-              },
+              state: { ...t.state, status: 'loaded', trajectory: parsed },
             })),
           );
         })
@@ -569,7 +427,7 @@ export function TaskInstanceViewer({
     return () => {
       cancelled = true;
     };
-  }, [instanceId, resolvedEnvType, taskSteps, promptResponsesSignature]);
+  }, [instanceId, taskSteps, promptResponsesSignature]);
 
   const loadTrajectoryAt = useCallback(
     (index: number) => {
@@ -577,7 +435,6 @@ export function TaskInstanceViewer({
       if (!target) return;
       // Commit by s3Uri, not array index: `trajectories` can be rebuilt/reordered while a load is in flight.
       const s3Uri = target.state.s3Uri;
-      const fetchEnvType = resolvedEnvType;
       setTrajectories(prev =>
         prev.map(t =>
           t.state.s3Uri === s3Uri
@@ -585,28 +442,20 @@ export function TaskInstanceViewer({
             : t,
         ),
       );
-      fetchTrajectory(s3Uri, fetchEnvType)
+      fetchTrajectory(s3Uri)
         .then(parsed => {
-          // Drop the result if the env type changed since this load started (a stale-parser parse would render wrong).
-          if (fetchEnvType !== resolvedEnvTypeRef.current) return;
           setTrajectories(prev =>
             prev.map(t =>
               t.state.s3Uri === s3Uri
                 ? {
                     ...t,
-                    state: {
-                      ...t.state,
-                      status: 'loaded',
-                      trajectory: parsed,
-                      parsedEnvType: fetchEnvType,
-                    },
+                    state: { ...t.state, status: 'loaded', trajectory: parsed },
                   }
                 : t,
             ),
           );
         })
         .catch(err => {
-          if (fetchEnvType !== resolvedEnvTypeRef.current) return;
           setTrajectories(prev =>
             prev.map(t =>
               t.state.s3Uri === s3Uri
@@ -624,7 +473,7 @@ export function TaskInstanceViewer({
           );
         });
     },
-    [trajectories, resolvedEnvType],
+    [trajectories],
   );
 
   useEffect(() => {
@@ -718,10 +567,6 @@ export function TaskInstanceViewer({
     ? ((context.deployed_envs ?? []) as Record<string, unknown>[])
     : [];
   const metadata = context?.metadata as Record<string, unknown> | undefined;
-  // iOS CUA per-step action-group labels; harmless for non-iOS trajectories (no badges).
-  const iosCuaActionCoverage = metadata?.ios_cua_action_coverage as
-    | ActionCoverage
-    | undefined;
   const serverConfigChanges = (metadata?.server_config_changes ??
     []) as ServerConfigChange[];
   const serverConfigFailures = (
@@ -771,8 +616,6 @@ export function TaskInstanceViewer({
             message: string;
             title?: string;
             justification?: string;
-            actual_s3_uri?: string;
-            expected_url?: string;
           }[];
           score: number;
           format?: string;
@@ -830,106 +673,11 @@ export function TaskInstanceViewer({
           {},
         )
       : null;
-  const artifactRoleMap: Record<string, 'input' | 'result' | 'expected'> =
-    React.useMemo(() => {
-      const inputs = new Set<string>();
-      const results = new Set<string>();
-      const expecteds = new Set<string>();
-      const basename = (p: unknown): string => {
-        if (typeof p !== 'string') return '';
-        const parts = p.split(/[\\/]/);
-        return parts[parts.length - 1] ?? '';
-      };
-      for (const stepRef of taskSteps ?? []) {
-        // TaskStepRef types only shared fields; init_config / evaluator live on the underlying step dict, so cast to a loose record.
-        const step = stepRef as unknown as Record<string, unknown>;
-        if (step.type === 'cua_initialize') {
-          for (const cfg of (step.init_config as unknown[]) ?? []) {
-            if (!cfg || typeof cfg !== 'object') continue;
-            const c = cfg as Record<string, unknown>;
-            if (c.type !== 'download') continue;
-            const params = (c.parameters as Record<string, unknown>) ?? {};
-            for (const f of (params.files as unknown[]) ?? []) {
-              if (!f || typeof f !== 'object') continue;
-              const b = basename((f as Record<string, unknown>).path);
-              if (b) inputs.add(b);
-            }
-          }
-        } else if (step.type === 'cua_evaluate') {
-          const evaluator = (step.evaluator as Record<string, unknown>) ?? {};
-          for (const [key, bucket] of [
-            ['result', results] as const,
-            ['expected', expecteds] as const,
-          ]) {
-            const val = evaluator[key];
-            const items = Array.isArray(val)
-              ? val
-              : val && typeof val === 'object'
-              ? [val]
-              : [];
-            for (const it of items) {
-              if (!it || typeof it !== 'object') continue;
-              const b = basename((it as Record<string, unknown>).path);
-              if (b) bucket.add(b);
-            }
-          }
-        }
-      }
-      const out: Record<string, 'input' | 'result' | 'expected'> = {};
-      for (const b of inputs) out[b] = 'input';
-      for (const b of expecteds) out[b] = 'expected'; // overrides input
-      for (const b of results) out[b] = 'result'; // overrides everything
-      return out;
-    }, [taskSteps]);
   const hasCollectedArtifacts = collectedArtifactSections.length > 0;
   const collectedArtifactsCount = collectedArtifactSections.reduce(
     (n, s) => n + Object.keys(s.artifacts).length,
     0,
   );
-
-  // Golden files from cua_evaluate.evaluator.expected — public cloud URLs (not collected onto the VM), so
-  // surface them as their own previewable section via the same s3:// pipeline.
-  const expectedGoldFiles = React.useMemo(() => {
-    const out: { filename: string; s3Uri: string; sourceUrl: string }[] = [];
-    const seen = new Set<string>();
-    const basename = (p: string): string => {
-      const last = p.split(/[\\/]/).pop() ?? '';
-      // URL keys can be percent-encoded; show the decoded name as the label.
-      try {
-        return decodeURIComponent(last);
-      } catch {
-        return last;
-      }
-    };
-    for (const stepRef of taskSteps ?? []) {
-      const step = stepRef as unknown as Record<string, unknown>;
-      if (step.type !== 'cua_evaluate') continue;
-      const evaluator = (step.evaluator as Record<string, unknown>) ?? {};
-      const expected = evaluator.expected;
-      const items = Array.isArray(expected)
-        ? expected
-        : expected && typeof expected === 'object'
-        ? [expected]
-        : [];
-      for (const it of items) {
-        if (!it || typeof it !== 'object') continue;
-        const e = it as Record<string, unknown>;
-        const url = typeof e.path === 'string' ? e.path : '';
-        if (!url || seen.has(url)) continue;
-        const s3Uri = publicHttpsToS3Uri(url);
-        if (!s3Uri) continue; // only files we can presign for preview
-        seen.add(url);
-        out.push({
-          filename:
-            typeof e.dest === 'string' && e.dest ? e.dest : basename(url),
-          s3Uri,
-          sourceUrl: url,
-        });
-      }
-    }
-    return out;
-  }, [taskSteps]);
-  const hasExpectedGold = expectedGoldFiles.length > 0;
 
   // A "reviewer overview" HTML page (plain-English functionality, API detail collapsed). Rendered in its
   // own tab so a non-technical reviewer reads it in-app instead of downloading a file.
@@ -1292,10 +1040,9 @@ export function TaskInstanceViewer({
                 Overview
               </Tabs.Trigger>
             )}
-            {(hasCollectedArtifacts || hasExpectedGold) && (
+            {hasCollectedArtifacts && (
               <Tabs.Trigger value="collected-artifacts" className="my-1">
-                Collected Artifacts (
-                {collectedArtifactsCount + expectedGoldFiles.length})
+                Collected Artifacts ({collectedArtifactsCount})
               </Tabs.Trigger>
             )}
             {hasCompletedRuns && (
@@ -1464,7 +1211,6 @@ export function TaskInstanceViewer({
                           <TrajectoryViewer
                             trajectory={t.state.trajectory}
                             screenshotBaseUri={t.state.s3Uri}
-                            actionCoverage={iosCuaActionCoverage}
                           />
                         </div>
                       </details>
@@ -1842,11 +1588,7 @@ export function TaskInstanceViewer({
             ) : (
               <div className="flex flex-col gap-4">
                 {Object.entries(verifications!).map(([verifierId, v]) => {
-                  const rawResults = Array.isArray(v.results) ? v.results : [];
-                  // CUA wraps checks as [{func, results:[...]}]; unwrap so passed/total reflects real per-check outcomes.
-                  const results = flattenCuaVerifierResults(
-                    rawResults,
-                  ) as unknown as typeof v.results;
+                  const results = Array.isArray(v.results) ? v.results : [];
                   const isValidationStyle = 'passed' in v;
 
                   if (isValidationStyle) {
@@ -1861,50 +1603,7 @@ export function TaskInstanceViewer({
 
                   const passed = results.filter(r => r.result).length;
                   const total = results.length;
-                  const allPassed = passed === total;
-                  const evalFunc = evaluatorConfig?.func as string | undefined;
-                  const evalOptions = evaluatorConfig?.options as
-                    | Record<string, unknown>
-                    | undefined;
-                  const isInfeasible =
-                    evalFunc === 'infeasible' ||
-                    results.some(
-                      r =>
-                        r.id === 'infeasible' ||
-                        r.id === 'infeasible_on_feasible',
-                    );
-                  const lastPrompt =
-                    promptResponses.length > 0
-                      ? promptResponses[promptResponses.length - 1]
-                      : undefined;
-                  const agentResponse = lastPrompt?.response;
-                  const expectedPath = (
-                    evaluatorConfig?.expected as
-                      | Record<string, unknown>
-                      | undefined
-                  )?.path as string | undefined;
-                  const resultPath = (
-                    evaluatorConfig?.result as
-                      | Record<string, unknown>
-                      | undefined
-                  )?.path as string | undefined;
-                  // Conjunction (and/or) drives how per-check pass/fail rolls up. Surfacing it disambiguates "1/2 passed" next to "Score: 100%" on an OR-gated verifier.
-                  const conjRaw = (
-                    evaluatorConfig?.conj as string | undefined
-                  )?.toLowerCase();
-                  const conj: 'and' | 'or' | null =
-                    conjRaw === 'and' || conjRaw === 'or' ? conjRaw : null;
-                  const showConjBadge = conj !== null && total > 1;
-                  // The agent judge returns a continuous rubric score, so a CUA task passes above the 65% bar
-                  // (CUA_AGENT_JUDGE_PASS_THRESHOLD) rather than requiring 1.0. Other evaluators keep the strict `score >= 1` gate.
-                  const isAgentJudge =
-                    isAgentJudgeFunc(evalFunc) ||
-                    results.some(r =>
-                      isAgentJudgeFunc((r as { func?: unknown }).func),
-                    );
-                  const verifierPassed = isAgentJudge
-                    ? v.score > CUA_AGENT_JUDGE_PASS_THRESHOLD
-                    : v.score >= 1;
+                  const verifierPassed = v.score >= 1;
                   return (
                     <div key={verifierId} className="flex flex-col gap-4">
                       {/* Summary */}
@@ -1917,18 +1616,6 @@ export function TaskInstanceViewer({
                         <span className="text-sm font-semibold">
                           {passed}/{total} checks passed
                         </span>
-                        {showConjBadge && (
-                          <span
-                            className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--muted-foreground)]"
-                            title={
-                              conj === 'or'
-                                ? 'Verifier passes if ANY check passes (conj: or)'
-                                : 'Verifier passes only if ALL checks pass (conj: and)'
-                            }
-                          >
-                            {conj === 'or' ? 'any-pass' : 'all-pass'} ({conj})
-                          </span>
-                        )}
                         <span
                           className={`text-xs font-semibold px-1.5 py-0.5 rounded ${
                             verifierPassed
@@ -1939,220 +1626,43 @@ export function TaskInstanceViewer({
                           Score: {(v.score * 100).toFixed(0)}%
                         </span>
                       </div>
-                      {showConjBadge && passed !== total && v.score >= 1 && (
-                        <p className="text-xs text-[var(--muted-foreground)] -mt-2">
-                          Score is 100% because the evaluator uses{' '}
-                          <code className="px-1 py-0.5 rounded bg-[var(--background)] border border-[var(--border)] font-mono">
-                            conj: or
-                          </code>{' '}
-                          — the verifier passes as long as at least one of{' '}
-                          {total} checks passes.
-                        </p>
-                      )}
 
-                      {/* One block per result/check, with an AND/OR
-                       * connector between consecutive pairs when there's
-                       * more than one check. The connector reinforces the
-                       * pass-rule visually so readers don't have to hold
-                       * the conjunction in their head while scanning. */}
                       {results.map((r, i) => (
-                        <React.Fragment key={i}>
-                          {i > 0 && conj && (
-                            <VerifierConjSeparator conj={conj} />
-                          )}
-                          <div className="rounded-lg border border-[var(--border)] p-4">
-                            {/* Check header */}
-                            <div className="flex items-center gap-2 mb-2">
-                              {r.result ? (
-                                <CheckCircle2
-                                  size={16}
-                                  className="text-green-500 flex-shrink-0"
-                                />
-                              ) : (
-                                <XCircle
-                                  size={16}
-                                  className="text-red-500 flex-shrink-0"
-                                />
-                              )}
-                              <span className="text-sm font-semibold">
-                                {(r.id ?? `check ${i + 1}`).replace(/_/g, ' ')}
+                        <div
+                          key={i}
+                          className="rounded-lg border border-[var(--border)] p-4"
+                        >
+                          {/* Check header */}
+                          <div className="flex items-center gap-2 mb-2">
+                            {r.result ? (
+                              <CheckCircle2
+                                size={16}
+                                className="text-green-500 flex-shrink-0"
+                              />
+                            ) : (
+                              <XCircle
+                                size={16}
+                                className="text-red-500 flex-shrink-0"
+                              />
+                            )}
+                            <span className="text-sm font-semibold">
+                              {(r.id ?? `check ${i + 1}`).replace(/_/g, ' ')}
+                            </span>
+                            {typeof r.score === 'number' && r.score !== 0 && r.score !== 1 && (
+                              <span className="text-xs text-[var(--muted-foreground)]">
+                                score:{' '}
+                                {typeof r.score === 'number'
+                                  ? r.score.toFixed(2)
+                                  : r.score}
                               </span>
-                              {/* For agent_judge_* checks, surface the
-                                  comparison / rubric sub-scores as
-                                  left-aligned percentage pills (parsed from
-                                  the rendered message) in place of the raw
-                                  float. Non-judge checks keep the simple
-                                  rounded "score:" label. */}
-                              {(() => {
-                                const judge =
-                                  typeof r.message === 'string'
-                                    ? parseCuaAgentJudgeMessage(r.message)
-                                    : null;
-                                if (judge) {
-                                  const fmt = (n: number | null) =>
-                                    n === null
-                                      ? '—'
-                                      : `${(n * 100).toFixed(0)}%`;
-                                  return (
-                                    <div className="flex items-center gap-1.5 text-[10px] font-mono">
-                                      <span
-                                        className="px-1.5 py-0.5 rounded bg-[var(--secondary)] border border-[var(--border)] text-[var(--muted-foreground)]"
-                                        title="Rubric sub-score"
-                                      >
-                                        rubric {fmt(judge.rubricScore)}
-                                      </span>
-                                      <span
-                                        className="px-1.5 py-0.5 rounded bg-[var(--secondary)] border border-[var(--border)] text-[var(--muted-foreground)]"
-                                        title="Comparison (golden-compare) sub-score"
-                                      >
-                                        comparison {fmt(judge.verdictScore)}
-                                      </span>
-                                    </div>
-                                  );
-                                }
-                                if (r.score !== 0 && r.score !== 1) {
-                                  return (
-                                    <span className="text-xs text-[var(--muted-foreground)]">
-                                      score:{' '}
-                                      {typeof r.score === 'number'
-                                        ? r.score.toFixed(2)
-                                        : r.score}
-                                    </span>
-                                  );
-                                }
-                                return null;
-                              })()}
-                            </div>
-
-                            {/* Message — agent_judge_* messages get a
-                                structured renderer (per-criterion table with
-                                filters + collapsible reasons); anything else
-                                falls back to the original raw paragraph. */}
-                            {r.message ? (
-                              <div className="mb-3">
-                                {r.id === 'osworld_v2' ? (
-                                  <OSWorldV2VerifierMessage
-                                    message={r.message}
-                                    topLineScore={v.score}
-                                  />
-                                ) : (
-                                  <CuaAgentJudgeResult
-                                    message={r.message}
-                                    topLineScore={v.score}
-                                  />
-                                )}
-                              </div>
-                            ) : null}
-
-                            {/* Details grid */}
-                            <div className="flex flex-col gap-1.5 text-xs">
-                              {/* Prefer the per-check `func` stamped during
-                               * CUA-result flattening; fall back to the
-                               * top-level evaluator func for non-CUA tasks. */}
-                              {((r as { func?: string }).func ?? evalFunc) && (
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[var(--muted-foreground)]">
-                                    Function:
-                                  </span>
-                                  <code className="px-1.5 py-0.5 rounded bg-[var(--background)] border border-[var(--border)] font-mono">
-                                    {(r as { func?: string }).func ?? evalFunc}
-                                  </code>
-                                </div>
-                              )}
-                              {(() => {
-                                // Per-check options: for CUA `options` is an array indexed by func (slice the entry); for others a single dict.
-                                const checkOptions = selectCheckOptions(
-                                  evalOptions,
-                                  (r as { __funcIndex?: number }).__funcIndex,
-                                );
-                                if (
-                                  !checkOptions ||
-                                  Object.keys(checkOptions).length === 0
-                                ) {
-                                  return null;
-                                }
-                                return (
-                                  <div className="flex items-center gap-2 flex-wrap">
-                                    <span className="text-[var(--muted-foreground)]">
-                                      Options:
-                                    </span>
-                                    {Object.entries(checkOptions).map(
-                                      ([key, val]) => (
-                                        <code
-                                          key={key}
-                                          className="px-1.5 py-0.5 rounded bg-[var(--background)] border border-[var(--border)] font-mono text-[var(--muted-foreground)]"
-                                        >
-                                          {key}:{' '}
-                                          {typeof val === 'object' &&
-                                          val !== null
-                                            ? JSON.stringify(val)
-                                            : String(val)}
-                                        </code>
-                                      ),
-                                    )}
-                                  </div>
-                                );
-                              })()}
-                              {(r.expected_url || expectedPath) && (
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[var(--muted-foreground)]">
-                                    Expected:
-                                  </span>
-                                  <a
-                                    href={safeHref(r.expected_url || expectedPath)}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="inline-flex items-center gap-1 text-blue-500 hover:underline"
-                                  >
-                                    <Download size={12} />
-                                    Download
-                                  </a>
-                                </div>
-                              )}
-                              {(r.actual_s3_uri || resultPath) && (
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[var(--muted-foreground)]">
-                                    Actual:
-                                  </span>
-                                  {r.actual_s3_uri ? (
-                                    <button
-                                      onClick={e => {
-                                        e.stopPropagation();
-                                        window.open(
-                                          objectContentUrl(r.actual_s3_uri!),
-                                          '_blank',
-                                        );
-                                      }}
-                                      className="inline-flex items-center gap-1 text-blue-500 hover:underline cursor-pointer"
-                                      title="Download actual result"
-                                    >
-                                      <Download size={12} />
-                                      Download
-                                    </button>
-                                  ) : (
-                                    <code className="px-1.5 py-0.5 rounded bg-[var(--background)] border border-[var(--border)] font-mono truncate">
-                                      {resultPath}
-                                    </code>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-
-                            {/* Agent response for infeasible */}
-                            {isInfeasible && agentResponse && (
-                              <div className="mt-3 pt-3 border-t border-[var(--border)]">
-                                <div className="text-xs font-semibold text-[var(--muted-foreground)] mb-1">
-                                  Agent Response
-                                </div>
-                                <p className="text-xs whitespace-pre-wrap break-words">
-                                  {agentResponse.length > 500
-                                    ? agentResponse.slice(0, 500) + '...'
-                                    : agentResponse}
-                                </p>
-                              </div>
                             )}
                           </div>
-                        </React.Fragment>
+                          {r.message ? (
+                            <p className="text-xs text-[var(--muted-foreground)] whitespace-pre-wrap">
+                              {r.message}
+                            </p>
+                          ) : null}
+                        </div>
                       ))}
                     </div>
                   );
@@ -2190,17 +1700,10 @@ export function TaskInstanceViewer({
           </Tabs.Content>
         )}
 
-        {(hasCollectedArtifacts || hasExpectedGold) && (
+        {hasCollectedArtifacts && (
           <Tabs.Content value="collected-artifacts" className="p-4">
             <div className="flex flex-col gap-5">
-              {/* Render one list per collect step. Golden files (task-level,
-                  not per-step) go to the first section; when there are no
-                  collected artifacts at all, synthesize a single empty section
-                  so the gold-only case still renders. */}
-              {(collectedArtifactSections.length > 0
-                ? collectedArtifactSections
-                : [{ stepId: null, artifacts: {}, basePath: '' }]
-              ).map((section, i) => (
+              {collectedArtifactSections.map((section, i) => (
                 <div
                   key={section.stepId ?? `legacy-${i}`}
                   className="flex flex-col gap-3"
@@ -2217,13 +1720,9 @@ export function TaskInstanceViewer({
                     key={`${instanceId}-${section.stepId ?? i}`}
                     artifacts={section.artifacts}
                     basePath={section.basePath}
-                    roleMap={artifactRoleMap}
                     taskId={taskId}
                     instanceId={instanceId}
                     stepId={section.stepId ?? ''}
-                    expectedGold={
-                      i === 0 && hasExpectedGold ? expectedGoldFiles : undefined
-                    }
                   />
                 </div>
               ))}
@@ -2489,7 +1988,6 @@ async function fetchRawS3Json(
 
 async function fetchTrajectory(
   s3Uri: string,
-  envType?: string,
   modelHint?: string,
 ): Promise<ParsedTrajectory> {
   const base = objectContentUrl(s3Uri);
@@ -2506,29 +2004,7 @@ async function fetchTrajectory(
 
   // modelHint feeds formats whose trajectory carries no model (e.g. OpenClaw),
   // sourced from the prompt-response's `model`.
-  return parseOtelTrajectory(spans, envType, { modelHint });
-}
-
-/** Horizontal rule with an AND/OR label between adjacent verifier checks so the pass-rule reads visually.
- *  Both conjunctions share the same muted weight — the label communicates the rule, not the color. */
-function VerifierConjSeparator({ conj }: { conj: 'and' | 'or' }) {
-  const label = conj === 'or' ? 'OR' : 'AND';
-  return (
-    <div className="flex items-center gap-3 px-2">
-      <div className="flex-1 border-t border-[var(--border)]" />
-      <span
-        className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded border border-[var(--border)] text-[var(--muted-foreground)] bg-[var(--background)]"
-        title={
-          conj === 'or'
-            ? 'The verifier passes if either the check above OR the check below passes'
-            : 'The verifier passes only if the check above AND the check below pass'
-        }
-      >
-        {label}
-      </span>
-      <div className="flex-1 border-t border-[var(--border)]" />
-    </div>
-  );
+  return parseOtelTrajectory(spans, { modelHint });
 }
 
 /** Top-of-tab card for the merged score from an `aggregate_verifiers` step. Reads `source_verifier_ids`
@@ -3060,28 +2536,6 @@ function classifyArtifact(filename: string): ArtifactKind {
   return 'other';
 }
 
-/** Convert a public S3 object URL into an `s3://bucket/key` URI so injected reference files flow through
- *  the same presign backend as collected artifacts. Handles virtual-hosted and path-style forms; null when not an S3 URL. */
-function publicHttpsToS3Uri(url: string): string | null {
-  try {
-    const u = new URL(url);
-    const host = u.hostname;
-    const path = u.pathname.replace(/^\/+/, '');
-    const vhost =
-      host.match(/^(.+?)\.s3[.-][^.]+\.amazonaws\.com$/) ??
-      host.match(/^(.+?)\.s3\.amazonaws\.com$/);
-    if (vhost) return `s3://${vhost[1]}/${path}`;
-    if (/^s3([.-][^.]+)?\.amazonaws\.com$/.test(host)) {
-      const slash = path.indexOf('/');
-      if (slash <= 0) return null;
-      return `s3://${path.slice(0, slash)}/${path.slice(slash + 1)}`;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 // Client-side zip of the files shown in the tab, each at its precomputed base_path-relative path.
 function CollectedArtifactsZipButton({
   instanceId,
@@ -3098,7 +2552,7 @@ function CollectedArtifactsZipButton({
   const [error, setError] = useState<string | null>(null);
 
   const handleZip = useCallback(async () => {
-    // Dedupe paths so same-named files (e.g. two gold files sharing a basename) don't silently overwrite.
+    // Dedupe paths so same-named files don't silently overwrite.
     const seen = new Set<string>();
     const uniquePath = (p: string): string => {
       if (!seen.has(p)) return seen.add(p), p;
@@ -3205,167 +2659,31 @@ function CollectedArtifactsZipButton({
 function CollectedArtifactsList({
   artifacts,
   basePath,
-  roleMap,
   taskId,
   instanceId,
   stepId,
-  expectedGold = [],
 }: {
   artifacts: Record<string, string>;
   basePath: string;
-  roleMap?: Record<string, 'input' | 'result' | 'expected'>;
   taskId: string;
   instanceId: string;
   stepId: string;
-  // Task-level golden files (cua_evaluate.evaluator.expected) — public cloud files, not collected, rendered in the "Expected / gold" column. First section only.
-  expectedGold?: { filename: string; s3Uri: string; sourceUrl: string }[];
 }) {
-  // Artifact keys are absolute source paths (used verbatim) or relative (joined under base_path).
-  const isAbsolute = (p: string) => /^(\/|[A-Za-z]:[\\/])/.test(p);
   const basename = (p: string) => p.split(/[\\/]/).pop() || p;
 
-  type Role = 'expected' | 'result' | 'input' | 'other';
-  type Card = {
-    role: Role;
-    key: string;
-    filename: string;
-    s3Uri: string;
-    sourcePath: string;
-    sourceLabel?: string;
-  };
-
-  // Unify gold (cloud) + collected files into one ordered list. Order: expected → result → input → other.
-  const collected: Record<Role, Card[]> = {
-    expected: [],
-    result: [],
-    input: [],
-    other: [],
-  };
-  for (const [path, uri] of Object.entries(artifacts)) {
-    const role = (roleMap?.[basename(path)] ?? 'other') as Role;
-    collected[role].push({
-      role,
-      key: path,
-      filename: basename(path),
-      s3Uri: uri,
-      sourcePath: isAbsolute(path)
-        ? path
-        : `${basePath.replace(/\/+$/, '')}/${path}`,
-    });
-  }
-  const goldCards: Card[] = expectedGold.map(g => ({
-    role: 'expected',
-    key: `gold:${g.sourceUrl}`,
-    filename: g.filename,
-    s3Uri: g.s3Uri,
-    sourcePath: g.sourceUrl,
-    sourceLabel: 'Source URL',
+  const cards = Object.entries(artifacts).map(([path, uri]) => ({
+    key: path,
+    filename: basename(path),
+    s3Uri: uri,
+    sourcePath: isAbsoluteArtifactPath(path)
+      ? path
+      : `${basePath.replace(/\/+$/, '')}/${path}`,
   }));
-  const allCards: Card[] = [
-    ...goldCards,
-    ...collected.expected,
-    ...collected.result,
-    ...collected.input,
-    ...collected.other,
-  ];
 
-  // Files for the "Download All" zip: everything shown, keyed relative to
-  // base_path (absolute keys stripped) so the tree stays clean; gold under expected/.
-  const base = basePath.replace(/\/+$/, '');
-  const zipFiles = allCards
-    .filter(c => typeof c.s3Uri === 'string' && c.s3Uri.startsWith('s3://'))
-    .map(c => ({
-      path: c.key.startsWith('gold:')
-        ? `expected/${c.filename}`
-        : !isAbsolute(c.key)
-        ? c.key
-        : c.key.startsWith(`${base}/`)
-        ? c.key.slice(base.length + 1)
-        : c.key.replace(/^[/\\]+/, ''),
-      s3Uri: c.s3Uri,
-    }));
+  const zipFiles = collectedZipFiles(artifacts, basePath);
 
   // Render every card — no pagination. Each lazy-loads its URL/bytes/preview only when expanded, so unexpanded rows are cheap.
-  const total = allCards.length;
-  const byRole: Record<Role, Card[]> = {
-    expected: [],
-    result: [],
-    input: [],
-    other: [],
-  };
-  for (const c of allCards) byRole[c.role].push(c);
-
-  // If everything is unclassified "other", the role map found no matches —
-  // drop the group chrome and render a flat list.
-  const onlyOther =
-    byRole.expected.length === 0 &&
-    byRole.result.length === 0 &&
-    byRole.input.length === 0 &&
-    byRole.other.length > 0;
-
-  const ROLE_META: Record<Role, { label: string; blurb: string }> = {
-    expected: {
-      label: 'Expected / gold',
-      blurb:
-        'Reference files from cua_evaluate.evaluator.expected — the golden deliverables the agent output is graded against.',
-    },
-    result: {
-      label: 'Agent deliverables',
-      blurb:
-        'Files the agent produced for cua_evaluate.evaluator.result — these are the outputs being graded.',
-    },
-    input: {
-      label: 'Inputs staged on the VM',
-      blurb:
-        'Files cua_initialize.init_config downloaded onto the VM before the agent ran — round-tripped by collect_artifacts for reference.',
-    },
-    other: {
-      label: 'Other',
-      blurb:
-        "Files collected by the step that aren't listed in the task's init_config or evaluator config.",
-    },
-  };
-
-  const renderBucket = (role: Role, className = '') => {
-    const cards = byRole[role];
-    if (cards.length === 0) return null;
-    return (
-      <div className={`flex flex-col gap-2 ${className}`}>
-        {!onlyOther && (
-          <div className="flex items-baseline gap-2 pb-1.5 border-b border-[var(--border)]">
-            <span className="text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-gray-300 text-gray-800 dark:bg-gray-700 dark:text-gray-200">
-              {role}
-            </span>
-            <span className="text-sm font-semibold text-[var(--foreground)]">
-              {ROLE_META[role].label}
-            </span>
-            <span className="text-xs text-[var(--muted-foreground)]">
-              ({cards.length})
-            </span>
-          </div>
-        )}
-        {!onlyOther && (
-          <p className="text-[11px] text-[var(--muted-foreground)] -mt-1">
-            {ROLE_META[role].blurb}
-          </p>
-        )}
-        <div className="flex flex-col gap-3">
-          {cards.map(c => (
-            <ArtifactCard
-              key={c.key}
-              filename={c.filename}
-              s3Uri={c.s3Uri}
-              sourcePath={c.sourcePath}
-              sourceLabel={c.sourceLabel}
-            />
-          ))}
-        </div>
-      </div>
-    );
-  };
-
-  // Expected/gold and Agent deliverables sit side by side when both present (for comparison); else full width. Inputs/Other stack below.
-  const pairBoth = byRole.expected.length > 0 && byRole.result.length > 0;
+  const total = cards.length;
 
   return (
     <div className="flex flex-col gap-5">
@@ -3380,20 +2698,16 @@ function CollectedArtifactsList({
           />
         )}
       </div>
-      {(byRole.expected.length > 0 || byRole.result.length > 0) && (
-        <div
-          className={
-            pairBoth
-              ? 'flex flex-col lg:flex-row gap-5 items-start'
-              : 'flex flex-col gap-5'
-          }
-        >
-          {renderBucket('expected', pairBoth ? 'flex-1 min-w-0' : '')}
-          {renderBucket('result', pairBoth ? 'flex-1 min-w-0' : '')}
-        </div>
-      )}
-      {renderBucket('input')}
-      {renderBucket('other')}
+      <div className="flex flex-col gap-3">
+        {cards.map(c => (
+          <ArtifactCard
+            key={c.key}
+            filename={c.filename}
+            s3Uri={c.s3Uri}
+            sourcePath={c.sourcePath}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -3410,13 +2724,10 @@ function ArtifactCard({
   filename,
   s3Uri,
   sourcePath,
-  sourceLabel = 'Sandbox path',
 }: {
   filename: string;
   s3Uri: string;
   sourcePath: string;
-  // Source-path row label: collected artifacts came off the VM ("Sandbox path"); injected files came from a URL ("Source URL").
-  sourceLabel?: string;
 }) {
   const kind = classifyArtifact(filename);
   const [presignedUrl, setPresignedUrl] = useState<string | null>(null);
@@ -3560,7 +2871,7 @@ function ArtifactCard({
           {/* Always show source path on expand, including on small screens
               where it's hidden in the row header. */}
           <div className="text-xs text-[var(--muted-foreground)] mb-2 flex items-center gap-2 flex-wrap">
-            <span>{sourceLabel}:</span>
+            <span>Sandbox path:</span>
             <code className="px-1.5 py-0.5 rounded bg-[var(--background)] border border-[var(--border)] font-mono">
               {sourcePath}
             </code>

@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from agent_env.task_step.task_step import TaskStep
     from agent_env.config.runtime import Config
 
+# TaskStep defines this only to raise, so a registered class must override it.
+_MUST_IMPLEMENT = ("from_dict",)
+
 
 def _get_type(cls: type["TaskStep"]) -> str:
     return cls.type
@@ -31,6 +34,7 @@ def _builtin_registry() -> dict[str, type["TaskStep"]]:
     from agent_env.task_step.task_steps.deploy_human_agent import DeployHumanAgentTaskStep
     from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
     from agent_env.task_step.task_steps.reset_env import ResetEnvTaskStep
+    from agent_env.task_step.task_steps.teardown_sandboxes import TeardownSandboxesTaskStep
     from agent_env.task_step.task_steps.verifiers.env_outcome_verifier import EnvOutcomeVerifierTaskStep
     from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
     from agent_env.task_step.task_steps.modify_env_tool_access import ModifyEnvToolAccessStep
@@ -82,6 +86,7 @@ def _builtin_registry() -> dict[str, type["TaskStep"]]:
         _get_type(DeployHumanAgentTaskStep): DeployHumanAgentTaskStep,
         _get_type(DeploySandboxTaskStep): DeploySandboxTaskStep,
         _get_type(ResetEnvTaskStep): ResetEnvTaskStep,
+        _get_type(TeardownSandboxesTaskStep): TeardownSandboxesTaskStep,
         _get_type(EnvOutcomeVerifierTaskStep): EnvOutcomeVerifierTaskStep,
         _get_type(LoadArtifactTaskStep): LoadArtifactTaskStep,
         _get_type(ModifyEnvToolAccessStep): ModifyEnvToolAccessStep,
@@ -131,7 +136,7 @@ def _build_registry(source: Config | None = None) -> dict[str, type["TaskStep"]]
     from agent_env.task_step.task_step import TaskStep
 
     registry = _builtin_registry()
-    validate = _registration.typed_validator(TaskStep, builtins=frozenset(registry))
+    validate = _registration.typed_validator(TaskStep, builtins=frozenset(registry), required=_MUST_IMPLEMENT)
     from_plugins = _registration.merge(registry, _registration.TASK_STEPS, validate, source=source)
     _merge_config_toml_steps(registry, source=source, from_plugins=from_plugins)
     return registry
@@ -165,7 +170,11 @@ def _merge_config_toml_steps(
                 f"[task_steps] impl {impl!r} does not define its own 'type' "
                 f"(inherits the base default {TaskStep.type!r}); set a unique 'type' ClassVar"
             )
-        if not from_plugins.release(cls.type, f"[task_steps] impl {impl!r}", cls) and cls.type in registry:
+        if problem := _registration.unimplemented(cls, TaskStep, _MUST_IMPLEMENT):
+            raise ConfigError(f"[task_steps] impl {impl!r}: {problem}")
+        if from_plugins.refuse(cls.type, f"[task_steps] impl {impl!r}"):
+            continue
+        if not from_plugins.release(cls.type, "task_steps", impl, cls) and cls.type in registry:
             raise ConfigError(
                 f"[task_steps] impl {impl!r} type {cls.type!r} is already registered "
                 f"(conflicts with a built-in or another custom step)"

@@ -18,7 +18,7 @@ from agent_env.artifact.artifact import Artifact
 from agent_env.artifact.artifacts.file import FileArtifact
 from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
 from agent_env.artifact.artifacts.environment_universe import EnvironmentUniverseArtifact
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv
 from agent_env.task_step.context import DeployedAgent, DeployedSandbox, TaskStepContext
 from agent_env.task_step.task_steps import load_artifact as load_artifact_mod
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
@@ -66,7 +66,7 @@ def agent_ctx(monkeypatch):
 
 
 def _deployed_env(env_id: str = "multi-slack-email") -> DeployedEnv:
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id=env_id, env_version=7, gateway_url="http://gw", mcp_url="http://gw/mcp",
         db_web_url=None, sandbox_id="sb-env", instance_id="env-inst-1",
     )
@@ -116,7 +116,7 @@ class TestStagedIntoContainer:
             lambda: type("P", (), {"get_sandbox": staticmethod(_async_none)})(),
             raising=False,
         )
-        from agent_env.providers import sandbox_provider
+        from agent_env.providers.sandbox_providers import sandbox_provider
 
         monkeypatch.setattr(sandbox_provider, "build_sandbox_provider", lambda _t: _FakeProvider())
 

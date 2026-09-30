@@ -24,20 +24,23 @@ def _indent(text: str, prefix: str = "    ") -> str:
 
 
 def _format_env(env) -> str:
+    from agent_env.env.env import DeployedGatewayEnv, DeployedSandboxEnv
+
+    fronted = isinstance(env, DeployedGatewayEnv)  # a record without a gateway has none of its URLs
     lines = [
         "deployed-env:",
         f"  instance_id: {env.instance_id}",
         f"  env_id: {env.env_id}",
         f"  env_version: {env.env_version}",
-        f"  gateway_url: {env.gateway_url}",
+        *([f"  gateway_url: {env.gateway_url}"] if fronted else []),
         f"  mcp_url: {env.mcp_url}",
-        f"  db_web_url: {env.db_web_url}",
-        f"  db_mcp_url: {env.db_mcp_url}",
-        f"  sandbox_id: {env.sandbox_id}",
+        *([f"  db_web_url: {env.db_web_url}", f"  db_mcp_url: {env.db_mcp_url}"] if fronted else []),
     ]
-    if env.sandbox_type:
-        lines.append(f"  sandbox_type: {env.sandbox_type}")
-    if env.vnc_url:
+    if isinstance(env, DeployedSandboxEnv):  # an env outside our sandboxes has no sandbox to name
+        lines.append(f"  sandbox_id: {env.sandbox_id}")
+        if env.sandbox_type:
+            lines.append(f"  sandbox_type: {env.sandbox_type}")
+    if fronted and env.vnc_url:
         lines.append(f"  vnc_url: {env.vnc_url}")
     return "\n".join(lines)
 
@@ -131,7 +134,6 @@ def _format_loaded_snapshot(load: dict) -> str:
         f"  context_id: {load.get('context_id')}",
         f"  source_artifact_id: {load.get('source_artifact_id')}",
         f"  source_artifact_version: {load.get('source_artifact_version')}",
-        f"  source_bundle_s3_url: {load.get('source_bundle_s3_url')}",
     ]
     return "\n".join(lines)
 
@@ -316,7 +318,6 @@ _LITELLM_USING_STEP_TYPES: frozenset[str] = frozenset({
     "deploy_agent",
     "prompt_agent",
     "rubrics_verifier",
-    "cua_initialize",
 })
 
 
@@ -380,25 +381,21 @@ async def _run_single(task, run_index, task_id, output_dir, agent_model=None, ag
 @click.option("--judge-litellm-api-key", default=None, type=str, help="Override LITELLM_API_KEY used by rubrics_verifier judge agents (falls back to --litellm-api-key, then to config secret)")
 @click.option("--apply-trajectory-filter/--no-trajectory-filter", "apply_trajectory_filter", default=None, help="Force trajectory filtering on/off for rubrics_verifier (overrides the step's trajectory_filter setting)")
 @click.option("--a2a-agent-id", default=None, type=str, help="Override A2A agent id for deploy_agent steps")
-@click.option("--remote-token", "remote_tokens", multiple=True, metavar="ENV_ID=TOKEN",
-              help="Per-run bearer token for a remote endpoint env, as ENV_ID=TOKEN (repeatable). Sent as Authorization: Bearer to that env's URL; not persisted.")
 @click.option("--agent-sandbox", default=None,
               help="Override agent sandbox backend(s) for deploy_agent steps; comma-separated for fallback chain (e.g. 'modal,local')")
 @click.option("--project-id", "project_id", default=None, type=str,
               help="Project id for LiteLLM cost attribution. Forwarded as the `user` field on every LLM call and as `projectId:<id>` in `metadata.tags`. Optional, but spend won't be attributed to a project without it.")
 @click.option("--env-sandbox", default=None,
               help="Override env sandbox backend(s) for deploy_env steps; comma-separated for fallback chain (e.g. 'modal,local')")
-@click.option("--cua-sandbox", default=None,
-              help="Override the CUA *desktop* sandbox backend for deploy_env steps (e.g. 'modal' for a container desktop). Distinct from --env-sandbox, which moves the gateway VM. Single backend only — no fallback chain.")
 @click.option("--gateway-env-id", default=None, type=str,
               help="Override default_gateway_env_id (required when --env-sandbox=modal until the default gateway image is rebuilt)")
 @click.option("--service-db-env-id", default=None, type=str,
-              help="Override default_service_db_env_id (use 'default-db-modal' for ECR-backed pgweb/db-mcp images on Modal)")
+              help="Override default_service_db_env_id (on Modal its images must be in the configured image store)")
 @click.option("--env-state-type", default=None, type=str,
               help="Override the env state type for deploy_env steps")
 @click.option("--env-state-instance-id", default=None, type=str,
               help="Attach env to an existing EnvStateInstance")
-def run(task_id: str, task_version: int | None, output_dir: str | None, k: int, agent_model: str | None, agent_artifact_id: str | None, start_step: int, context_json: str | None, litellm_api_key: str | None, judge_litellm_api_key: str | None, apply_trajectory_filter: bool | None, a2a_agent_id: str | None, remote_tokens: tuple[str, ...], agent_sandbox: str | None, project_id: str | None, env_sandbox: str | None, cua_sandbox: str | None, gateway_env_id: str | None, service_db_env_id: str | None, env_state_type: str | None, env_state_instance_id: str | None):
+def run(task_id: str, task_version: int | None, output_dir: str | None, k: int, agent_model: str | None, agent_artifact_id: str | None, start_step: int, context_json: str | None, litellm_api_key: str | None, judge_litellm_api_key: str | None, apply_trajectory_filter: bool | None, a2a_agent_id: str | None, agent_sandbox: str | None, project_id: str | None, env_sandbox: str | None, gateway_env_id: str | None, service_db_env_id: str | None, env_state_type: str | None, env_state_instance_id: str | None):
     """Run a task by executing its steps sequentially."""
     if k < 1:
         raise click.BadParameter("must be at least 1", param_hint="'--k'")
@@ -432,20 +429,10 @@ def run(task_id: str, task_version: int | None, output_dir: str | None, k: int, 
         initial_context.metadata.setdefault("user_overrides", {})["apply_trajectory_filter"] = apply_trajectory_filter
     if a2a_agent_id:
         initial_context.metadata.setdefault("user_overrides", {})["a2a_agent_id"] = a2a_agent_id
-    if remote_tokens:
-        tokens: dict[str, str] = {}
-        for pair in remote_tokens:
-            if "=" not in pair:
-                raise click.BadParameter("expected ENV_ID=TOKEN", param_hint="'--remote-token'")
-            eid, token = pair.split("=", 1)
-            tokens[eid] = token
-        initial_context.metadata.setdefault("user_overrides", {})["remote_tokens"] = tokens
     if agent_sandbox:
         initial_context.metadata.setdefault("user_overrides", {})["agent_sandbox"] = agent_sandbox
     if env_sandbox:
         initial_context.metadata.setdefault("user_overrides", {})["env_sandbox"] = env_sandbox
-    if cua_sandbox:
-        initial_context.metadata.setdefault("user_overrides", {})["cua_sandbox"] = cua_sandbox
     if env_state_type:
         initial_context.metadata.setdefault("user_overrides", {})["env_state_type"] = env_state_type
     if env_state_instance_id:
@@ -516,15 +503,13 @@ def run(task_id: str, task_version: int | None, output_dir: str | None, k: int, 
               help="Override agent sandbox backend(s) for deploy_agent steps; comma-separated for fallback chain (e.g. 'modal,local')")
 @click.option("--env-sandbox", default=None,
               help="Override env sandbox backend(s) for deploy_env steps; comma-separated for fallback chain (e.g. 'modal,local')")
-@click.option("--cua-sandbox", default=None,
-              help="Override the CUA *desktop* sandbox backend for deploy_env steps (e.g. 'modal' for a container desktop). Distinct from --env-sandbox, which moves the gateway VM. Single backend only — no fallback chain.")
 @click.option("--project-id", "project_id", default=None, type=str,
               help="Project id for LiteLLM cost attribution. Forwarded as the `user` field on every LLM call and as `projectId:<id>` in `metadata.tags`. Optional, but spend won't be attributed to a project without it.")
 @click.option("--env-state-type", default=None, type=str,
               help="Override the env state type for deploy_env steps")
 @click.option("--env-state-instance-id", default=None, type=str,
               help="Attach env to an existing EnvStateInstance")
-def run_batch(task_id: str, task_version: int | None, seeds: str, concurrency: int, output_dir: str | None, agent_model: str | None, agent_artifact_id: str | None, litellm_api_key: str | None, judge_litellm_api_key: str | None, apply_trajectory_filter: bool | None, agent_sandbox: str | None, env_sandbox: str | None, cua_sandbox: str | None, project_id: str | None, env_state_type: str | None, env_state_instance_id: str | None):
+def run_batch(task_id: str, task_version: int | None, seeds: str, concurrency: int, output_dir: str | None, agent_model: str | None, agent_artifact_id: str | None, litellm_api_key: str | None, judge_litellm_api_key: str | None, apply_trajectory_filter: bool | None, agent_sandbox: str | None, env_sandbox: str | None, project_id: str | None, env_state_type: str | None, env_state_instance_id: str | None):
     """Run a task in batch against multiple seeds from a CSV file.
 
     Each row in the CSV becomes a seed dict passed to the task via
@@ -586,8 +571,6 @@ def run_batch(task_id: str, task_version: int | None, seeds: str, concurrency: i
                 ctx.metadata.setdefault("user_overrides", {})["agent_sandbox"] = agent_sandbox
             if env_sandbox:
                 ctx.metadata.setdefault("user_overrides", {})["env_sandbox"] = env_sandbox
-            if cua_sandbox:
-                ctx.metadata.setdefault("user_overrides", {})["cua_sandbox"] = cua_sandbox
             if env_state_type:
                 ctx.metadata.setdefault("user_overrides", {})["env_state_type"] = env_state_type
             if env_state_instance_id:

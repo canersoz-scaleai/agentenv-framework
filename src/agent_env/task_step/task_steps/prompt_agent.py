@@ -9,23 +9,30 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Optional
-from urllib.parse import urlparse
-
-import boto3
 import httpx
 from a2a.types import TaskState
-from botocore.credentials import RefreshableCredentials
 
 from agent_env.a2a_agent import A2AAgent, conversation_store
 from agent_env.a2a_agent import protocol
+from agent_env.a2a_agent.object_transfer import (
+    TrajectoryUpload,
+    fetch_trajectory,
+    trajectory_mode,
+)
 from agent_env.config.model import MODEL_PARAMS_RESERVED
-from agent_env.env.gateway.constants import TRIGGER_IN_FLIGHT_STATUSES
+from agent_env.env.gateway.constants import EXT_CLOCK_URI, EXT_TRIGGERS_URI, TRIGGER_IN_FLIGHT_STATUSES
 from agent_env.store import DuplicateKeyError, get_config
 from agent_env.task_step.context import PromptResponse, TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import RetryConfig, TaskStep, TaskStepDependency
-from agent_env.task_step.task_steps.sandbox_utils.sandbox_utils import fetch_container_logs
-from agent_env.task_step.snapshot_utils.agent_state_capture import upload_trajectory
+from agent_env.task_step.task_steps.sandbox_utils.sandbox_utils import (
+    agent_error_text,
+    fetch_container_logs,
+)
+from agent_env.task_step.snapshot_utils.agent_state_capture import (
+    store_trajectory,
+    trajectory_object_url,
+)
 from agent_env.task_step.snapshot_utils.snapshot_series import SnapshotConfig, SnapshotSeries
 
 logger = logging.getLogger(__name__)
@@ -73,10 +80,9 @@ def _parse_structured_output(text: str) -> Optional[dict]:
 def _duplicates_prompt_text(parts: list[dict], prompt_text: Optional[str]) -> bool:
     """True when ``parts`` is exactly the single text part already persisted as
     ``PromptResponse.prompt_text`` — i.e. the first conversation turn of a
-    prompt-mode step. That text can be huge (OpenClaw inlines base64 images into
-    the prompt), so storing it a second time in
-    ``source_agent_per_turn_prompt_parts`` roughly doubles the task-run context
-    doc. Readers treat a ``None`` per-turn entry as "same as
+    prompt-mode step. That text can be huge (a prompt can inline base64 images), so
+    storing it a second time in ``source_agent_per_turn_prompt_parts`` roughly
+    doubles the task-run context doc. Readers treat a ``None`` per-turn entry as "same as
     ``prompt_text``"."""
     if prompt_text is None:
         return False
@@ -94,35 +100,6 @@ _DEFAULT_USER_SIM_OUTPUT_FORMAT: dict[str, Any] = {
         "required": ["message", "done"],
     },
 }
-
-
-_CREDS_DIAG_LOGGED = False
-
-def _log_aws_creds_refreshability_once() -> None:
-    """Log once per process whether boto3's resolved AWS credentials auto-refresh.
-
-    On EKS+IRSA the worker gets RefreshableCredentials and S3 uploads survive
-    arbitrarily-long runs. If this logs `refreshable=False` in production it's
-    a deployment regression — the worker pod is missing IRSA and will fail
-    long-running trajectory uploads the same way the sandbox VMs do.
-    """
-    global _CREDS_DIAG_LOGGED
-    if _CREDS_DIAG_LOGGED:
-        return
-    _CREDS_DIAG_LOGGED = True
-    try:
-        session = boto3._get_default_session()
-        creds = session.get_credentials()
-        if creds is None:
-            logger.warning("AWS credentials: none resolved by boto3 default chain")
-            return
-        is_refreshable = isinstance(creds, RefreshableCredentials)
-        logger.info(
-            "AWS credentials: method=%s refreshable=%s",
-            creds.method, is_refreshable,
-        )
-    except Exception as e:
-        logger.warning("AWS credentials diag failed: %s", e)
 
 
 class PromptAgentTaskStep(TaskStep):
@@ -205,8 +182,6 @@ class PromptAgentTaskStep(TaskStep):
         self.user_output_format = user_output_format
         self.user_model = user_model
         self.snapshot_config = snapshot_config
-        self._s3 = boto3.client("s3")
-        _log_aws_creds_refreshability_once()
 
     @staticmethod
     def _validate_parts(parts: list[dict]) -> None:
@@ -320,8 +295,10 @@ class PromptAgentTaskStep(TaskStep):
     def _trajectory_prefix(self) -> str:
         if self.trajectory_output_prefix:
             return self.trajectory_output_prefix
-        bucket = get_config().get_s3_bucket()
-        return f"s3://{bucket}/prompt_agent_trajectories/prompt_id={self.prompt_id}/"
+        config = get_config()
+        return config.get_object_store().object_url(
+            f"{config.get_artifact_key_prefix()}prompt_agent_trajectories/prompt_id={self.prompt_id}/"
+        )
 
     def _warn_on_snapshot_budget(self) -> None:
         """Flag snapshot settings that will not capture what the caller asked for.
@@ -667,7 +644,7 @@ class PromptAgentTaskStep(TaskStep):
         final_error_for_response: Optional[str] = None
         if final_state == TaskState.failed:
             final_error_for_response = (
-                (final_terminal.error_message or final_terminal.response_text or "")[:500]
+                agent_error_text(final_terminal.error_message, final_terminal.response_text)
                 or container_logs
                 or None
             )
@@ -712,7 +689,7 @@ class PromptAgentTaskStep(TaskStep):
             if sandbox_id:
                 detail_parts.append(f"agent_sandbox={sandbox_id}")
             detail = ", ".join(detail_parts)
-            body = (final_terminal.error_message or final_terminal.response_text or "")[:500]
+            body = agent_error_text(final_terminal.error_message, final_terminal.response_text)
             if container_logs:
                 body = f"{body}\n{container_logs}" if body else container_logs
             if not body:
@@ -725,62 +702,44 @@ class PromptAgentTaskStep(TaskStep):
         return context
 
     async def _fetch_trajectory(self, a2a_url: str, traj_ext: dict, a2a_server_task_id: str, trajectory_output_prefix: str, target_a2a_task_id: str) -> str | None:
-        # Always upload from the worker side, never ask the agent to upload.
-        # Sandbox VMs hold static STS env vars with a fixed expiry; long runs
-        # exceed that and PutObject fails with ExpiredToken. The worker pod's
-        # IRSA creds auto-refresh, so worker-side uploads are robust.
-        endpoint = a2a_url + traj_ext["params"]["endpoint"]
-        # a2a_server_task_id is the ID produced by the A2A server, so it's what we send to them to get the trajectory.
-        payload: dict = {"task_id": a2a_server_task_id}
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(endpoint, json=payload, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-
-        if "trajectory_s3_prefix" in data:
-            prefix = data["trajectory_s3_prefix"]
-            parsed = urlparse(prefix)
-            bucket, prefix_key = parsed.netloc, parsed.path.lstrip("/")
-            objects = self._s3.list_objects_v2(Bucket=bucket, Prefix=prefix_key)
-            files = [o["Key"] for o in objects.get("Contents", [])]
-            if files:
-                return f"s3://{bucket}/{files[0]}"
-            return None
-
-        if "trajectory" in data:
-            # Named by target_a2a_task_id — the client message id persisted on the
-            # conversation as a2a_task_id, so the FE can resolve it (#731). NOT
-            # a2a_server_task_id, which is only the fetch key above.
-            return upload_trajectory(
-                data["trajectory"], trajectory_output_prefix, name=target_a2a_task_id
+        get_method, get_path = A2AAgent.operation(traj_ext, "get")
+        store = get_config().get_object_store()
+        mode = trajectory_mode(get_method, store, by="task_id")
+        if mode is None:
+            raise RuntimeError(
+                "Agent advertises no trajectory get form this object store can serve"
             )
-
-        return None
+        # Fetched by a2a_server_task_id, the id the A2A server produced; stored under
+        # target_a2a_task_id, the client message id persisted on the conversation as
+        # a2a_task_id, so the FE can resolve it (#731).
+        upload = None
+        if mode == "objects":
+            upload = await asyncio.to_thread(
+                TrajectoryUpload.to,
+                store, trajectory_object_url(trajectory_output_prefix, name=target_a2a_task_id, store=store),
+            )
+        fetched = await fetch_trajectory(a2a_url + get_path, {"task_id": a2a_server_task_id}, upload=upload)
+        return await asyncio.to_thread(store_trajectory, fetched, trajectory_output_prefix, name=target_a2a_task_id)
 
     async def _read_env_triggers(self, context: TaskStepContext) -> dict:
-        """Snapshot each deployed env's gateway /triggers/state as {env_id: {trigger_id: status}}; fail-closed on a read error."""
+        """Snapshot each deployed env's triggers state as {env_id: {trigger_id: status}}; {} when its card offers none; fail-closed on a read error."""
         env_triggers: dict = {}
-        async with httpx.AsyncClient() as client:
-            for d in context.deployed_envs:
-                url = f"{d.gateway_url}/triggers/state"
-                last_exc: Optional[Exception] = None
-                for attempt in range(3):
-                    try:
-                        resp = await client.get(url, timeout=15)
-                        if resp.status_code == 404:
-                            env_triggers[d.env_id] = {}
-                            last_exc = None
-                            break
-                        resp.raise_for_status()
-                        env_triggers[d.env_id] = {t["id"]: t.get("status") for t in resp.json().get("triggers", [])}
-                        last_exc = None
-                        break
-                    except Exception as e:
-                        last_exc = e
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                if last_exc is not None:
-                    raise RuntimeError(f"fail-closed: could not read /triggers/state for env '{d.env_id}': {last_exc}")
+        for d in context.deployed_envs:
+            if not d.supports(EXT_TRIGGERS_URI, "state"):
+                env_triggers[d.env_id] = {}
+                continue
+            last_exc: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    state = await d.invoke(EXT_TRIGGERS_URI, "state", timeout=15)
+                    env_triggers[d.env_id] = {t["id"]: t.get("status") for t in state.get("triggers", [])}
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            if last_exc is not None:
+                raise RuntimeError(f"fail-closed: could not read /triggers/state for env '{d.env_id}': {last_exc}")
         return env_triggers
 
     async def _decide(self, decide_url: str, turn: int, solver_message: str, context_id: str, env_triggers: dict) -> dict:
@@ -822,6 +781,8 @@ class PromptAgentTaskStep(TaskStep):
         return {r["env_id"] for r in registrations if isinstance(r, dict) and r.get("env_id")}
 
     async def _capture_env_trigger_state(self, context: TaskStepContext) -> None:
+        from agent_env.env.env import gateway_url_of
+
         registered_env_ids = self._registered_env_ids(context)
         if not registered_env_ids:
             return
@@ -834,8 +795,8 @@ class PromptAgentTaskStep(TaskStep):
                 "capture_step_id": self.id,
             }
             try:
-                state = await self._fetch_settled_trigger_state(deployed.gateway_url)
-                clock = await self._get_clock_state(deployed.gateway_url)
+                state = await self._fetch_settled_trigger_state(deployed)
+                clock = await self._get_clock_state(deployed)
                 # Stamped at the read: the settle poll above can take a minute, which at a high
                 # rate is many virtual days of anchor error.
                 clock_read_at_utc = datetime.now(timezone.utc).isoformat()
@@ -855,7 +816,7 @@ class PromptAgentTaskStep(TaskStep):
                 payload = {
                     "instance_id": context.instance_id,
                     "env_id": deployed.env_id,
-                    "gateway_url": deployed.gateway_url,
+                    "gateway_url": gateway_url_of(deployed),
                     "capture_source": "prompt_agent",
                     "captured_at_utc": entry["captured_at_utc"],
                     "clock": clock,
@@ -864,7 +825,10 @@ class PromptAgentTaskStep(TaskStep):
                     "state": state,
                 }
                 instance_key = context.instance_id or f"adhoc-{uuid.uuid4().hex[:12]}"
-                key = f"env_trigger_state/instance_id={instance_key}/{deployed.env_id}-{uuid.uuid4().hex[:8]}.json"
+                key = (
+                    f"{get_config().get_artifact_key_prefix()}env_trigger_state/"
+                    f"instance_id={instance_key}/{deployed.env_id}-{uuid.uuid4().hex[:8]}.json"
+                )
                 entry["object_url"] = await asyncio.to_thread(
                     store.put, key, json.dumps(payload, indent=2, default=str).encode(),
                     content_type="application/json",
@@ -907,37 +871,30 @@ class PromptAgentTaskStep(TaskStep):
         return not any(t.get("status") in TRIGGER_IN_FLIGHT_STATUSES or t.get("pending")
                        or (t["type"] == "time" and t.get("status") == "armed") for t in rows)
 
-    async def _fetch_settled_trigger_state(self, gateway_url: str, settle_timeout_seconds: float = 60) -> dict:
+    async def _fetch_settled_trigger_state(self, deployed, settle_timeout_seconds: float = 60) -> dict:
         """Full /triggers/state, re-polled briefly while a one-shot trigger is mid-``firing``."""
-        state = await self._get_trigger_state(gateway_url)
+        state = await self._get_trigger_state(deployed)
         deadline = time.monotonic() + settle_timeout_seconds
         while self._is_settling(state) and time.monotonic() < deadline:
             await asyncio.sleep(5)
-            state = await self._get_trigger_state(gateway_url)
+            state = await self._get_trigger_state(deployed)
         return state
 
-    async def _get_clock_state(self, gateway_url: str) -> Optional[dict]:
-        """The gateway clock at capture time; None when unreachable (e.g. no clock/v1)."""
+    async def _get_clock_state(self, deployed) -> Optional[dict]:
+        """The gateway clock at capture time; None when its card offers no clock state, or it is unreachable."""
         try:
-            async with httpx.AsyncClient() as client:
-                # Tight: runs inside the shared capture budget, after the settle poll.
-                resp = await client.get(f"{gateway_url}/clock/state", timeout=5)
-                resp.raise_for_status()
-                return resp.json()
+            # Tight: runs inside the shared capture budget, after the settle poll.
+            return await deployed.invoke(EXT_CLOCK_URI, "state", timeout=5)
         except Exception as e:
-            logger.warning(f"clock state capture failed for {gateway_url} (continuing): {e}")
+            logger.warning(f"clock state capture failed for env '{deployed.env_id}' (continuing): {e}")
             return None
 
-    async def _get_trigger_state(self, gateway_url: str) -> dict:
-        url = f"{gateway_url}/triggers/state"
+    async def _get_trigger_state(self, deployed) -> dict:
         last_exc: Optional[Exception] = None
-        async with httpx.AsyncClient() as client:
-            for attempt in range(3):
-                try:
-                    resp = await client.get(url, timeout=15)
-                    resp.raise_for_status()
-                    return resp.json()
-                except Exception as e:
-                    last_exc = e
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        raise RuntimeError(f"could not read /triggers/state at {gateway_url}: {last_exc}")
+        for attempt in range(3):
+            try:
+                return await deployed.invoke(EXT_TRIGGERS_URI, "state", timeout=15)
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"could not read /triggers/state for env '{deployed.env_id}': {last_exc}")

@@ -55,6 +55,7 @@ class VerifyA2AAgentMCPStep(TaskStep):
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent, protocol
+        from agent_env.env.env import require_gateway_url
 
         deployed_agent = next((a for a in context.deployed_agents), None)
         if deployed_agent is None:
@@ -62,6 +63,8 @@ class VerifyA2AAgentMCPStep(TaskStep):
         deployed_env = next((e for e in context.deployed_envs), None)
         if deployed_env is None:
             raise RuntimeError("No deployed env found in context")
+        # It counts tool calls in the gateway's trajectory, so an env without one can't be checked here.
+        require_gateway_url(deployed_env, "verify_a2a_agent_mcp")
 
         a2a_url = deployed_agent.a2a_url or deployed_agent.api_url
         message_id = uuid.uuid4().hex
@@ -168,8 +171,8 @@ class VerifyA2AAgentMCPStep(TaskStep):
     async def _count_tool_calls(sandbox_id: str) -> int:
         """Read the env gateway trajectory from the gateway container and count tool_call events."""
         from agent_env.providers import get_env_sandbox_provider
-        from agent_env.providers.gateway_provider import GatewayProvider
+        from agent_env.providers import EnvironmentGatewayProvider
         sandbox = await get_env_sandbox_provider().get_sandbox(sandbox_id)
-        events = await GatewayProvider().read_trajectory(sandbox)
+        events = await EnvironmentGatewayProvider().read_trajectory(sandbox)
         count = sum(1 for e in events if e.get("event_type") == "tool_call")
         return count

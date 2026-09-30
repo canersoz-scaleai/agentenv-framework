@@ -14,13 +14,23 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+from agentenv_protocol.a2a_agent import ObjectSnapshotSaveResponse
 
 from agent_env.a2a_agent import A2AAgent
+from agent_env.a2a_agent.object_transfer import (
+    SNAPSHOT_TRAJECTORY_OBJECT_NAME,
+    SNAPSHOT_WORKSPACE_OBJECT_NAME,
+    FetchedTrajectory,
+    TrajectoryUpload,
+    bounded_echo,
+    fetch_trajectory,
+    invoke_transfer,
+    snapshot_save_call,
+    trajectory_mode,
+)
+from agent_env.config import get_config
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_SNAPSHOT_ENDPOINT = "/ext/snapshot"
-DEFAULT_TRAJECTORY_ENDPOINT = "/ext/trajectory"
 
 
 @dataclass
@@ -39,32 +49,10 @@ class WorkspaceCapture:
 @dataclass
 class TrajectoryCapture:
     trajectory: Any = None
+    object_url: str | None = None
     # Non-None means this read produced no trajectory; the caller records it as a
     # `partial` capture reason.
     reason: Optional[str] = None
-
-
-def _bounded_echo(issued: str, echoed: str) -> str:
-    """Where the agent says it wrote, clamped to the prefix we issued.
-
-    Sidecars uploading with their own client nest under it and echo that; registering
-    the issued prefix instead points the artifact a level too high, which
-    `put_existing`'s recursive list hides until a restore cannot find its files.
-
-    Escaping is still refused — `put_existing` registers everything under what it is
-    handed, with the worker's credentials. Nesting is free to allow: the presigned
-    POST's `starts-with $key` already admits any depth under the issued prefix.
-    """
-    issued_norm, echoed_norm = issued.rstrip("/"), echoed.rstrip("/")
-    if echoed_norm == issued_norm:
-        return issued
-    if echoed_norm.startswith(issued_norm + "/"):
-        return echoed
-    logger.warning(
-        "snapshot save echoed a prefix outside the one issued; registering the "
-        "issued one (issued=%s returned=%s)", issued, echoed,
-    )
-    return issued
 
 
 async def capture_workspace(
@@ -80,48 +68,55 @@ async def capture_workspace(
 
     Raises on any failure — without the tar there is nothing to grade."""
     from agent_env.artifact.store import get_artifact_store
-    from agent_env.config import get_config
 
     snapshot_ext = A2AAgent.find_extension(a2a_card or {}, A2AAgent.EXT_SNAPSHOT)
     if not snapshot_ext:
         raise RuntimeError(f"Agent '{agent_name}' does not advertise the snapshot extension")
-    ext_params = snapshot_ext.get("params") or {}
-    save_url = a2a_url + ext_params.get("endpoint", DEFAULT_SNAPSHOT_ENDPOINT)
+    save_method, save_path = A2AAgent.operation(snapshot_ext, "save")
 
     # The random suffix, not the version, isolates captures: two concurrent ones
     # can peek the same version. to_thread because this loop is shared by every
     # concurrent rollout, so a blocking call here stalls their poll loops.
     snapshot_version = await asyncio.to_thread(get_artifact_store().next_version, artifact_id)
+    config = get_config()
     capture_key_prefix = (
-        f"agent_snapshots/{artifact_id}/{snapshot_version}-{uuid.uuid4().hex[:8]}/"
+        f"{config.get_artifact_key_prefix()}agent_snapshots/{artifact_id}/{snapshot_version}-{uuid.uuid4().hex[:8]}/"
     )
-    store = get_config().get_object_store()
+    store = config.get_object_store()
     capture_prefix = store.object_url(capture_key_prefix)
 
-    # Signed with the step's fresh creds: the sidecar's are the deployer's STS
-    # session, frozen at deploy and expired on a long run.
-    presigned_post = await asyncio.to_thread(store.signed_post, capture_prefix)
+    call = await asyncio.to_thread(
+        snapshot_save_call,
+        save_method,
+        store,
+        agent_name=agent_name,
+        context_id=a2a_context_id,
+        capture_prefix=capture_prefix,
+    )
+    save_body = await invoke_transfer(
+        a2a_url + save_path,
+        call,
+        verb="POST",
+        operation="snapshot save",
+        timeout=timeout_seconds,
+        response_model=ObjectSnapshotSaveResponse,
+    )
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            save_url,
-            json={
-                "context_id": a2a_context_id,
-                "s3_prefix": capture_prefix,
-                # Absent, not null, when the backend cannot sign: the sidecar then
-                # uploads with its own client.
-                **({"presigned_post": presigned_post} if presigned_post else {}),
-            },
-            timeout=timeout_seconds,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"snapshot save failed: {resp.status_code} {resp.text}")
-        save_body = resp.json()
-
-    echoed = save_body.get("s3_prefix")
-    if not echoed:
-        raise RuntimeError(f"snapshot save response missing 's3_prefix': {save_body}")
-    registered_prefix = _bounded_echo(capture_prefix, echoed)
+    if call.mode == "objects":
+        # The agent's answer is only a claim: a snapshot missing either object cannot be restored.
+        listed = await asyncio.to_thread(store.list_at, capture_prefix)
+        stored = {url.rsplit("/", 1)[-1] for url in listed}
+        missing = {SNAPSHOT_TRAJECTORY_OBJECT_NAME, SNAPSHOT_WORKSPACE_OBJECT_NAME} - stored
+        if missing:
+            raise RuntimeError(
+                f"snapshot save from agent '{agent_name}' left {sorted(missing)} out of the object store"
+            )
+        registered_prefix = capture_prefix
+    else:
+        echoed = save_body.get("s3_prefix")
+        if not echoed:
+            raise RuntimeError(f"snapshot save response missing 's3_prefix': {save_body}")
+        registered_prefix = bounded_echo(capture_prefix, echoed)
 
     from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
 
@@ -150,29 +145,13 @@ async def capture_workspace(
     )
 
 
-def _accepts_context_id(method: dict) -> bool:
-    """Does this advertised ``get`` take ``context_id``, per its own request contract?
-
-    The keys are mutually exclusive and advertised as a ``oneOf``, so the accepted
-    set unions every branch's ``required`` with the flat ``required``/``optional``.
-    Distinguishes a card advertising ``get`` as ``task_id``-only — which would 400
-    on every tick — without a round-trip.
-    """
-    request = (method or {}).get("request") or {}
-    accepted: set[str] = set()
-    for branch in request.get("oneOf") or []:
-        accepted.update((branch or {}).get("required") or [])
-    accepted.update(request.get("required") or [])
-    accepted.update(request.get("optional") or [])
-    return "context_id" in accepted
-
-
 async def read_partial_trajectory(
     *,
     a2a_url: str,
     a2a_card: dict,
     context_id: str,
     timeout_seconds: float,
+    trajectory_output_prefix: str,
 ) -> TrajectoryCapture:
     """Read the trajectory-so-far for an in-progress run.
 
@@ -191,40 +170,46 @@ async def read_partial_trajectory(
     traj_ext = A2AAgent.find_extension(a2a_card or {}, A2AAgent.EXT_TRAJECTORY)
     if not traj_ext:
         return TrajectoryCapture(reason="trajectory_ext_unavailable")
-    params = traj_ext.get("params") or {}
     # Presence, not truthiness: a card may advertise a method as a bare `{}`,
     # which is falsy. Testing truth would read such a card as not having it.
-    get_method = (params.get("methods") or {}).get("get")
+    get_method, get_path = A2AAgent.operation(traj_ext, "get")
     if get_method is None:
         return TrajectoryCapture(reason="trajectory_get_unadvertised")
-    if not _accepts_context_id(get_method):
+    # Only an explicit request contract offers the context mode: a `get` that declares
+    # none may be task_id-only, and would 400 on every tick.
+    if "request" not in get_method:
+        return TrajectoryCapture(reason="trajectory_context_unsupported")
+    store = get_config().get_object_store()
+    mode = trajectory_mode(get_method, store, by="context_id")
+    if mode is None:
         return TrajectoryCapture(reason="trajectory_context_unsupported")
 
-    endpoint = a2a_url + params.get("endpoint", DEFAULT_TRAJECTORY_ENDPOINT)
+    upload = None
+    if mode == "objects":
+        try:
+            object_url = trajectory_object_url(trajectory_output_prefix, store=store)
+            upload = await asyncio.to_thread(TrajectoryUpload.to, store, object_url)
+        except Exception as exc:
+            logger.warning("partial trajectory grant failed for %s: %s", context_id, exc)
+            return TrajectoryCapture(reason="trajectory_grant_unavailable")
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                endpoint, json={"context_id": context_id}, timeout=timeout_seconds
-            )
+        fetched = await fetch_trajectory(
+            a2a_url + get_path, {"context_id": context_id}, upload=upload, timeout=timeout_seconds
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            # No transcript yet — the agent hasn't written a turn.
+            return TrajectoryCapture(reason="trajectory_session_missing")
+        return TrajectoryCapture(reason=f"trajectory_http_{exc.response.status_code}")
     except Exception as exc:
         logger.warning("partial trajectory read failed for %s: %s", context_id, exc)
         return TrajectoryCapture(reason="trajectory_read_failed")
 
-    if resp.status_code == 404:
-        # No transcript yet — the agent hasn't written a turn.
-        return TrajectoryCapture(reason="trajectory_session_missing")
-    if resp.status_code >= 400:
-        return TrajectoryCapture(reason=f"trajectory_http_{resp.status_code}")
-
-    try:
-        data = resp.json()
-    except Exception:
-        return TrajectoryCapture(reason="trajectory_read_failed")
-
-    trajectory = data.get("trajectory")
-    if not trajectory:
+    if fetched.object_url is not None:
+        return TrajectoryCapture(object_url=fetched.object_url)
+    if not fetched.inline:
         return TrajectoryCapture(reason="trajectory_empty")
-    return TrajectoryCapture(trajectory=trajectory)
+    return TrajectoryCapture(trajectory=fetched.inline)
 
 
 def upload_trajectory(
@@ -239,7 +224,6 @@ def upload_trajectory(
     (#731); omit it to get a random one, which is what writing repeatedly under a
     single prefix needs, since a fixed name would overwrite the last upload.
     """
-    from agent_env.config import get_config
 
     store = get_config().get_object_store()
     # Via the store, not urlparse().path: a prefix naming a different bucket
@@ -252,3 +236,26 @@ def upload_trajectory(
     return store.put(key, body, content_type="application/json")
 
 
+def store_trajectory(
+    fetched: FetchedTrajectory, trajectory_output_prefix: str, *, name: Optional[str] = None
+) -> str | None:
+    """The URL of a fetched trajectory, storing it first when the agent returned it inline."""
+    if fetched.object_url is not None:
+        return fetched.object_url
+    if fetched.legacy_prefix:
+        urls = get_config().get_object_store().list_at(fetched.legacy_prefix)
+        return urls[0] if urls else None
+    if fetched.inline is not None:
+        return upload_trajectory(fetched.inline, trajectory_output_prefix, name=name)
+    return None
+
+
+def trajectory_object_url(
+    trajectory_output_prefix: str, *, store, name: Optional[str] = None
+) -> str:
+    """Return the durable URL used for one agent-written trajectory."""
+    prefix_key = store.get_object_key(trajectory_output_prefix)
+    if prefix_key and not prefix_key.endswith("/"):
+        prefix_key += "/"
+    key = f"{prefix_key}trajectory-{name or uuid.uuid4().hex[:12]}.json"
+    return store.object_url(key)

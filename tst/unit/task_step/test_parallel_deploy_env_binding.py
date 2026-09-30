@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 
-ENV_ID = "openclaw-damien_coleman-multi-0gr8479d"
+ENV_ID = "multi-env-0gr8479d"
 
 
 def _fake_env_deploying_to(mcp_url: str, sandbox_id: str):
@@ -27,7 +27,7 @@ def _fake_env_deploying_to(mcp_url: str, sandbox_id: str):
     """
     async def _deploy(**_kwargs):
         await asyncio.sleep(0)
-        return DeployedEnv(
+        return DeployedGatewayEnv(
             env_id=ENV_ID,
             env_version=1,
             gateway_url=f"https://gw-{sandbox_id}",

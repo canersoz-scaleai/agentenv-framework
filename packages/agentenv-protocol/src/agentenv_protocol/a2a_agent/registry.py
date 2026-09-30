@@ -5,7 +5,8 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, get_type_hints
+from types import UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel
 
@@ -48,13 +49,16 @@ def _validate_handler_signature(
         annotation = parameter.annotation
         if isinstance(annotation, str):
             annotation = handler.__globals__.get(annotation, annotation)
-    valid_annotation = annotation is request_model
-    if (
-        allow_request_supertype
-        and isinstance(annotation, type)
-        and issubclass(annotation, BaseModel)
-    ):
-        valid_annotation = issubclass(request_model, annotation)
+    is_union = isinstance(annotation, UnionType) or get_origin(annotation) is Union
+    accepted = get_args(annotation) if is_union else (annotation,)
+    valid_annotation = request_model in accepted
+    if allow_request_supertype:
+        valid_annotation = any(
+            isinstance(model, type)
+            and issubclass(model, BaseModel)
+            and issubclass(request_model, model)
+            for model in accepted
+        )
     if not valid_annotation:
         raise ValueError(
             f"handler for {label} must annotate its request argument as "

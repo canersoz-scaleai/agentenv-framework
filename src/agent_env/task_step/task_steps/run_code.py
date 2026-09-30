@@ -16,7 +16,6 @@ can see the agent's workspace.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -25,6 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Optional, Protocol
 
+from agent_env.artifact import Artifact, FileArtifact
+from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
+from agent_env.env.env import require_sandbox
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -142,7 +144,7 @@ class RunCodeTaskStep(TaskStep):
         return []
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        script_file, files = self._load_script()
+        script_file, files = await asyncio.to_thread(self._load_script)
         target = await self._resolve_target(context)
         run_dir = f"{_RUN_DIR}/{self.id}"
 
@@ -161,9 +163,6 @@ class RunCodeTaskStep(TaskStep):
 
     def _resolve_script_artifact(self) -> tuple[str, Any]:
         """Resolve to ``(entry_filename, artifact)``; reads documents only, never content."""
-        from agent_env.artifact import Artifact, FileArtifact
-        from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
-
         artifact = Artifact.get(self.script_artifact_id, self.script_artifact_version)
         if isinstance(artifact, FileArtifact):
             if self.script_file:
@@ -245,7 +244,7 @@ class RunCodeTaskStep(TaskStep):
     def _load_script(self) -> tuple[str, dict[str, bytes]]:
         """Resolve the artifact and load only its ``.py`` members: ``(entry, {name: bytes})``."""
         script_file, artifact = self._resolve_script_artifact()
-        if not hasattr(artifact, "get_file_artifacts"):
+        if isinstance(artifact, FileArtifact):
             return (script_file, {script_file: artifact.load()})
 
         # .py only: these universes are often collect_artifacts output, uncapped and binary.
@@ -339,7 +338,7 @@ class RunCodeTaskStep(TaskStep):
     # --- run targets ---
 
     async def _host_target(self, context: TaskStepContext) -> _ExecTarget:
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             build_sandbox_provider,
             get_env_sandbox_provider,
         )
@@ -347,6 +346,8 @@ class RunCodeTaskStep(TaskStep):
         deployed = next(
             (d for d in context.deployed_envs if d.env_id == self.env_id), None
         )
+        if deployed is not None:
+            deployed = require_sandbox(deployed, "run_code on the env's host")
         if deployed is None or not deployed.sandbox_id:
             raise RuntimeError(
                 f"Env '{self.env_id}' not found in context.deployed_envs "
@@ -364,8 +365,9 @@ class RunCodeTaskStep(TaskStep):
     async def _agent_target(self, context: TaskStepContext) -> _ExecTarget:
         # Runs inside the agent container. VM mode needs `sudo docker exec -u 0`:
         # docker on the host needs sudo, and -u 0 reads the root-owned copied files.
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
+            build_sandbox_provider,
             get_agent_sandbox_provider,
         )
 
@@ -377,7 +379,11 @@ class RunCodeTaskStep(TaskStep):
                 f"Agent '{self.agent_name}' not found in context.deployed_agents "
                 "(or missing sandbox_id)"
             )
-        sandbox = await get_agent_sandbox_provider().get_sandbox(agent.sandbox_id)
+        provider = build_sandbox_provider(agent.sandbox_type) if agent.sandbox_type else get_agent_sandbox_provider()
+        sandbox = await provider.get_sandbox(agent.sandbox_id)
+        if agent.on_host:
+            # A host-installed agent has no container: stage and run on the VM host, as root.
+            return _HostTarget(sandbox)
         prefix = (
             ("sudo", "docker", "exec", "-u", "0", sandbox.container_name)
             if sandbox.mode == SANDBOX_MODE_VM
@@ -429,12 +435,7 @@ class _HostTarget:
         )
 
     async def write_file(self, path: str, content: str) -> None:
-        # base64 so any bytes survive the heredoc; exec_script writes as root.
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        await self.sandbox.exec_script(
-            f"mkdir -p {shlex.quote(os.path.dirname(path))} && "
-            f"base64 -d > {shlex.quote(path)} <<'AE_RUN_CODE_B64'\n{encoded}\nAE_RUN_CODE_B64"
-        )
+        await self.sandbox.write_host_file(content.encode("utf-8"), path)
 
     async def run(self, *command: str) -> tuple[int, str, str]:
         # Files are written as root, so run as root too.

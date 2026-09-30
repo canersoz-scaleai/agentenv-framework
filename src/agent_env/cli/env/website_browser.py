@@ -11,7 +11,6 @@ from agent_env.env.envs.website_browser import (
     PLAYWRIGHT_MCP_VERSION,
     WEBSITE_BROWSER_IMAGE_TAG,
     WEBSITE_BROWSER_ENVIRONMENT_NAME,
-    WEBSITE_BROWSER_SERVICE_VERSION,
 )
 
 _PACKAGE_ROOT = Path(__file__).parent.parent.parent
@@ -71,7 +70,6 @@ def put(env_id: str, metadata_pairs: tuple[str, ...], build_platform: str):
         id=env_id,
         docker_image_artifact=artifact,
         environment_name=WEBSITE_BROWSER_ENVIRONMENT_NAME,
-        service_version=WEBSITE_BROWSER_SERVICE_VERSION,
         metadata=metadata if metadata else None,
     )
-    click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name} service_version={env.service_version}")
+    click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name}")

@@ -10,7 +10,8 @@ def validate(task_id: str, task_version: int | None):
     """Validate a stored task's step config without deploying anything.
 
     Reports steps whose script artifact does not resolve, or resolves to the wrong
-    type. Exits non-zero when there are problems, so it can gate CI.
+    type, and deploy_env steps that couldn't deploy their env. Exits non-zero
+    when there are problems, so it can gate CI.
     """
     from agent_env.task import Task
     from agent_env.task_step.task_step import TaskStep

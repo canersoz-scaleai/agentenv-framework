@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from pydantic import Field
 from agentenv_protocol import (
@@ -31,8 +32,9 @@ class SlackEnv(AgentEnvEnvironment):
     @add_data
     async def _add(self, parts):
         # Seeds arrive as an inline DataPart (live deploy) OR a FilePart whose
-        # file carries inline bytes or a file:// URI (exported bundles). Handle
-        # all three — dropping the FilePart branch makes bundles load empty.
+        # file carries inline bytes, a file:// URI (a staged file or an exported
+        # bundle) or an https:// URL (a signed URL, when agent-env can't stage the
+        # file). Handle all four — dropping the FilePart branch makes bundles load empty.
         for p in parts:
             if isinstance(p, DataPart):
                 payload = p.data
@@ -40,6 +42,9 @@ class SlackEnv(AgentEnvEnvironment):
                 f = p.file
                 if getattr(f, "bytes", None) is not None:
                     payload = json.loads(base64.b64decode(f.bytes))
+                elif urlparse(f.uri).scheme in ("http", "https"):
+                    with urlopen(f.uri) as response:
+                        payload = json.loads(response.read())
                 else:
                     payload = json.loads(Path(urlparse(f.uri).path).read_bytes())
             else:
@@ -79,8 +84,9 @@ raises.
 ## Serving
 
 `serve()` builds the FastMCP app via `create_fastmcp_app()`, which encodes the agent-env deploy
-contract once — the name resolution order (`@environment_card`'s name, then `ENVIRONMENT_NAME`,
-then the class name; `SERVICE_NAME` is no longer consulted), `MCP_HOST`/`MCP_PORT`
+contract once — the name resolution order (`ENVIRONMENT_NAME`, which agent-env sets to the env's
+registered name, then `@environment_card`'s name, then the class name; `SERVICE_NAME` is no
+longer consulted), `MCP_HOST`/`MCP_PORT`
 binding (default 18765), DNS-rebinding protection off (gateways reach servers by compose
 hostname, which mcp's localhost-only default allowlist rejects), and the AgentEnv mount — then
 runs `streamable-http`. Pre-declared card content is more `@environment_card(...)` kwargs — any
@@ -347,41 +353,53 @@ explicit features or request variants.
 
 ```python
 from agentenv_protocol.a2a_agent import (
-    ContextTrajectoryRequest,
+    ContextObjectTrajectoryRequest,
+    ObjectSnapshotLoadRequest,
+    ObjectSnapshotSaveRequest,
     SNAPSHOT_V1,
-    SnapshotLoadRequest,
-    SnapshotSaveRequest,
     TRAJECTORY_V1,
     extension,
 )
 
 
 @extension(SNAPSHOT_V1.save)
-async def save_snapshot(self, request: SnapshotSaveRequest):
+async def save_snapshot(self, request: ObjectSnapshotSaveRequest):
     ...
 
 
 @extension(SNAPSHOT_V1.load)
-async def load_snapshot(self, request: SnapshotLoadRequest):
+async def load_snapshot(self, request: ObjectSnapshotLoadRequest):
     ...
 
 
-@extension(TRAJECTORY_V1.get.context)
-async def get_live_trajectory(self, request: ContextTrajectoryRequest):
+@extension(TRAJECTORY_V1.get.context_objects)
+async def get_live_trajectory(self, request: ContextObjectTrajectoryRequest):
     ...
 ```
 
-The last handler opts that agent into the optional `context_id` request variant
-of `TRAJECTORY_V1.get`; without it the generated card advertises only `task_id`.
+The last handler opts that agent into the optional live-context variant of
+`TRAJECTORY_V1.get` that uploads through an object grant;
+`TRAJECTORY_V1.get.context` (`ContextTrajectoryRequest`) is its inline
+counterpart. Without them the generated card advertises only the
+framework-owned completed-task variants: `{task_id}`, answered inline, and
+`{task_id, objects}`, answered by upload.
 Snapshot `save` and `load` are an atomic core contract, while its optional
 changelog handlers are enabled as an atomic feature group.
+Each operation has at most one response model. The framework validates a
+handler's return value against it before serializing, so a response with a
+missing or unknown field is an HTTP 500.
 
 After a successful `SKILL_CONFIG_V1.add` handler call, the framework records
-the registration and includes it in the detached `TaskRequest.skills` snapshot
-for later task executions. It also owns `SKILL_CONFIG_V1.list` and projects the
-installed skill onto the live Agent Card. Agent implementations only install the
-skill into their runtime; they do not implement listing or mutate framework/card
-state. Identity skills remain discoverable but are not injected into
+the skill's `name` and `description`, plus `skill_md` for an inline skill, and
+includes that record in the detached `TaskRequest.skills` snapshot for later
+task executions; a bundle's read grants are not kept. It also owns
+`SKILL_CONFIG_V1.list` and projects the installed skill onto the live Agent
+Card. Agent implementations only install the skill into their runtime; they do
+not implement listing or mutate framework/card state. The SDK contract accepts
+inline `skill_md` for simple single-file skills and `BundleSkillRequest` for
+multi-file or stored skills. A skill name is one path segment matching
+`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`, so a runtime can use it as a directory name.
+Identity skills remain discoverable but are not injected into
 `TaskRequest.skills`. Duplicate names are rejected before installation.
 
 An agent can narrowly replace an SDK implementation while retaining the SDK's
@@ -463,3 +481,90 @@ The agent examples make real OpenAI-compatible model calls. Set
 `LITELLM_API_KEY` and, when needed, `LITELLM_BASE_URL`; their typed agent config
 selects the model and system prompt for each deployment. Tests inject a fake
 model client, so the example suite remains offline and deterministic.
+
+### Object transfer
+
+Skill bundles, trajectories, snapshots and changelog increments move as bytes
+through short-lived HTTPS grants that AgentEnv issues from its object store, so
+an agent never holds storage credentials or a provider location. The types and
+helpers live in `agentenv_protocol.transfers`, which depends only on `pydantic`
+and `httpx`; `agentenv_protocol.a2a_agent` re-exports them.
+
+| Type | Wire shape |
+| --- | --- |
+| `HttpGetGrant`, `HttpPutGrant` | `{kind: "http-get" \| "http-put", url, expires_at, headers?}`, one exact object |
+| `HttpPostPolicyGrant` | `{kind: "http-post-policy", url, fields, path_field, file_field, headers?}`, multipart POST |
+| `WriteNamespaceGrant` | `{root_path, expires_at, max_objects, max_object_bytes, max_total_bytes, write: HttpPostPolicyGrant}` |
+| `ReadObject` | `{media_type, max_bytes, size_bytes?, sha256?, read: HttpGetGrant}` |
+| `WriteObject` | `{media_type, max_bytes, write: HttpPutGrant}` |
+| `Uploaded` | `{size_bytes, sha256?}` |
+
+URLs are absolute HTTPS and timestamps are UTC. `size_bytes` and `sha256`
+describe the stored bytes. The extensions use them as follows (`?` marks an
+optional field, `|` an alternative request):
+
+| Operation | Request | Response |
+| --- | --- | --- |
+| skill `add` | `{name, description, skill_md}` \| `{name, description, skill_bundle: {max_total_bytes, files: [{path, object: ReadObject}]}}` | `{name}` |
+| trajectory `get` | `{task_id}` \| `{context_id}` | `{trajectory}` |
+| | `{task_id \| context_id, objects: {trajectory: WriteObject}}` | `{objects: {trajectory: Uploaded}}` |
+| snapshot `save` | `{context_id, objects: {trajectory: WriteObject, workspace?: WriteObject}}` | `{context_id, objects: {trajectory: Uploaded, workspace?: Uploaded}}` |
+| snapshot `load` | `{objects: {trajectory: ReadObject, workspace?: ReadObject}, target_context_id?}` | `{context_id}` |
+| `enable-changelog` | `{write_namespace: WriteNamespaceGrant, roots?}` | `{roots}` |
+| `apply-changelog` | `{increments: [{sequence, object: ReadObject}], resume_conversation?, target_context_id?}` | `{count, context_id?}` |
+
+A bundle contains a root `SKILL.md`; its paths are unique, normalized and
+relative, and their `max_bytes` sum to at most `max_total_bytes`. An uploaded
+trajectory is the JSON encoding of the trajectory value. Snapshot objects are
+opaque `application/octet-stream` in the runtime's own format; when AgentEnv
+sends a workspace grant, the agent uploads the workspace. A changelog agent
+names each increment under the namespace root by its absolute zero-based
+tool-call position, six digits plus an optional extension (`000042.tar`);
+positions are unique but may be sparse, and apply receives them in increasing
+`sequence` order, or none when a rewind stops before the first tool call.
+AgentEnv ignores response fields it does not know, so a response may carry more
+than these shapes; the SDK still refuses unknown request fields.
+
+`upload(target, source)` and `download(source, destination)` move one object;
+`NamespaceUploader(grant).upload(relative_path, source)` writes under a
+namespace. An upload's source is a file path or bytes already in memory. Use one uploader per grant: it runs uploads one at a time, counts an
+overwrite once and enforces the grant's limits. The helpers stream within the
+limits, refuse expired grants and redirects, download with identity encoding and
+check the raw bytes' size and hash, and retry `transfer_unavailable` and
+`transfer_timeout` up to three attempts while the grant is unexpired. A
+`TransferError` raised by a handler is returned with the status below and the
+body `{"error": {"code", "message", "retryable"}}`; the message never carries
+grant material, provider response bodies or local paths.
+
+| Code | HTTP | Retryable with the same grant |
+| --- | ---: | --- |
+| `invalid_transfer` | 400 | No |
+| `grant_expired` | 410 | No |
+| `transfer_too_large` | 413 | No |
+| `integrity_mismatch` | 422 | No |
+| `transfer_rejected` | 502 | No |
+| `transfer_unavailable` | 502 | Yes |
+| `transfer_timeout` | 504 | While unexpired |
+
+Grants are secrets: agents must not log, store or echo them, and the helpers
+keep grant URLs out of `httpx` logs. A provider signature authorizes storage
+access but does not prove that AgentEnv chose the URL, so endpoint and egress
+controls remain the trust boundary. The limits are enforced by the helpers,
+that is by the uploading agent. AgentEnv accepts a trajectory upload response
+without reading the object back, and registers a snapshot only once both its
+objects are in the store.
+
+SDK agents advertise only these shapes. AgentEnv reads each Agent Card, sends
+the object variants when the agent advertises them and its object store issues
+grants (the S3 store does, and namespace grants for changelog capture only when
+it signs with long-term credentials), and keeps the older `s3_prefix`, `skill_s3_url` and
+`trajectory_s3_prefix` shapes for agents that advertise those instead. An SDK
+agent built on this protocol therefore needs an agent-env release that includes
+it: an older release sends the older shapes, which such an agent refuses apart
+from inline skills and trajectories. Roll out in this
+order: release agent-env and `agentenv-protocol` together, move every service
+that embeds agent-env to that release, and only then build agents on the new
+SDK. A snapshot or changelog is restored in the form it was captured in: one
+captured as objects only through the object variants, an older one only
+through `s3_prefix`. Do not roll agent-env back once portable snapshots or
+changelogs exist, because older releases cannot load them.

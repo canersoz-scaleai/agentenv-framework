@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import FrozenInstanceError
 from functools import wraps
-from typing import Any
+from typing import Any, Union
 from unittest.mock import MagicMock
 
 import httpx
@@ -40,8 +40,8 @@ from agentenv_protocol.a2a_agent import (
     AgentConfig,
     AgentEnvAgent,
     AgentIdentity,
-    ChangelogApplyRequest,
-    ChangelogEnableRequest,
+    BundleSkillRequest,
+    ContextObjectTrajectoryRequest,
     ContextTrajectoryRequest,
     DataPart,
     DefaultExtensionHandlers,
@@ -51,14 +51,16 @@ from agentenv_protocol.a2a_agent import (
     ImplementationOwner,
     InlineSkillRequest,
     McpAddRequest,
+    NamespaceChangelogEnableRequest,
     NativeTrajectory,
+    ObjectChangelogApplyRequest,
+    ObjectSnapshotLoadRequest,
+    ObjectSnapshotSaveRequest,
     OperationDefinition,
     PeerAgentsSetRequest,
     RequestDefinition,
     RequestVariant,
-    S3SkillRequest,
-    SnapshotLoadRequest,
-    SnapshotSaveRequest,
+    TaskObjectTrajectoryRequest,
     TaskOutcome,
     TaskProgress,
     TaskRequest,
@@ -92,6 +94,31 @@ from agentenv_protocol.a2a_agent.framework import (
 )
 from pydantic import BaseModel, Field, ValidationError, field_serializer
 from starlette.testclient import TestClient
+
+
+def _skill_bundle_payload(name: str = "review") -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": "Review code",
+        "skill_bundle": {
+            "max_total_bytes": 1024,
+            "files": [
+                {
+                    "path": "SKILL.md",
+                    "object": {
+                        "media_type": "text/markdown",
+                        "max_bytes": 1024,
+                        "size_bytes": 8,
+                        "read": {
+                            "kind": "http-get",
+                            "url": "https://objects.example.test/read?signature=secret",
+                            "expires_at": "2099-01-01T00:00:00Z",
+                        },
+                    },
+                }
+            ],
+        },
+    }
 
 
 def test_agent_capabilities_is_the_upstream_a2a_type() -> None:
@@ -1209,43 +1236,44 @@ def test_unhandled_run_failures_are_opaque_and_correlated(
     assert internal_marker not in response.text
 
 
-def test_request_variants_preserve_existing_one_of_wire_shape() -> None:
-    skill_request = SKILL_CONFIG_V1.operation("add").request
+def test_sdk_skill_contract_is_portable_only() -> None:
+    skill_add = SKILL_CONFIG_V1.operation("add")
+    skill_request = skill_add.request
     assert skill_request is not None
     assert skill_request.to_card() == {
         "required": ["name", "description"],
         "oneOf": [
             {"required": ["skill_md"]},
-            {"required": ["skill_s3_url"]},
+            {"required": ["skill_bundle"]},
         ],
     }
+    assert skill_add.response is not None
+    assert skill_add.response.to_card() == {"required": ["name"]}
+    assert skill_request.select_variant(
+        {"name": "x", "description": "x", "skill_md": "# x"}
+    ) == "inline"
     assert (
-        skill_request.select_variant(
-            {"name": "x", "description": "x", "skill_md": "# x"}
-        )
-        == "inline"
+        skill_request.select_variant(_skill_bundle_payload(name="x")) == "bundle"
     )
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="request must match exactly one"):
         skill_request.select_variant(
             {
                 "name": "x",
                 "description": "x",
-                "skill_md": "# x",
-                "skill_s3_url": "s3://bucket/key",
-            }
-        )
-    with pytest.raises(ValueError, match="version: Extra inputs are not permitted"):
-        skill_request.select_variant(
-            {
-                "name": "x",
-                "description": "x",
-                "skill_md": "# x",
-                "version": "1",
+                "skill_s3_url": "s3://bucket/skill",
             }
         )
 
 
-def test_runtime_owned_request_variants_can_implement_an_operation() -> None:
+@pytest.mark.parametrize("name", ["../app", "a/b", "a\\b", ".hidden", "", "x" * 129])
+def test_skill_names_are_one_safe_path_segment(name: str) -> None:
+    with pytest.raises(ValidationError, match="name"):
+        InlineSkillRequest(name=name, description="x", skill_md="# x")
+    with pytest.raises(ValidationError, match="name"):
+        BundleSkillRequest.model_validate(_skill_bundle_payload(name=name))
+
+
+def test_runtime_can_implement_the_portable_skill_operation() -> None:
     @a2a_agent(
         identity=AgentIdentity(name="variant-agent", description="test", version="1"),
     )
@@ -1255,42 +1283,25 @@ def test_runtime_owned_request_variants_can_implement_an_operation() -> None:
 
         @extension(SKILL_CONFIG_V1.add.inline)
         async def add_inline(self, request: InlineSkillRequest):
-            return {"status": "added", "name": request.name, "source": "inline"}
+            return {"name": request.name}
 
-        @extension(SKILL_CONFIG_V1.add.s3)
-        async def add_s3(self, request: S3SkillRequest):
-            return {"status": "added", "name": request.name, "source": "s3"}
+        @extension(SKILL_CONFIG_V1.add.bundle)
+        async def add_bundle(self, request: BundleSkillRequest):
+            return {"name": request.name}
 
     with TestClient(VariantAgent().create_app()) as client:
         card = client.get("/.well-known/agent.json").json()
-        inline = _operation(
+        added = _operation(
             client,
             card,
             SKILL_CONFIG_V1.uri,
             "add",
-            {
-                "name": "inline-skill",
-                "description": "Inline skill",
-                "skill_md": "# Inline",
-            },
+            _skill_bundle_payload(name="bundle-skill"),
         )
-        assert inline.json()["source"] == "inline"
-
-        s3 = _operation(
-            client,
-            card,
-            SKILL_CONFIG_V1.uri,
-            "add",
-            {
-                "name": "s3-skill",
-                "description": "S3 skill",
-                "skill_s3_url": "s3://bucket/skill/",
-            },
-        )
-        assert s3.json()["source"] == "s3"
+        assert added.json() == {"name": "bundle-skill"}
         assert set(
             _operation(client, card, SKILL_CONFIG_V1.uri, "list").json()["skills"]
-        ) == {"inline-skill", "s3-skill"}
+        ) == {"bundle-skill"}
 
 
 def test_handler_receives_the_canonical_request_model() -> None:
@@ -1340,50 +1351,48 @@ def test_handler_receives_the_canonical_request_model() -> None:
 def test_handler_advertises_the_canonical_request_model() -> None:
     class Agent:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
         @extension(SNAPSHOT_V1.load)
-        async def load(self, request: SnapshotLoadRequest):
+        async def load(self, request: ObjectSnapshotLoadRequest):
             return request
 
         @extension(SNAPSHOT_V1.changelog.enable)
-        async def enable_changelog(self, request: ChangelogEnableRequest):
-            return {"ok": True, "s3_prefix": request.s3_prefix, "roots": []}
+        async def enable_changelog(self, request: NamespaceChangelogEnableRequest):
+            return {"roots": request.roots or []}
 
         @extension(SNAPSHOT_V1.changelog.apply)
-        async def apply_changelog(self, request: ChangelogApplyRequest):
-            return {"ok": True, "count": 0}
+        async def apply_changelog(self, request: ObjectChangelogApplyRequest):
+            return {"count": len(request.increments)}
 
     registry = build_registry(Agent())
-    methods = registry.card_extensions()[0]["params"]["methods"]
+    params = registry.card_extensions()[0]["params"]
+    assert set(params) == {"endpoint", "methods"}
+    methods = params["methods"]
+    assert methods["save"]["request"] == {"required": ["context_id", "objects"]}
+    assert methods["save"]["response"] == {"required": ["context_id", "objects"]}
+    assert methods["load"]["request"] == {
+        "required": ["objects"],
+        "optional": ["target_context_id"],
+    }
+    assert methods["load"]["response"] == {"required": ["context_id"]}
     assert methods["enable-changelog"]["request"] == {
-        "required": ["s3_prefix"],
+        "required": ["write_namespace"],
         "optional": ["roots"],
     }
+    assert methods["enable-changelog"]["response"] == {"required": ["roots"]}
     assert methods["apply-changelog"]["request"] == {
-        "required": ["s3_prefix"],
+        "required": ["increments"],
         "optional": [
-            "up_to_tool_call_exclusive",
             "resume_conversation",
             "target_context_id",
         ],
     }
     assert methods["apply-changelog"]["response"] == {
-        "required": ["ok", "count"],
+        "required": ["count"],
         "optional": ["context_id"],
     }
-
-    class IncompleteAgent:
-        @extension(SKILL_CONFIG_V1.add.inline)
-        async def add_inline(self, request: InlineSkillRequest):
-            return {"status": "added", "name": request.name}
-
-    with pytest.raises(ValueError, match="missing runtime handler.*add.s3"):
-        build_registry(
-            IncompleteAgent(),
-            sdk_handlers={(SKILL_CONFIG_V1.uri, "list"): lambda payload: {}},
-        )
 
 
 def test_request_variants_are_selected_by_model_validation() -> None:
@@ -1412,6 +1421,20 @@ def test_request_variants_are_selected_by_model_validation() -> None:
     )
     with pytest.raises(ValueError, match="exactly one"):
         request.select_variant({"name": "review"})
+
+
+def test_operation_response_models_must_be_closed() -> None:
+    class OpenResponse(BaseModel):
+        value: str
+
+    with pytest.raises(TypeError, match="response model.*extra='forbid'"):
+        OperationDefinition(
+            name="send",
+            method="POST",
+            path="/ext/send",
+            implementation=ImplementationOwner.RUNTIME,
+            response=OpenResponse,
+        )
 
 
 def test_handler_must_use_the_canonical_request_model() -> None:
@@ -1879,11 +1902,11 @@ def test_activation_description_overrides_sdk_default_and_merges_with_handlers()
 ):
     class Agent:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
         @extension(SNAPSHOT_V1.load)
-        async def load(self, request: SnapshotLoadRequest):
+        async def load(self, request: ObjectSnapshotLoadRequest):
             return request
 
     registry = build_registry(
@@ -1902,7 +1925,7 @@ def test_activation_description_overrides_sdk_default_and_merges_with_handlers()
 
 
 def test_trajectory_context_variant_is_advertised_only_with_handler() -> None:
-    async def sdk_handler(request: TaskTrajectoryRequest):
+    async def sdk_handler(request: TaskTrajectoryRequest | TaskObjectTrajectoryRequest):
         return {"trajectory": []}
 
     task_only = build_registry(
@@ -1913,13 +1936,17 @@ def test_trajectory_context_variant_is_advertised_only_with_handler() -> None:
     request = task_only.card_extensions()[0]["params"]["methods"]["get"]["request"]
     assert request == {
         "required": ["task_id"],
-        "optional": ["trajectory_s3_prefix"],
+        "oneOf": [{}, {"required": ["objects"]}],
     }
 
     class ContextAgent:
         @extension(TRAJECTORY_V1.get.context)
         async def get_by_context(self, request: ContextTrajectoryRequest):
-            return {"trajectory": [], "context_id": request.context_id}
+            return {"trajectory": []}
+
+        @extension(TRAJECTORY_V1.get.context_objects)
+        async def upload_by_context(self, request: ContextObjectTrajectoryRequest):
+            return {"objects": {"trajectory": {"size_bytes": 1}}}
 
     with_context = build_registry(
         ContextAgent(),
@@ -1928,10 +1955,11 @@ def test_trajectory_context_variant_is_advertised_only_with_handler() -> None:
     )
     request = with_context.card_extensions()[0]["params"]["methods"]["get"]["request"]
     assert request == {
-        "optional": ["trajectory_s3_prefix"],
         "oneOf": [
             {"required": ["task_id"]},
+            {"required": ["task_id", "objects"]},
             {"required": ["context_id"]},
+            {"required": ["context_id", "objects"]},
         ],
     }
 
@@ -1954,42 +1982,37 @@ async def test_default_handler_delegation_accepts_sdk_request_variant() -> None:
     assert result == {"trajectory": [{"type": "result"}]}
 
 
-@pytest.mark.asyncio
-async def test_trajectory_s3_upload_does_not_consume_cached_trajectory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    services = _SdkServices([enable(TRAJECTORY_V1)], None)
-    trajectory = NativeTrajectory(format="events/v1", payload=[{"type": "result"}])
-    services.task_trajectories["task-1"] = trajectory
-    s3 = MagicMock()
-    s3_client = MagicMock(return_value=s3)
-    monkeypatch.setattr("boto3.client", s3_client)
-    request = TaskTrajectoryRequest(
-        task_id="task-1",
-        trajectory_s3_prefix="s3://trajectory-bucket/tasks/task-1",
-    )
+def test_trajectory_override_annotates_every_sdk_variant() -> None:
+    class Complete:
+        @extension(TRAJECTORY_V1.get)
+        async def get(self, request: TaskTrajectoryRequest | TaskObjectTrajectoryRequest):
+            return {"trajectory": []}
 
-    first = await services.trajectory_get(request)
-    second = await services.trajectory_get(request)
+    class TypingUnion:
+        @extension(TRAJECTORY_V1.get)
+        async def get(self, request: Union[TaskTrajectoryRequest, TaskObjectTrajectoryRequest]):
+            return {"trajectory": []}
 
-    assert first["trajectory_s3_prefix"].startswith(
-        "s3://trajectory-bucket/tasks/task-1/trajectory-"
-    )
-    assert second["trajectory_s3_prefix"].startswith(
-        "s3://trajectory-bucket/tasks/task-1/trajectory-"
-    )
-    assert services.task_trajectories.get("task-1") == trajectory
-    assert [call.args for call in s3_client.call_args_list] == [("s3",), ("s3",)]
-    assert s3.put_object.call_count == 2
-    assert [
-        json.loads(call.kwargs["Body"]) for call in s3.put_object.call_args_list
-    ] == [[{"type": "result"}], [{"type": "result"}]]
+    for agent in (Complete(), TypingUnion()):
+        assert build_registry(agent).conformance() == {
+            "standard_operation_overrides": [
+                {"uri": TRAJECTORY_V1.uri, "operation": "get"}
+            ]
+        }
+
+    class TaskOnly:
+        @extension(TRAJECTORY_V1.get)
+        async def get(self, request: TaskTrajectoryRequest):
+            return {"trajectory": []}
+
+    with pytest.raises(ValueError, match="must annotate.*TaskObjectTrajectoryRequest"):
+        build_registry(TaskOnly())
 
 
 def test_snapshot_requires_atomic_core_and_changelog_groups() -> None:
     class IncompleteSnapshot:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
     with pytest.raises(ValueError, match="missing runtime handler.*load"):
@@ -1997,15 +2020,15 @@ def test_snapshot_requires_atomic_core_and_changelog_groups() -> None:
 
     class IncompleteChangelog:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
         @extension(SNAPSHOT_V1.load)
-        async def load(self, request: SnapshotLoadRequest):
+        async def load(self, request: ObjectSnapshotLoadRequest):
             return request
 
         @extension(SNAPSHOT_V1.changelog.enable)
-        async def enable(self, request: ChangelogEnableRequest):
+        async def enable(self, request: NamespaceChangelogEnableRequest):
             return request
 
     with pytest.raises(ValueError, match="feature .*changelog is incomplete"):
@@ -2013,19 +2036,19 @@ def test_snapshot_requires_atomic_core_and_changelog_groups() -> None:
 
     class CompleteSnapshot:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
         @extension(SNAPSHOT_V1.load)
-        async def load(self, request: SnapshotLoadRequest):
+        async def load(self, request: ObjectSnapshotLoadRequest):
             return request
 
         @extension(SNAPSHOT_V1.changelog.enable)
-        async def enable(self, request: ChangelogEnableRequest):
+        async def enable(self, request: NamespaceChangelogEnableRequest):
             return request
 
         @extension(SNAPSHOT_V1.changelog.apply)
-        async def apply(self, request: ChangelogApplyRequest):
+        async def apply(self, request: ObjectChangelogApplyRequest):
             return request
 
     registered_snapshot = build_registry(CompleteSnapshot()).extension(SNAPSHOT_V1.uri)
@@ -2044,7 +2067,7 @@ def test_snapshot_requires_atomic_core_and_changelog_groups() -> None:
 def test_standard_extension_handler_implicitly_activates_definition() -> None:
     class Agent:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
     with pytest.raises(ValueError, match="missing runtime handler.*load"):
@@ -2052,11 +2075,11 @@ def test_standard_extension_handler_implicitly_activates_definition() -> None:
 
     class CompleteAgent:
         @extension(SNAPSHOT_V1.save)
-        async def save(self, request: SnapshotSaveRequest):
+        async def save(self, request: ObjectSnapshotSaveRequest):
             return request
 
         @extension(SNAPSHOT_V1.load)
-        async def load(self, request: SnapshotLoadRequest):
+        async def load(self, request: ObjectSnapshotLoadRequest):
             return request
 
     registry = build_registry(CompleteAgent())
@@ -2145,21 +2168,17 @@ async def test_concurrent_duplicate_skill_install_is_rejected() -> None:
 
         @extension(SKILL_CONFIG_V1.add.inline)
         async def add_inline(self, request: InlineSkillRequest):
+            return {"name": request.name}
+
+        @extension(SKILL_CONFIG_V1.add.bundle)
+        async def add_bundle(self, request: BundleSkillRequest):
             nonlocal installs
             installs += 1
             install_started.set()
             await finish_install.wait()
-            return {"status": "added", "name": request.name}
+            return {"name": request.name}
 
-        @extension(SKILL_CONFIG_V1.add.s3)
-        async def add_s3(self, request: S3SkillRequest):
-            return {"status": "added", "name": request.name}
-
-    payload = {
-        "name": "review",
-        "description": "Review code",
-        "skill_md": "# Review",
-    }
+    payload = _skill_bundle_payload()
     transport = httpx.ASGITransport(app=Agent().create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = asyncio.create_task(client.post("/ext/skill-config", json=payload))
@@ -2176,6 +2195,36 @@ async def test_concurrent_duplicate_skill_install_is_rejected() -> None:
         assert skill_list.json()["skills"] == {
             "review": {"description": "Review code"}
         }
+
+
+def test_bundle_skill_registration_keeps_no_read_grants() -> None:
+    seen: list[TaskRequest] = []
+
+    @a2a_agent(
+        identity=AgentIdentity(name="skill-agent", description="test", version="1")
+    )
+    class Agent(AgentEnvAgent):
+        async def run(self, request: TaskRequest) -> TaskResult:
+            seen.append(request)
+            return TaskResult.text("ok")
+
+        @extension(SKILL_CONFIG_V1.add.inline)
+        async def add_inline(self, request: InlineSkillRequest):
+            return {"name": request.name}
+
+        @extension(SKILL_CONFIG_V1.add.bundle)
+        async def add_bundle(self, request: BundleSkillRequest):
+            return {"name": request.name}
+
+    with TestClient(Agent().create_app()) as client:
+        assert (
+            client.post("/ext/skill-config", json=_skill_bundle_payload()).status_code
+            == 200
+        )
+        response = client.post("/a2a", json=_message_request())
+        assert response.json()["result"]["status"]["state"] == "completed"
+
+    assert seen[0].skills == ({"name": "review", "description": "Review code"},)
 
 
 def test_custom_extension_cannot_claim_agentenv_namespace() -> None:
@@ -2475,12 +2524,12 @@ def test_generated_app_serves_sdk_extensions_and_a2a_lifecycle() -> None:
         @extension(SKILL_CONFIG_V1.add.inline)
         async def add_inline_skill(self, request: InlineSkillRequest):
             skill_installs.append(request.name)
-            return {"status": "added", "name": request.name}
+            return {"name": request.name}
 
-        @extension(SKILL_CONFIG_V1.add.s3)
-        async def add_s3_skill(self, request: S3SkillRequest):
+        @extension(SKILL_CONFIG_V1.add.bundle)
+        async def add_bundle_skill(self, request: BundleSkillRequest):
             skill_installs.append(request.name)
-            return {"status": "added", "name": request.name}
+            return {"name": request.name}
 
     with TestClient(Agent().create_app()) as client:
         card = client.get("/.well-known/agent.json").json()

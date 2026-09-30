@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from click.testing import CliRunner
 
 from agent_env.cli.env.state.teardown import teardown_env_state
-from agent_env.providers.state import EnvStateInstance
+from agent_env.providers.env_state import EnvStateInstance
 
 # Any config.toml-registered external backend; core ships none, so the tag is just a string here.
 PERSISTENT_REMOTE_POSTGRES_STATE_TYPE = "persistent_remote_postgres"
@@ -22,8 +22,8 @@ def _invoke_persistent(metadata):
     store.get.return_value = instance
     provider = MagicMock()
     provider.teardown = AsyncMock(return_value=None)
-    with patch("agent_env.providers.state.get_env_state_instance_store", return_value=store), \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider):
+    with patch("agent_env.providers.env_state.get_env_state_instance_store", return_value=store), \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider):
         return CliRunner().invoke(teardown_env_state, ["--instance-id", "esi-p"]), provider
 
 
@@ -33,8 +33,8 @@ def test_teardown_cli_drops_and_retires():
     store.get.return_value = instance
     provider = MagicMock()
     provider.teardown = AsyncMock(return_value=None)
-    with patch("agent_env.providers.state.get_env_state_instance_store", return_value=store), \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider) as build:
+    with patch("agent_env.providers.env_state.get_env_state_instance_store", return_value=store), \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider) as build:
         res = CliRunner().invoke(teardown_env_state, ["--instance-id", "esi-abc"])
     assert res.exit_code == 0, res.output
     build.assert_called_once_with(REMOTE_POSTGRES_STATE_TYPE)
@@ -46,8 +46,8 @@ def test_teardown_cli_unknown_instance_is_noop():
     """No record = already gone: exit 0, friendly message, no provider built (reaper/re-run safe)."""
     store = MagicMock()
     store.get.side_effect = NotFoundError("nope")
-    with patch("agent_env.providers.state.get_env_state_instance_store", return_value=store), \
-         patch("agent_env.providers.state.build_state_provider") as build:
+    with patch("agent_env.providers.env_state.get_env_state_instance_store", return_value=store), \
+         patch("agent_env.providers.env_state.build_state_provider") as build:
         res = CliRunner().invoke(teardown_env_state, ["--instance-id", "esi-missing"])
     assert res.exit_code == 0, res.output
     assert "nothing to tear down" in res.output

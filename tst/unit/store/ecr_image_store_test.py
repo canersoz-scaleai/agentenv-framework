@@ -51,3 +51,14 @@ def test_ecr_from_config_builds_the_keyed_client():
         aws_access_key_id="access",
         aws_secret_access_key="secret",
     )
+
+
+def test_region_only_credentials_use_the_default_aws_chain():
+    with patch(
+        "agent_env.store.image_store.ecr_image_store.boto3.client"
+    ) as boto_client:
+        credentials = EcrCredentials(region="us-west-2")
+
+        assert credentials.client is boto_client.return_value
+
+    boto_client.assert_called_once_with("ecr", region_name="us-west-2")

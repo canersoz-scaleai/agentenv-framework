@@ -51,7 +51,7 @@ def vm(monkeypatch):
         async def write_file_from_url(self, url, destination_path):  # pragma: no cover
             calls.append(("container_url", url, destination_path))
 
-    from agent_env.providers import sandbox_provider as sp_mod
+    from agent_env.providers.sandbox_providers import sandbox_provider as sp_mod
 
     async def _get_sandbox(sandbox_id):
         return _Vm()

@@ -1,0 +1,65 @@
+{
+  "format_version": 1,
+  "agent_env": {
+    "version": "<version>",
+    "environment": "<environment>",
+    "location": "<location>"
+  },
+  "config": {
+    "path": null,
+    "error": {
+      "code": "config-not-found",
+      "reason": "<text>"
+    }
+  },
+  "loaded": true,
+  "group_errors": {
+    "agent_env.envs": {
+      "code": "config-not-found",
+      "reason": "<text>"
+    }
+  },
+  "discovery_errors": {
+    "agent_env.cli_plugins": {
+      "code": "entry-points-unreadable",
+      "reason": "<text>"
+    },
+    "agent_env.cli_root_options": {
+      "code": "entry-points-unreadable",
+      "reason": "<text>"
+    }
+  },
+  "plugins": [
+    {
+      "name": "agentenv-demo",
+      "version": "1.0",
+      "contributions": [
+        {
+          "group": "agent_env.envs",
+          "name": "browser",
+          "value": "tst.unit.plugins_test:_BrowserEnv",
+          "status": "blocked",
+          "code": "config-not-found",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": []
+        }
+      ]
+    }
+  ],
+  "ok": false,
+  "problems": [
+    {
+      "package": "agentenv-demo",
+      "version": "1.0",
+      "group": "agent_env.envs",
+      "name": "browser",
+      "value": "tst.unit.plugins_test:_BrowserEnv",
+      "status": "blocked",
+      "code": "config-not-found",
+      "reason": "<text>",
+      "replaced_by": null,
+      "conflicts_with": []
+    }
+  ]
+}

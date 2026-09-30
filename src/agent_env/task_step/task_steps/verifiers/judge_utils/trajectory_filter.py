@@ -300,15 +300,14 @@ _BASE64_IMAGE_RE = re.compile(
 # text is far smaller). Sized for a ~1M-token judge (gemini-pro-latest): ~2.4M chars
 # ≈ 600-700k tokens, leaving the rest of the window for criteria, frames, and verdict.
 MAX_JUDGE_TRAJECTORY_CHARS = 2_400_000
-# base64 magic-byte prefixes for the image formats CUA harnesses emit — claude_cua
-# encodes screenshots as PNG, the iOS bridge as JPEG. We set the data-URI media type
-# from this because some multimodal APIs validate it against the payload.
+# base64 magic-byte prefixes of the screenshot formats agent harnesses emit. We set the
+# data-URI media type from this because some multimodal APIs validate it against the payload.
 _B64_MAGIC_MEDIA_TYPES = (("iVBORw0KGgo", "image/png"), ("/9j/", "image/jpeg"))
 
 
 def media_type_for_b64(b64: str) -> str:
     """Infer an image media type from a base64 payload's magic-byte prefix.
-    Defaults to image/png (CUA screenshots are PNG unless a JPEG header is seen)."""
+    Defaults to image/png when no JPEG header is seen."""
     for prefix, media_type in _B64_MAGIC_MEDIA_TYPES:
         if b64.startswith(prefix):
             return media_type
@@ -377,7 +376,7 @@ def final_frames_from_raw(raw_text: str, last_n: int) -> list[str]:
         if isinstance(comp_obj, dict) and comp_obj.get("screenshot"):
             frames.append(comp_obj["screenshot"])
     # last_n must be a positive count; non-positive returns nothing (never "all" — a
-    # silent "attach every screenshot" is a footgun for long CUA trajectories).
+    # silent "attach every screenshot" is a footgun for long trajectories).
     return frames[-last_n:] if last_n > 0 else []
 
 

@@ -334,8 +334,6 @@ interface InstanceRowProps {
   setExpandedInstance: React.Dispatch<React.SetStateAction<string | null>>;
   cancellingInstances: Set<string>;
   handleCancelInstance: (instanceId: string, workflowId?: string) => void;
-  isCuaTask: boolean;
-  evaluatorConfig: Record<string, unknown> | undefined;
   rubricsCriteria: Record<string, unknown>[] | undefined;
   // Score aggregator from the rubrics_verifier step. Forwarded to RubricGradingResults to hide the Score badge for all_pass (redundant with N/M passed).
   rubricsAggregator: string | undefined;
@@ -358,8 +356,6 @@ function InstanceRow({
   setExpandedInstance,
   cancellingInstances,
   handleCancelInstance,
-  isCuaTask,
-  evaluatorConfig,
   rubricsCriteria,
   rubricsAggregator,
   fullInstance,
@@ -556,11 +552,11 @@ function InstanceRow({
               </button>
             </div>
           ) : inst.status === 'provisioning' ? (
-            // Distinct from `running`: queued in Temporal but no worker has picked it up yet (not executing a step). Still cancellable.
+            // Distinct from `running`: queued by the runner but no worker has picked it up yet (not executing a step). Still cancellable.
             <div className="flex items-center gap-2">
               <span
                 className="flex items-center gap-1.5 text-xs text-amber-500"
-                title="Queued in Temporal — no worker has started it yet"
+                title="Queued — no worker has started it yet"
               >
                 <Loader2 size={14} className="animate-spin" aria-hidden />
                 Provisioning
@@ -701,8 +697,6 @@ function InstanceRow({
             <TaskInstanceViewer
               instance={fullInstance ?? inst}
               taskId={taskId}
-              envType={isCuaTask ? 'cua' : undefined}
-              evaluatorConfig={evaluatorConfig}
               rubricsCriteria={rubricsCriteria}
               rubricsAggregator={rubricsAggregator}
               taskSteps={taskSteps}
@@ -1054,20 +1048,6 @@ export function TaskDetailPage({
   }, [versionFilter, runGroupsPageSize]);
 
   const steps = (task?.steps ?? []) as Record<string, unknown>[];
-  const isCuaTask = steps.some(
-    s =>
-      s.type === 'cua_initialize' ||
-      s.type === 'cua_evaluate' ||
-      (s.type === 'deploy_env' &&
-        typeof s.env_id === 'string' &&
-        s.env_id.includes('cua')),
-  );
-  const cuaEvalStep = steps.find(s => s.type === 'cua_evaluate') as
-    | Record<string, unknown>
-    | undefined;
-  const evaluatorConfig = cuaEvalStep?.evaluator as
-    | Record<string, unknown>
-    | undefined;
   const rubricsStep = steps.find(s => s.type === 'rubrics_verifier') as
     | Record<string, unknown>
     | undefined;
@@ -1095,17 +1075,9 @@ export function TaskDetailPage({
       target: (s.target ?? undefined) as string | undefined,
       base_path: (s.base_path ?? undefined) as string | undefined,
       artifact_paths: (s.artifact_paths ?? undefined) as string[] | undefined,
-      init_config: s.init_config,
-      evaluator: s.evaluator,
       env_id: (s.env_id ?? null) as string | null,
       agent_name: (s.agent_name ?? null) as string | null,
       triggers: s.triggers,
-      osworld_v2_task_url: (s.osworld_v2_task_url ?? undefined) as
-        | string
-        | undefined,
-      osworld_v2_task_path: (s.osworld_v2_task_path ?? undefined) as
-        | string
-        | undefined,
     }));
   }, [task]);
 
@@ -1590,8 +1562,6 @@ export function TaskDetailPage({
                             setExpandedInstance={setExpandedInstance}
                             cancellingInstances={cancellingInstances}
                             handleCancelInstance={handleCancelInstance}
-                            isCuaTask={isCuaTask}
-                            evaluatorConfig={evaluatorConfig}
                             rubricsCriteria={rubricsCriteria}
                             rubricsAggregator={
                               verifierStep?.score_aggregator as
@@ -1657,8 +1627,6 @@ export function TaskDetailPage({
                               setExpandedInstance={setExpandedInstance}
                               cancellingInstances={cancellingInstances}
                               handleCancelInstance={handleCancelInstance}
-                              isCuaTask={isCuaTask}
-                              evaluatorConfig={evaluatorConfig}
                               rubricsCriteria={rubricsCriteria}
                               fullInstance={fullInstances.get(id)}
                               isFullInstanceLoading={fullInstanceLoading.has(
@@ -1785,7 +1753,7 @@ export function TaskDetailPage({
   );
 }
 
-/** Compact live progress banner for the latest run group, above the instances table so a long CUA pass@k
+/** Compact live progress banner for the latest run group, above the instances table so a long pass@k
  *  is visible at a glance. Color encodes terminal state; a pulsing dot signals auto-update. */
 function RunGroupProgressBanner({ summary }: { summary: RunGroupSummary }) {
   const { run_group_id, total, completed, failed, running } = summary;

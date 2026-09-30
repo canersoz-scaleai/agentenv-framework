@@ -8,11 +8,11 @@ config, every store defaults to its local backend — no external coordinates ar
 built in:
 
 - Document store (AGENT_ENV_DOCUMENT_STORE): "local" (or unset): stdlib SQLite at
-  .agentenv/document_store/documents.db. MongoDB has no built-in coordinates;
-  configure it via a [stores.document] table.
+  document_store/documents.db under the per-user state root (``paths.state_root``).
+  MongoDB has no built-in coordinates; configure it via a [stores.document] table.
 - Object store (AGENT_ENV_OBJECT_STORE): "local" (or unset): filesystem under
-  .agentenv/object_store. S3 has no built-in coordinates; configure it via a
-  [stores.object] table.
+  object_store/ in the per-user state root. S3 has no built-in coordinates; configure
+  it via a [stores.object] table.
 - Image store (AGENT_ENV_IMAGE_STORE): "local" (or unset): an OCI registry at
   localhost:5000. ECR has no built-in coordinates; configure it via a
   [stores.image] table.
@@ -20,9 +20,10 @@ built in:
   optional local file. AWS Secrets Manager has no built-in coordinates; configure
   it via a [stores.secret] table.
 
-AGENT_ENV_FIXTURE_PREFIX (default ""): prepends <prefix>/ to artifact S3 keys,
-so a fresh control-plane backend can write without colliding with existing
-objects in a shared bucket. Empty in prod.
+AGENT_ENV_FIXTURE_PREFIX (default ""): prepends <prefix>/ to the keys of artifact
+objects, image builds, env and agent snapshots, changelogs, default agent and judge
+trajectories, verifier outputs and the A2A validator's fixtures, so a fresh control-plane
+backend can write without colliding with existing objects in a shared store. Empty in prod.
 """
 
 from __future__ import annotations
@@ -34,14 +35,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
-import boto3
 import yaml
-from botocore.config import Config as BotocoreConfig
 
 from agent_env.config import loader as config_loader
 from agent_env.config import model as model_config
 from agent_env.config.errors import ConfigError, EmptySecretBundleError
 from agent_env.config import snapshot as config_snapshot
+from agent_env.config.paths import state_root
 from agent_env.config.provenance import (
     KIND_DEFAULT,
     KIND_ENV,
@@ -54,7 +54,7 @@ from agent_env.config.provenance import (
 if TYPE_CHECKING:
     from pymongo.database import Database
 
-    from agent_env.store.document_store import DocumentStore
+    from agent_env.store.document_store import DocumentStore, LocalSqliteDocumentStore
     from agent_env.store.image_store import ImageStore
     from agent_env.store.object_store import ObjectStore
     from agent_env.store.secret_store import SecretStore
@@ -63,20 +63,18 @@ logger = logging.getLogger(__name__)
 
 _STORE_BACKEND_MONGO = "mongo"
 _STORE_BACKEND_LOCAL = "local"
-_DEFAULT_AGENTENV_DIR = ".agentenv"
 
 _OBJECT_BACKEND_S3 = "s3"
 _SECRET_BACKEND_AWS = "aws"
 
 _RUNNER_BACKEND_LOCAL = "local"
-_RUNNER_BACKEND_TEMPORAL = "temporal"
 
 _IMAGE_BACKEND_ECR = "ecr"
 _DEFAULT_LOCAL_REGISTRY_HOST = "localhost:5000"
 
 
 def _default_sandbox_mode() -> str:
-    from agent_env.providers.sandbox_provider import SANDBOX_MODE_VM
+    from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_VM
     return SANDBOX_MODE_VM
 
 _HUMAN_A2A_CONFIG_SECTION = "conversations"
@@ -212,7 +210,6 @@ class Config:
     )
     default_human_a2a_url: Optional[str] = None
 
-    _s3: Optional[Any] = field(default=None, repr=False, compare=False)  # boto3 S3 client
     _secret: Optional[Mapping[str, Any]] = field(default=None, repr=False, compare=False)
     _snapshot: Optional[config_snapshot.Snapshot] = field(default=None, repr=False, compare=False)
     _snapshot_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -222,6 +219,10 @@ class Config:
     _image_store_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
     _object_store: Optional[ObjectStore] = field(default=None, repr=False, compare=False)
     _object_store_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+    _local_stores: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _routed_stores: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _separate_stores: dict[str, tuple[Any, Any]] = field(default_factory=dict, repr=False, compare=False)
+    _routing_lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
     _secret_store: Optional[SecretStore] = field(default=None, repr=False, compare=False)
     _secret_store_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
     _model_cfg: Optional[model_config.ModelConfig] = field(default=None, repr=False, compare=False)
@@ -284,14 +285,19 @@ class Config:
         return self._registry("task_steps", registry._build_registry)
 
     def sandbox_registry(self) -> dict[str, dict]:
-        from agent_env.providers import sandbox_provider
+        from agent_env.providers.sandbox_providers import sandbox_provider
 
         return self._registry("sandbox", sandbox_provider._build_registry)
 
     def state_registry(self) -> dict[str, dict]:
-        from agent_env.providers.state import env_state_provider
+        from agent_env.providers.env_state import env_state_provider
 
         return self._registry("state", env_state_provider._build_registry)
+
+    def env_provider_registry(self) -> dict[str, Any]:
+        from agent_env.providers.env_providers import env_provider
+
+        return self._registry("env_providers", env_provider._build_registry)
 
     def _get_secret(self) -> Mapping[str, Any]:
         """Combined secret mapping from the configured secret store — the whole-bundle reader
@@ -333,22 +339,6 @@ class Config:
 
         secret = self._get_secret()
         return secret["modal_token_id"], secret["modal_token_secret"]
-
-    def get_export_credentials(self) -> dict[str, str]:
-        secret = self._get_secret()
-        return {
-            "access_key": secret["agentenvhub_export_access_key"],
-            "secret_key": secret["agentenvhub_export_secret_key"],
-        }
-
-    def build_ecr_client(self, region: str):
-        creds = self.get_export_credentials()
-        return boto3.client(
-            "ecr",
-            region_name=region,
-            aws_access_key_id=creds["access_key"],
-            aws_secret_access_key=creds["secret_key"],
-        )
 
     def get_litellm_base_url(self) -> str:
         base = os.getenv("LITELLM_BASE_URL") or self._model_config().base_url
@@ -443,7 +433,7 @@ class Config:
         that need collections the DocumentStore API does not model."""
         from agent_env.store.document_store import MongoDocumentStore
 
-        store = self.get_document_store()
+        store = self._configured_document_store()
         if not isinstance(store, MongoDocumentStore):
             raise ConfigError(
                 "Config.db needs a Mongo document store, but the configured store is "
@@ -455,7 +445,17 @@ class Config:
 
     def get_document_store(self) -> "DocumentStore":
         """The control-plane document store (cached): an explicitly-set backend, else the one from
-        ``AGENT_ENV_DOCUMENT_STORE`` / config.toml (``local`` → SQLite default)."""
+        ``AGENT_ENV_DOCUMENT_STORE`` / config.toml (``local`` → SQLite default). With namespace
+        routing on, ``@local`` documents and ``@local`` runs' records go to the ``@local`` namespace's
+        own local store (``agent_env.store.routing``)."""
+        from agent_env.store import routing
+
+        configured = self._configured_document_store()
+        if not routing.namespace_routing_enabled():
+            return configured
+        return self._routed("document", configured)
+
+    def _configured_document_store(self) -> "DocumentStore":
         if self._document_store is None:
             with self._document_store_lock:
                 if self._document_store is None:
@@ -572,13 +572,16 @@ class Config:
         )
 
     def _local_document_store_path(self) -> str:
-        return str(self._local_agentenv_dir() / "document_store" / "documents.db")
+        return str(state_root() / "document_store" / "documents.db")
 
-    def _local_agentenv_dir(self) -> Path:
-        """The .agentenv dir rooting local store state: the one holding the discovered
-        config.toml, else .agentenv under CWD. A path only; the stores create it on first use."""
-        discovered = self.config_path()
-        return discovered.parent if discovered is not None else Path(_DEFAULT_AGENTENV_DIR)
+    def local_namespace_document_store(self) -> "LocalSqliteDocumentStore":
+        """The ``@local`` namespace's own document store, whether or not routing is on. Records about
+        ``@local`` entities, like the bundle ledger, live beside them here and never reach a configured
+        store. Building it creates nothing; its first write creates the file."""
+        return self._local_store("document")
+
+    def _local_namespace_document_store_path(self) -> str:
+        return str(state_root() / "document_store" / "local.db")
 
     def _document(self) -> config_snapshot.Snapshot:
         """The document this Config reads, resolved on first use and kept.
@@ -611,7 +614,72 @@ class Config:
 
     def get_object_store(self) -> ObjectStore:
         """The object (blob) store (cached): an explicitly-set backend, else the one from
-        ``AGENT_ENV_OBJECT_STORE`` / config.toml (``local`` → filesystem default)."""
+        ``AGENT_ENV_OBJECT_STORE`` / config.toml (``local`` → filesystem default). While an ``@local``
+        task runs under namespace routing, its view of it keeps writes local."""
+        from agent_env.store import routing
+
+        configured = self._configured_object_store()
+        if not routing.in_local_run():
+            return configured
+        return self._routed("object", configured)
+
+    def get_object_store_for(self, entity_id: str) -> ObjectStore:
+        """The object store ``entity_id``'s objects are written to: under namespace routing, the
+        per-user local one for an ``@local`` id; otherwise the configured one."""
+        from agent_env.store import routing
+        from agent_env.store.ids import is_local_id
+
+        configured, local = self._namespace_stores("object")
+        if local is None:
+            return configured
+        if is_local_id(entity_id):
+            return local
+        routing.refuse_in_local_run(f"writing objects for {entity_id!r}")
+        return configured
+
+    def get_object_store_at(self, object_url: str) -> ObjectStore:
+        """The object store ``object_url`` addresses: under namespace routing a url the local store
+        owns is the local store's, unless the configured store owns it too."""
+        from agent_env.store import routing
+
+        configured, local = self._namespace_stores("object")
+        return configured if local is None else routing.object_store_holding(object_url, configured, local)
+
+    def get_object_store_to_write(self, object_url: str, entity_id: str) -> ObjectStore:
+        """``get_object_store_at`` for writing, or registering, ``entity_id``'s object at ``object_url``."""
+        self.check_object_url(entity_id, object_url)
+        return self.get_object_store_at(object_url)
+
+    def check_object_url(self, entity_id: str, object_url: str) -> None:
+        """Refuse recording ``object_url`` as ``entity_id``'s object across namespaces: under namespace
+        routing an ``@local`` entity's objects live in the local store, a bare one's in the configured
+        store, and an ``@local`` task run writes only locally."""
+        from agent_env.store import routing
+        from agent_env.store.ids import is_local_id
+
+        configured, local = self._namespace_stores("object")
+        if local is None:
+            return
+        store = routing.object_store_holding(object_url, configured, local)
+        if is_local_id(entity_id) and store is not local:
+            raise ValueError(f"{entity_id!r} is an @local id, so its objects go to the local object store, not {object_url!r}")
+        if not is_local_id(entity_id) and store is local:
+            raise ValueError(f"{entity_id!r} is not an @local id, so its objects go to the configured object store, not {object_url!r}")
+        if store is configured:
+            routing.refuse_in_local_run(f"a write to {object_url!r}")
+
+    def check_local_run_write(self, entity_id: str) -> None:
+        """Refuse writing bare-id ``entity_id`` while an ``@local`` task runs where a configured store
+        isn't the per-user one: the write would land in a shared store."""
+        from agent_env.store import routing
+        from agent_env.store.ids import is_local_id
+
+        if not routing.in_local_run() or is_local_id(entity_id):
+            return
+        if any(self._namespace_stores(kind)[1] is not None for kind in ("document", "object", "image")):
+            routing.refuse_in_local_run(f"writing {entity_id!r}")
+
+    def _configured_object_store(self) -> ObjectStore:
         if self._object_store is None:
             with self._object_store_lock:
                 if self._object_store is None:
@@ -643,15 +711,46 @@ class Config:
                 "config": {"root": self._local_object_store_path()},
             }
         raise ConfigError(
-            f"Unknown AGENT_ENV_OBJECT_STORE={name!r} (expected 'local', or a [stores.object] table for s3)"
+            f"Unknown AGENT_ENV_OBJECT_STORE={name!r} (expected 'local', or a [stores.object] table for a hosted backend)"
         )
 
     def _local_object_store_path(self) -> str:
-        return str(self._local_agentenv_dir() / "object_store")
+        return str(state_root() / "object_store")
 
     def get_image_store(self) -> ImageStore:
         """The image (registry) store (cached): an explicitly-set backend, else the one from
-        ``AGENT_ENV_IMAGE_STORE`` / config.toml (``local`` → local registry default)."""
+        ``AGENT_ENV_IMAGE_STORE`` / config.toml (``local`` → local registry default). While an
+        ``@local`` task runs under namespace routing, its view of it keeps pushes local."""
+        from agent_env.store import routing
+
+        configured = self._configured_image_store()
+        if not routing.in_local_run():
+            return configured
+        return self._routed("image", configured)
+
+    def get_image_store_for(self, entity_id: str) -> ImageStore:
+        """The image store ``entity_id``'s image is pushed to: under namespace routing, the local
+        registry for an ``@local`` id; otherwise the configured one."""
+        from agent_env.store import routing
+        from agent_env.store.ids import is_local_id
+
+        configured, local = self._namespace_stores("image")
+        if local is None:
+            return configured
+        if is_local_id(entity_id):
+            return local
+        routing.refuse_in_local_run(f"pushing an image for {entity_id!r}")
+        return configured
+
+    def get_image_store_at(self, ref: str) -> ImageStore:
+        """The image store serving ``ref``: under namespace routing, the local registry for a ref on
+        its host; otherwise the configured one."""
+        from agent_env.store import routing
+
+        configured, local = self._namespace_stores("image")
+        return configured if local is None else routing.image_store_holding(ref, configured, local)
+
+    def _configured_image_store(self) -> ImageStore:
         if self._image_store is None:
             with self._image_store_lock:
                 if self._image_store is None:
@@ -686,6 +785,90 @@ class Config:
             f"Unknown AGENT_ENV_IMAGE_STORE={name!r} (expected 'local', or a [stores.image] table for ecr)"
         )
 
+    def _local_store(self, kind: str) -> Any:
+        """The store of ``kind`` the ``@local`` namespace lives in. Documents get a file of their own
+        beside the default local store's, so neither ever holds the other's documents; objects and
+        images use the per-user object store and local registry, whose urls and repositories already
+        say whose they are."""
+        from agent_env.store.document_store import DocumentStore
+        from agent_env.store.image_store import ImageStore
+        from agent_env.store.object_store import ObjectStore
+
+        with self._routing_lock:
+            if kind not in self._local_stores:
+                if kind == "document":
+                    section, abc = {
+                        "impl": "agent_env.store.routing:LocalNamespaceDocumentStore",
+                        "config": {"path": self._local_namespace_document_store_path()},
+                    }, DocumentStore
+                else:
+                    alias, abc = {"object": (self._object_alias, ObjectStore), "image": (self._image_alias, ImageStore)}[kind]
+                    section = alias(_STORE_BACKEND_LOCAL)
+                self._local_stores[kind] = config_loader.build_store(section, abc, secret_resolver=self._resolve_secret)
+            return self._local_stores[kind]
+
+    def _namespace_stores(self, kind: str) -> tuple[Any, Any]:
+        """The configured store of ``kind`` and, under namespace routing, the ``@local`` namespace's
+        store when it is a separate one (else None)."""
+        from agent_env.store import routing
+
+        configured = {"document": self._configured_document_store, "object": self._configured_object_store,
+                      "image": self._configured_image_store}[kind]()
+        local = self._separate_local_store(kind, configured) if routing.namespace_routing_enabled() else None
+        return configured, local
+
+    def _separate_local_store(self, kind: str, configured: Any) -> Any:
+        """The ``@local`` namespace's store of ``kind``, or None when ``configured`` already is it.
+        Decided once per configured store: every store access asks."""
+        cached = self._separate_stores.get(kind)
+        if cached is not None and cached[0] is configured:
+            return cached[1]
+        local = self._compare_local_store(kind, configured)
+        self._separate_stores[kind] = (configured, local)
+        return local
+
+    def _compare_local_store(self, kind: str, configured: Any) -> Any:
+        from agent_env.store.document_store import LocalSqliteDocumentStore
+        from agent_env.store.image_store import LocalRegistryImageStore
+        from agent_env.store.image_store.oci_registry_credentials import normalize_registry_host
+        from agent_env.store.object_store import LocalFilesystemObjectStore
+
+        local = self._local_store(kind)
+        if kind == "document":
+            same = isinstance(configured, LocalSqliteDocumentStore) and configured.path.resolve() == local.path.resolve()
+        elif kind == "object":
+            same = isinstance(configured, LocalFilesystemObjectStore) and configured.root.resolve() == local.root.resolve()
+        else:
+            same = isinstance(configured, LocalRegistryImageStore) and (
+                normalize_registry_host(configured.registry_host) == normalize_registry_host(local.registry_host)
+            )
+        return None if same else local
+
+    def _routed(self, kind: str, configured: Any) -> Any:
+        """``configured`` wrapped by namespace routing, or ``configured`` itself when it already is
+        the ``@local`` namespace's store."""
+        from agent_env.store import routing
+
+        local = self._separate_local_store(kind, configured)
+        if local is None:
+            if kind == "document":
+                raise ConfigError(
+                    f"{self._local_namespace_document_store_path()} is kept for @local documents; "
+                    "point [stores.document] somewhere else"
+                )
+            return configured
+        with self._routing_lock:
+            routed = self._routed_stores.get(kind)
+            if routed is None or routed.configured is not configured:
+                if kind == "document":
+                    routed = routing.RoutingDocumentStore(configured, local, local.path)
+                elif kind == "object":
+                    routed = routing.LocalRunObjectStore(configured, local)
+                else:
+                    routed = routing.LocalRunImageStore(configured, local)
+                self._routed_stores[kind] = routed
+            return routed
+
     def get_runner(self):
         """The configured Runner (cached): an explicitly-set one, else ``[runner]`` /
         ``AGENT_ENV_RUNNER`` (``local`` default -> the in-process asyncio runner)."""
@@ -712,15 +895,6 @@ class Config:
     def _runner_alias(self, name: str) -> dict:
         if name == _RUNNER_BACKEND_LOCAL:
             return {"impl": "agent_env.runner.local_runner:LocalRunner", "config": {}}
-        if name == _RUNNER_BACKEND_TEMPORAL:
-            # No default coordinates: address/namespace/certs are deployment
-            # facts, so Temporal needs an explicit [runner] table, not a
-            # hostname baked into the package.
-            raise ConfigError(
-                "The 'temporal' runner has no built-in coordinates: configure a [runner] "
-                "table with impl + address/namespace (and unset AGENT_ENV_RUNNER, which "
-                "overrides it)."
-            )
         raise ConfigError(f"Unknown AGENT_ENV_RUNNER={name!r} (expected 'local', or a [runner] table)")
 
     def get_secret_store(self) -> SecretStore:
@@ -758,44 +932,14 @@ class Config:
         if name == _STORE_BACKEND_LOCAL:
             return {"impl": "agent_env.store.secret_store:LocalSecretStore", "config": {}}
         raise ConfigError(
-            f"Unknown AGENT_ENV_SECRET_STORE={name!r} (expected 'local', or a [stores.secret] table for AWS)"
+            f"Unknown AGENT_ENV_SECRET_STORE={name!r} (expected 'local', or a [stores.secret] table for a hosted backend)"
         )
 
-    def _s3_object_store(self) -> "ObjectStore":
-        from agent_env.store.object_store import S3ObjectStore
-
-        store = self.get_object_store()
-        if not isinstance(store, S3ObjectStore):
-            raise ConfigError(
-                "This caller needs an S3 object store, but the configured store is "
-                f"{type(store).__name__}: configure a [stores.object] table with an "
-                "S3ObjectStore impl (and unset AGENT_ENV_OBJECT_STORE, which overrides it)."
-            )
-        return store
-
-    def get_s3_bucket(self) -> str:
-        """The configured S3 object store's bucket, for callers that mint raw s3:// URLs."""
-        return self._s3_object_store().bucket
-
     def get_artifact_key_prefix(self) -> str:
-        """Key prefix for artifact objects (set via AGENT_ENV_FIXTURE_PREFIX; empty in prod)."""
+        """Key prefix for every object key core builds: artifacts, image builds, env and agent
+        snapshots, changelogs, default trajectories, verifier outputs and validator fixtures (set
+        via AGENT_ENV_FIXTURE_PREFIX; empty in prod)."""
         return f"{self.fixture_prefix}/" if self.fixture_prefix else ""
-
-    def get_s3_region(self) -> str:
-        """The configured S3 object store's client region."""
-        region = self._s3_object_store().region
-        if not region:
-            raise ConfigError(
-                "The configured S3 object store has no region: set [stores.object.config] "
-                "region (or an AWS default region on the environment)."
-            )
-        return region
-
-    @property
-    def s3(self):
-        if self._s3 is None:
-            self._s3 = boto3.client("s3", config=BotocoreConfig(retries={"max_attempts": 10, "mode": "adaptive"}))
-        return self._s3
 
 
 # One row per aliased section, carrying every coordinate that section has. The resolvers and

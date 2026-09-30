@@ -35,7 +35,7 @@ async def test_agent_loader_rejects_absolute_filename(monkeypatch):
     """The agent loader was the one staging path with no validation — an
     absolute filename silently escaped `destination` via posixpath.join."""
     from agent_env.a2a_agent.a2a_agent import A2AAgent, DeployedA2AAgent
-    from agent_env.providers import sandbox_provider
+    from agent_env.providers.sandbox_providers import sandbox_provider
 
     class _Sandbox:
         async def exec(self, *a):

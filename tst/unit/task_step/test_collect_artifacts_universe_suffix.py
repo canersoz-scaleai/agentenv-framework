@@ -56,7 +56,7 @@ class _VmSandbox:
 @pytest.fixture
 def env(monkeypatch):
     """Stub the sandbox provider and artifact store; record every universe id created."""
-    from agent_env.providers import sandbox_provider as sp_mod
+    from agent_env.providers.sandbox_providers import sandbox_provider as sp_mod
 
     class _Provider:
         @staticmethod

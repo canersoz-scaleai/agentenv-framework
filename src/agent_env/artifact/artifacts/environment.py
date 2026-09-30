@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class EnvironmentArtifact(Artifact):
-    """A FileArtifact wrapped with an environment name + schema version."""
+    """A FileArtifact wrapped with the name of the environment it seeds."""
 
     model_config = ConfigDict(populate_by_name=True)
 

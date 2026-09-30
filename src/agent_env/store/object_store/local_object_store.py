@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
-from agent_env.store.base import ObjectAlreadyExistsError
+from agent_env.store.base import ObjectAlreadyExistsError, ObjectNotFoundError
 from agent_env.store.local_state import ensure_state_dir
 from agent_env.store.object_store.object_store import DEFAULT_CONTENT_TYPE, ObjectMetadata, ObjectStore
 
@@ -18,6 +21,10 @@ class LocalFilesystemObjectStore(ObjectStore):
 
     def __init__(self, root: str) -> None:
         self._root = Path(root)
+
+    @property
+    def root(self) -> Path:
+        return self._root
 
     def put(
         self,
@@ -47,16 +54,27 @@ class LocalFilesystemObjectStore(ObjectStore):
         return self.put_file(self.get_object_key(object_url), file_path, content_type)
 
     def get(self, object_url: str) -> bytes:
-        return Path(self._from_url(object_url)).read_bytes()
+        with _missing_as_not_found(object_url):
+            return Path(self._from_url(object_url)).read_bytes()
 
     def download_to_file(self, object_url: str, dest_path: str) -> None:
+        source = self._from_url(object_url)
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self._from_url(object_url), dest)
+        try:
+            shutil.copyfile(source, dest)
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
+            if e.filename != source:
+                raise
+            raise ObjectNotFoundError(f"No object at {object_url}.") from e
+
+    def open(self, object_url: str) -> BinaryIO:
+        with _missing_as_not_found(object_url):
+            return Path(self._from_url(object_url)).open("rb")
 
     def get_object_metadata(self, key: str) -> ObjectMetadata | None:
         path = self._resolve(key)
-        if not path.exists():
+        if not path.is_file():
             return None
         st = path.stat()
         return ObjectMetadata(content_type=None, size=st.st_size, last_modified=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc))
@@ -89,8 +107,13 @@ class LocalFilesystemObjectStore(ObjectStore):
         return self._to_url(self._resolve(key))
 
     def get_object_key(self, object_url: str) -> str:
-        path = Path(self._from_url(object_url)).resolve()
+        if not object_url.startswith("file://"):
+            raise ValueError(f"{object_url!r} is not a file:// url of this store.")
         root = self._root.resolve()
+        try:
+            path = Path(object_url[len("file://"):]).resolve()
+        except (OSError, RuntimeError) as e:
+            raise ValueError(f"{object_url!r} is not an object in {root}.") from e
         if path != root and root not in path.parents:
             raise ValueError(f"{object_url!r} is not an object in {root}.")
         return path.relative_to(root).as_posix()
@@ -110,3 +133,11 @@ class LocalFilesystemObjectStore(ObjectStore):
     @staticmethod
     def _from_url(object_url: str) -> str:
         return object_url[len("file://"):] if object_url.startswith("file://") else object_url
+
+
+@contextlib.contextmanager
+def _missing_as_not_found(object_url: str) -> Iterator[None]:
+    try:
+        yield
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as e:
+        raise ObjectNotFoundError(f"No object at {object_url}.") from e

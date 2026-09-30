@@ -1,6 +1,6 @@
 """Parity between the two deploy entry points for the env-state param (``env_state_type``).
 
-The CLI (`env deploy --env-state-type`) and the Task/Temporal path (`DeployEnvTaskStep`, fed by
+The CLI (`env deploy --env-state-type`) and the Task path (`DeployEnvTaskStep`, fed by
 `task run --env-state-type` via `user_overrides`) must funnel the SAME value into `env.deploy(...)`.
 Both paths are exercised for real here; only the `env.deploy` seam is mocked to capture kwargs.
 
@@ -16,13 +16,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from click.testing import CliRunner
 
 from agent_env.cli.env import env as env_cli
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 
 
 def _fake_deployed() -> DeployedEnv:
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id="e1", env_version=1, gateway_url="http://gw", mcp_url="http://mcp",
         db_web_url=None, sandbox_id="s1",
     )

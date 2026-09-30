@@ -33,6 +33,8 @@ default stores are local.
 | `make unit-test` | `tst/unit` and `packages/agentenv-protocol/tests`, in parallel, no network |
 | `make int-test-fast` | `tst/integration` minus `int_test_slow`, in parallel; needs Docker and a local OCI registry (`docker run -d -p 5000:5000 public.ecr.aws/docker/library/registry:2`) |
 | `make int-test-slow` | the `int_test_slow` tests, serially (they build the same Docker tags from module fixtures and race under xdist) |
+| `make installer-test` | `tst/installer`: `plugin add` / `remove` through the real pip, uv and pipx, offline against wheels built from the checkout, and the container user journey (`python:3.12-slim`, `--network none`) with the PEP 668 refusal; needs uv, pipx and Docker |
+| `make clean-install-test` | the `clean-install` CI gate: both distributions built as the release builds them, installed into a fresh venv from public PyPI with an allowlisted environment, and `agent-env run hello` run twice by name and checked through the local store; needs Python 3.11, uv and git |
 | `pytest tst/unit/env/store_test.py -v` | one file; add `--log-cli-level=DEBUG` for debug logs |
 | `pip install build && python -m build` | wheel `agentenv_framework-<version>-py3-none-any.whl` (`src/agent_env` only) and sdist `agentenv_framework-<version>.tar.gz` (`src`, `tst`, the protocol package) |
 | `agent-env`, `python -m agent_env.cli` | the CLI; `agent-env config show` prints which config file is in effect and where each section came from |
@@ -48,8 +50,8 @@ default stores are local.
   `AGENT_ENV_SECRET_STORE`, `AGENT_ENV_RUNNER`) < `configure(...)` in code.
 - Defaults are local and carry no external coordinates: SQLite document store, filesystem object
   store, an OCI registry at `localhost:5000`, env-var secret store, `LocalRunner`, `local` Docker
-  sandboxes for envs and agents. MongoDB, S3, ECR, AWS Secrets Manager, Modal and E2B exist as
-  implementations and are selected by config.
+  sandboxes for envs and agents. MongoDB, S3, Cloud Storage, ECR, AWS Secrets Manager, Google Cloud
+  Secret Manager, Modal and E2B exist as implementations and are selected by config.
 - The model endpoint is unset until `[model] base_url` / `api_key` (or `LITELLM_BASE_URL` /
   `LITELLM_API_KEY`) is configured.
 - `[agents] default_a2a_agent_id`: the agent a `deploy_agent` step without an id deploys; built-in
@@ -72,13 +74,14 @@ and deserialized through a registry.
 | `env/` | `Env` base class: a subclass declares `type`, implements `from_dict` and `async deploy(...) -> DeployedEnv`, and may override `reset` and `load_file_artifact_universe`. Built-ins in `env/envs/`: `MCPServerEnv` (`mcp_server`), `MultiEnv` (`multi`, MCP servers plus websites), `ServiceDBEnv` (`service_db`, PostgreSQL), `WebsiteEnv` (`website`), `GatewayEnv` (`gateway_server`). `env/gateway/gateway.py` is the env-side gateway server, container-only code. |
 | `artifact/` | Immutable versioned artifacts; every `put()` creates a new version. The document goes to the document store, binary payloads to the object store. Built-ins: `CliArtifact` (`cli`), `FileArtifact` (`file`), `FileArtifactUniverse` (`file_artifact_universe`), `DockerImageArtifact` (`docker_image`), `EnvironmentArtifact` (`environment`; legacy `service`), `EnvironmentUniverseArtifact` (`environment_universe`; legacy `service_universe`), `SkillArtifact` (`skill`), `VMImageArtifact` (`vm_image`). |
 | `task/`, `task_step/` | A `Task` holds its `TaskStep`s inline; `Task.run()` executes them as a DAG. `depends_on` (None means all prior steps) gates a step, independent steps run concurrently, `fail_task_on_error` makes a failure fatal or tolerated, `retry_config` rolls a failed span back through the step journal and re-dispatches it. Built-in steps live in `task_step/task_steps/` (`deploy_env`, `deploy_agent`, `prompt_agent`, the verifiers under `verifiers/`, and more). |
-| `store/` | Four store ABCs with local and cloud implementations: `DocumentStore` (SQLite, MongoDB), `ObjectStore` (filesystem, S3), `ImageStore` (local OCI registry, ECR), `SecretStore` (env vars or file, AWS Secrets Manager). `VersionedEntityStore` implements the shared versioned get/put logic, `QueryBuilder` is the immutable chained query API, `store/base.py` holds the error types. A new backend must pass the conformance kits in `tst/store/`. |
+| `store/` | Four store ABCs with local and cloud implementations: `DocumentStore` (SQLite, MongoDB), `ObjectStore` (filesystem, S3, Cloud Storage), `ImageStore` (local OCI registry, ECR), `SecretStore` (env vars or file, AWS Secrets Manager, Google Cloud Secret Manager). `VersionedEntityStore` implements the shared versioned get/put logic, `QueryBuilder` is the immutable chained query API, `store/base.py` holds the error types. A new backend must pass the conformance kits in `tst/store/`. |
 | `config/` | The `Config` singleton (`get_config`, `configure`, `reset_config`) in `config/runtime.py`, file discovery in `config/loader.py`, and `load_impl`, which resolves `module:Class` pointers. `agent_env.store` re-exports the config names for compatibility. |
-| `providers/` | Sandbox providers `local`, `modal`, `modal_vm`, `e2b`; `[sandbox] default` and `agent_default` accept a comma-separated fallback chain. `GatewayProvider` renders a docker-compose for the gateway and its MCP servers inside the sandbox; `providers/state/` holds env-state providers (`local_postgres` built in). |
+| `providers/` | `providers/sandbox_providers/` holds the sandbox providers `local`, `modal`, `modal_vm`, `e2b`; `[sandbox] default` and `agent_default` accept a comma-separated fallback chain. `providers/env_providers/` holds the environment providers: `EnvironmentProvider` (an env's containers and state store) and `EnvironmentGatewayProvider`, which renders a docker-compose for the gateway and its MCP servers inside the sandbox; `providers/env_state/` holds env-state providers (`local_postgres` built in). |
 | `a2a_agent/` | The `A2AAgent` entity (`a2a_agent`), its stores and the validator steps. The protocol package provides the agent-side framework. |
 | `runner/` | The `[runner]` seam: `Runner.submit()` returns `(run_id, instance_id)`; `LocalRunner` is built in. |
 | `explorer/` | Optional local web UI: `agent-env up`, needs the `explorer` extra, binds loopback `:8234`. |
-| `cli/` | Click CLI with the groups `a2a-agent`, `artifact`, `config`, `env`, `eval`, `plugin`, `task`, `up`. |
+| `cli/` | Click CLI with the groups `a2a-agent`, `artifact`, `config`, `env`, `eval`, `plugin`, `run`, `task`, `up`. |
+| `examples/` | The bundles agent-env ships (`hello`), registered under `agent_env.bundles` in `pyproject.toml`. Tests run them, but they are examples for users, not fixtures. |
 
 ## Extension points
 
@@ -89,15 +92,23 @@ Everything out-of-tree is declared in `config.toml` as a `module:Class` pointer 
   `[state.providers.<name>]`, `[explorer.plugins]`: one implementation each.
 - `[envs]`, `[artifacts]`, `[task_steps]` with `impls = ["module:Class", ...]`: extra classes for the
   registries. The identity is the class's `type` (a `ClassVar` on envs and steps, the Pydantic `type`
-  default on artifacts); a class that keeps the base default or collides with a registered type fails
-  at registry build with `ConfigError`.
+  default on artifacts); a class that keeps the base default, collides with a registered type, or
+  leaves a method its base requires unimplemented fails at registry build with `ConfigError`.
 - For sandbox and state providers the table name must equal the `type` the provider produces,
   because that string is persisted and used to reconnect.
+- Environment providers have no table: an installed package registers one as an `agent_env.env_providers`
+  entry point named its `type`, which records carry as `env_provider_type`.
+- `[plugins.<distribution name>]` is reserved for an installed plugin's own settings, read with
+  `agent_env.plugins.settings`. Core reads nothing inside it and only reports it (`config show`,
+  `config explain`); every other top-level table is core's, so do not add one for a plugin.
+- Each section row in `config/describe.py` declares the keys its reader takes (`FileSection.keys`), and
+  `config show` warns about any other. A reader that takes a new key declares it there in the same change.
 - CLI: an installed package adds top-level groups through the `agent_env.cli_plugins` entry-point
   group and root options through `agent_env.cli_root_options`. Core names win, a plugin that fails to
-  import is skipped with a warning, two plugins claiming one root flag abort startup, and grafting
-  subcommands onto built-in groups is unsupported. Core does not add a root option a known plugin uses.
-  `plugin` is a core group (`agent-env plugin list/show/check`), so a plugin command of that name is skipped.
+  import is skipped with a warning, two different root options on one flag are both left off and
+  reported as a conflict, and grafting subcommands onto built-in groups is unsupported. Core does not
+  add a root option a known plugin uses.
+  `plugin` is a core group (`agent-env plugin list/show/check/add/remove`), so a plugin command of that name is skipped.
 
 Do not add a seam that nothing in this repository consumes or defaults: a new config section needs an
 in-tree implementation or default, and new behaviour is selected in `config.toml`, not by a new
@@ -147,20 +158,33 @@ orchestrators call it the same way. What callers rely on:
 
 ## CI
 
-`.github/workflows/local-backends.yml` is the required gate on pull requests and `main`: the jobs
-`unit`, `integration-local` and `integration-local-slow`, all installed from public PyPI with no
-secrets and no external services (a `registry:2` service container for the integration jobs). The
+The required checks on pull requests and `main` are `unit`, `integration-local`,
+`integration-local-slow`, `installer`, `plugin-api` and `clean-install`. `.github/workflows/local-backends.yml` runs
+the first four, all installed from public PyPI with no secrets and no external services (a `registry:2` service container for the integration jobs). The
 `unit` job also fails if `uv.lock` resolves anything from a registry other than PyPI or if
 `agentenv-protocol` is not the editable workspace member. The integration jobs run
 `.github/scripts/check_skip_policy.py` over the JUnit report: only `agentenv-capability-missing`
 skips for the allowed capabilities pass, and the fast job allows no skips under
-`tst/integration/store/`. Actions are pinned to commit SHAs.
+`tst/integration/store/`. The `installer` job runs `tst/installer` when a pull request or push
+touches the plugin CLI, `agent_env/plugins`, the tier itself or the lockfile, and allows no skips; a
+`changes` job decides. `.github/workflows/plugin-api.yml` runs the `plugin-api` job on every pull
+request, title edits included, and on `main`: `.github/scripts/check_plugin_api.py` compares the
+plugin surface (its `BASES` and `USED`, which a unit test holds to the README "Plugin compatibility"
+list) between `HEAD^1` and `HEAD` with griffe, pinned in the `dev` extra, and fails on a break the
+title does not mark with `!`. `.github/workflows/clean-install.yml` runs the `clean-install` job on
+every pull request and on `main`: `.github/scripts/clean_install.py` builds both distributions as the
+release does, fails if the wheel leaves out a file tracked under `src/agent_env/examples` or a
+`agent_env.bundles` entry point, installs the two wheels into a fresh venv from public PyPI with an
+allowlisted environment (no AWS, no config, no plugin), and runs `agent-env run hello`
+twice by name; `.github/scripts/check_clean_install.py`, run by that venv, checks the local store and
+that the runs left no sandbox work folder.
+Actions are pinned to commit SHAs.
 
 ## Conventions
 
 - PR titles (the squash commit) follow Conventional Commits: `type(scope)!?: imperative summary`,
-  with the types in use `feat`, `fix`, `refactor`, `test`, `docs`, `ci`, `chore`, `perf`, `build`;
-  `!` marks a breaking change.
+  with the types in use `feat`, `fix`, `refactor`, `test`, `docs`, `ci`, `chore`, `perf`, `build`,
+  `security`; `!` marks a breaking change, and `plugin-api` requires it for a plugin-surface break.
 - Versions are cut by the maintainers' release automation. Never edit `version` in
   `pyproject.toml` or push a tag in a PR.
 - Names: the distribution is `agentenv-framework`, the import package `agent_env`, the console
@@ -171,12 +195,11 @@ skips for the allowed capabilities pass, and the fast job allows no skips under
 - No ticket ids, program codenames or review context in code, docstrings or docs; that belongs in
   the commit message and the PR.
 - No defensive code for a case no caller produces; say so in the PR instead.
-- Keep core vendor-neutral: no vendor hostnames, account ids or deployment facts in `src/`, `tst/`,
-  `docs/` or this file. A deployment plugs in through the extension points above.
+- Keep core vendor-neutral: no vendor hostnames, account ids or deployment facts in `src/`, `tst/`
+  or this file. A deployment plugs in through the extension points above.
 
 ## Docs
 
 `README.md` is the user-facing front door (configuration, custom envs, steps, artifacts and
-providers, the CLI). `docs/agent-tools.md` covers the in-process agent tools and
-`docs/e2b-sandbox-provider.md` the E2B provider. `packages/agentenv-protocol/README.md` documents the
+providers, the CLI). `packages/agentenv-protocol/README.md` documents the
 protocol and the A2A agent framework.

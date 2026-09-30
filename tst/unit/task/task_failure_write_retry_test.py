@@ -1,4 +1,4 @@
-"""Write-path tests for record_task_failure and append_step_attempt_failure.
+"""Write-path tests for record_task_failure, record_task_cancelled and append_step_attempt_failure.
 
 The retry tests fake the doc store and make it fail a controllable number of times.
 The ledger test drives a real LocalSqliteDocumentStore so it exercises actual filter +
@@ -12,10 +12,12 @@ import pytest
 
 import agent_env.task.store as store_mod
 from agent_env.store import LocalSqliteDocumentStore
+from agent_env.store.document_store import Filter, UpdateSpec
 from agent_env.task.store import (
     StepAttemptFailure,
     TaskInstanceStore,
     append_step_attempt_failure,
+    record_task_cancelled,
     record_task_failure,
     set_task_instance_store,
 )
@@ -169,3 +171,34 @@ async def test_append_and_record_are_independent_on_the_same_instance(tmp_path, 
         assert inst.step_attempt_failures[0]["error_class"] == "httpx.ReadTimeout"
     finally:
         set_task_instance_store(None)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_mark_overrides_a_failure_but_never_a_completion(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_mod, "_FAILURE_WRITE_BACKOFF_SECONDS", 0)
+    store = _sqlite_store(tmp_path)
+    for instance_id in ("inst-1", "inst-2"):
+        store.upsert_instance(instance_id=instance_id, task_id="t", task_version=1, total_steps=1)
+    store._doc_store.update(store_mod.TASK_INSTANCES_COLLECTION, Filter.of(instance_id="inst-2"),
+                            UpdateSpec(set={"status": "completed"}))
+    set_task_instance_store(store)
+    try:
+        await _record("inst-1")
+        for instance_id in ("inst-1", "inst-2"):
+            record_task_cancelled(instance_id, "cancelled by Ctrl-C", "2026-09-29 18:00 UTC")
+        cancelled, completed = store.get("inst-1"), store.get("inst-2")
+    finally:
+        set_task_instance_store(None)
+    assert (cancelled.status, cancelled.error) == ("cancelled", "cancelled by Ctrl-C")
+    assert completed.status == "completed"
+
+
+def test_record_task_cancelled_retries_until_write_succeeds(monkeypatch):
+    monkeypatch.setattr(store_mod, "_FAILURE_WRITE_BACKOFF_SECONDS", 0)
+    flaky = _FlakyDocStore(fail_times=2)
+    set_task_instance_store(_store_with(flaky))
+    try:
+        record_task_cancelled("inst-1", "cancelled by SIGTERM", "2026-09-29 18:00 UTC")
+    finally:
+        set_task_instance_store(None)
+    assert flaky.calls == 3

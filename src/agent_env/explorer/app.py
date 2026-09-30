@@ -25,6 +25,7 @@ from agent_env.explorer.routers import objects as objects_router
 from agent_env.explorer.routers import runs as runs_router
 from agent_env.explorer.routers.common import versioned_router
 from agent_env.store import NotFoundError
+from agent_env.store.routing import configured_store
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ def explorer_settings() -> dict:
 async def lifespan(app: FastAPI):
     cfg = get_config()
     logger.info("agent-env explorer starting")
-    logger.info("document store: %s", type(cfg.get_document_store()).__name__)
+    logger.info("document store: %s", type(configured_store(cfg.get_document_store())).__name__)
 
     runner = get_runner()
     logger.info("runner: %s (%s)", runner.type, type(runner).__name__)
@@ -219,7 +220,7 @@ def create_app(static_dir: Optional[str] = None) -> FastAPI:
         cfg = get_config()
         return {
             "status": "ok",
-            "document_store": type(cfg.get_document_store()).__name__,
+            "document_store": type(configured_store(cfg.get_document_store())).__name__,
             "runner": get_runner().type,
         }
 

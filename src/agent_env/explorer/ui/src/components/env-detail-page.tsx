@@ -32,8 +32,7 @@ const HIDDEN_ENV_METADATA_KEYS = new Set([
   'validated_environment_card',
 ]);
 
-// Generic, collapsible JSON dump of the env's resolved references — e.g. a CUA
-// env's vm_image_artifact, including the ECR image tag it boots. Deliberately
+// Generic, collapsible JSON dump of the env's resolved references. Deliberately
 // schema-agnostic: whatever the backend puts under `resolved_refs` is rendered
 // verbatim, so new fields or refs need no frontend change.
 function ResolvedRefsSection({ data }: { data: Record<string, unknown> }) {
@@ -139,21 +138,8 @@ export function EnvDetailPage({
   // Curated copy for featured environments (title/tagline/description), shown on
   // the header. undefined for non-featured envs, which render as before.
   const featured = FEATURED_ENV_BY_ID[envId];
-  // Featured banner mark shown on the header: a full-bleed illustration (`logo`,
-  // MCP Advanced universes) or a centered brand/OS mark (`icon`, desktop CUA).
+  // Featured banner mark: a full-bleed illustration (`logo`) or a centered brand mark (`icon`).
   const featuredBanner = featured?.logo ?? featured?.icon;
-  const vmImageArtifact = env?.vm_image_artifact as
-    | { id: string; version: number }
-    | undefined;
-  const cuaMcpServerEnv = env?.cua_mcp_server_env as
-    | { id: string; service_name?: string }
-    | undefined;
-  // iOS CUA wraps a single MCP server env (the phone-driving MCP image). There
-  // is no VM image — the env drives a physical device via a tunneled, Mac-hosted
-  // computer server — so the detail view shows just the MCP server.
-  const iosCuaMcpServerEnv = env?.ios_cua_mcp_server_env as
-    | { id: string; service_name?: string }
-    | undefined;
   const metadata = (env?.metadata ?? {}) as Record<string, unknown>;
   const environmentCard = (metadata.environment_card ??
     null) as EnvironmentCard | null;
@@ -249,7 +235,7 @@ export function EnvDetailPage({
             </div>
           </div>
 
-          {/* Recommended Universe (curated for MCP Advanced envs) */}
+          {/* Recommended Universe (curated for featured envs) */}
           {featured?.recommendedUniverse && (
             <div className="mb-6">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)] mb-2">
@@ -324,78 +310,6 @@ export function EnvDetailPage({
                 </div>
               </div>
             )}
-
-          {envType === 'cua' && (vmImageArtifact || cuaMcpServerEnv) && (
-            <div className="mb-6 flex flex-col gap-4">
-              {vmImageArtifact && (
-                <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)] mb-2">
-                    VM Image
-                  </h3>
-                  <span className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm bg-[var(--secondary)]">
-                    <span className="font-medium text-[var(--foreground)]">
-                      {vmImageArtifact.id}
-                    </span>
-                    <span className="text-xs text-[var(--muted-foreground)] font-mono">
-                      v{vmImageArtifact.version}
-                    </span>
-                  </span>
-                </div>
-              )}
-              {cuaMcpServerEnv && (
-                <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)] mb-2">
-                    CUA MCP Server
-                  </h3>
-                  <button
-                    onClick={() => onNavigateToEnv(cuaMcpServerEnv.id)}
-                    className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm bg-[var(--secondary)] hover:bg-[var(--accent)] transition-colors cursor-pointer"
-                  >
-                    <span className="font-medium text-[var(--foreground)]">
-                      {cuaMcpServerEnv.service_name ?? cuaMcpServerEnv.id}
-                    </span>
-                    {cuaMcpServerEnv.service_name &&
-                      cuaMcpServerEnv.service_name !== cuaMcpServerEnv.id && (
-                        <span className="text-xs text-[var(--muted-foreground)] font-mono">
-                          {cuaMcpServerEnv.id}
-                        </span>
-                      )}
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {envType === 'ios_cua' && (
-            <div className="mb-6 flex flex-col gap-4">
-              <p className="text-sm text-[var(--muted-foreground)]">
-                Drives a physical iPhone via a tunneled, Mac-hosted computer
-                server. No VM image — the device is leased at deploy time.
-              </p>
-              {iosCuaMcpServerEnv && (
-                <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)] mb-2">
-                    iOS CUA MCP Server
-                  </h3>
-                  <button
-                    onClick={() => onNavigateToEnv(iosCuaMcpServerEnv.id)}
-                    className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm bg-[var(--secondary)] hover:bg-[var(--accent)] transition-colors cursor-pointer"
-                  >
-                    <span className="font-medium text-[var(--foreground)]">
-                      {iosCuaMcpServerEnv.service_name ?? iosCuaMcpServerEnv.id}
-                    </span>
-                    {iosCuaMcpServerEnv.service_name &&
-                      iosCuaMcpServerEnv.service_name !==
-                        iosCuaMcpServerEnv.id && (
-                        <span className="text-xs text-[var(--muted-foreground)] font-mono">
-                          {iosCuaMcpServerEnv.id}
-                        </span>
-                      )}
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
 
           {envType === 'multi' &&
             (mcpServers.length > 0 || websites.length > 0) && (

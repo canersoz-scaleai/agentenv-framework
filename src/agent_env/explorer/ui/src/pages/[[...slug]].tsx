@@ -16,7 +16,6 @@ import {
   Sprout,
   Sparkles,
   BookOpen,
-  Smartphone,
   Package,
   PanelLeftClose,
   PanelLeftOpen,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self
 
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
@@ -19,11 +19,11 @@ class TaskStepDependency:
     task_step_id: str
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TaskStepDependency":
+    def from_dict(cls, data: dict[str, Any]) -> "TaskStepDependency":
         return cls(task_step_id=data["task_step_id"])
 
 
-def attach_retry_config(step: "TaskStep", data: dict) -> "TaskStep":
+def attach_retry_config(step: "TaskStep", data: dict[str, Any]) -> "TaskStep":
     """Hydrate ``retry_config`` after ``step_cls.from_dict`` at the generic
     parse sites, so the field survives round-trips on step types whose
     ``__init__`` doesn't accept it. No-op if already set or absent."""
@@ -51,7 +51,7 @@ class RetryConfig:
     max_retries: int = 1
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RetryConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "RetryConfig":
         # go_to_step_id = wire alias; retry_from_step_id canonical (only spelling emitted).
         step_id = data.get("retry_from_step_id", data.get("go_to_step_id"))
         if step_id is None:
@@ -103,7 +103,7 @@ class TaskStep(ABC):
         self.retry_config = retry_config
 
     @abstractmethod
-    async def execute(self, context: TaskStepContext) -> TaskStepContext:
+    async def execute(self, context: TaskStepContext) -> TaskStepContext | None:
         """Execute this task step."""
         pass
 
@@ -114,7 +114,7 @@ class TaskStep(ABC):
         """
         return []
 
-    def step_param_overrides(self, context: TaskStepContext) -> dict:
+    def step_param_overrides(self, context: TaskStepContext) -> dict[str, Any]:
         """Per-run overrides for this step's params, from a run's ``step_overrides``.
 
         Generic seam: a step opts in by reading the params it supports; an
@@ -122,8 +122,8 @@ class TaskStep(ABC):
         """
         return (context.metadata.get("user_overrides") or {}).get("step_params", {}).get(self.id) or {}
 
-    def to_dict(self) -> dict:
-        base: dict = {"id": self.id, "type": self.type, "version": self.version, "fail_task_on_error": self.fail_task_on_error}
+    def to_dict(self) -> dict[str, Any]:
+        base: dict[str, Any] = {"id": self.id, "type": self.type, "version": self.version, "fail_task_on_error": self.fail_task_on_error}
         if self.depends_on is not None:
             base["depends_on"] = [dataclasses.asdict(d) for d in self.depends_on]
         if self.retry_config is not None:
@@ -143,7 +143,7 @@ class TaskStep(ABC):
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TaskStep":
+    def from_dict(cls, data: dict[str, Any]) -> "TaskStep":
         raise NotImplementedError(f"{cls.__name__} must implement from_dict")
 
     @classmethod
@@ -153,7 +153,7 @@ class TaskStep(ABC):
         return get_task_step_store().get(id, version)
 
     @classmethod
-    def put(cls, **kwargs) -> "TaskStep":
+    def put(cls, **kwargs: Any) -> Self:
         from .store import get_task_step_store
 
         kwargs.setdefault("version", None)

@@ -15,7 +15,7 @@ import pytest
 from click.testing import CliRunner
 
 from agent_env.cli import cli
-from agent_env.cli.plugin import environment, plugin
+from agent_env.cli.plugin import _KINDS, environment, plugin
 from agent_env.config import get_config
 from agent_env.plugins import _cli as cli_plugins_mod
 from agent_env.plugins import _discovery, _inventory
@@ -25,6 +25,8 @@ from tst.unit.plugins_test import _EP, _HERE, _fresh, _install, _use_config  # n
 _THIS = "tst.unit.cli.plugin_command_test"
 
 tools = click.Group(name="tools", help="Demo tools.")
+# The usual click idiom, `@click.group() def cli()`, names the group "cli".
+cli_named_group = click.Group(name="cli", help="Demo group.")
 shadow = click.Command(name="plugin")
 tenant = click.Option(["--tenant"], expose_value=False)
 
@@ -32,11 +34,12 @@ tenant = click.Option(["--tenant"], expose_value=False)
 class _CliEP:
     """A CLI entry point from a named distribution."""
 
-    def __init__(self, name: str, attr: str, group: str, dist: str = "agentenv-tools", version: str = "0.2.0"):
+    def __init__(self, name: str, attr: str, group: str, dist: str = "agentenv-tools", version: str = "0.2.0",
+                 requires: list[str] | None = None):
         self.name = name
         self.value = f"{_THIS}:{attr}"
         self.group = group
-        self.dist = type("Dist", (), {"name": dist, "version": version})()
+        self.dist = type("Dist", (), {"name": dist, "version": version, "requires": requires})()
 
     def load(self):
         module, _, attr = self.value.partition(":")
@@ -79,7 +82,8 @@ def test_list_shows_each_package_what_it_provides_and_its_status(monkeypatch):
     _install(monkeypatch,
              envs=[_EP("browser", "_BrowserEnv", dist="agentenv-browser", version="1.0.0")],
              task_steps=[_EP("plugin_step", "_PluginStep", dist="agentenv-browser", version="1.0.0"),
-                         _broken("broken_step", dist="agentenv-grader", version="0.3.1")])
+                         _broken("broken_step", dist="agentenv-grader", version="0.3.1")],
+             env_providers=[_EP("plugin_env", "_PluginEnvProvider", dist="agentenv-browser", version="1.0.0")])
     root = _root_with_cli_plugins(monkeypatch)
 
     result = _run(root, "list")
@@ -87,7 +91,7 @@ def test_list_shows_each_package_what_it_provides_and_its_status(monkeypatch):
     assert result.exit_code == 0
     rows = [line.split() for line in result.output.splitlines() if line.startswith("agentenv-")]
     assert rows[0][:2] == ["agentenv-browser", "1.0.0"] and rows[0][-1] == "ok"
-    assert "env browser, task step plugin_step" in result.output
+    assert "env browser, task step plugin_step, environment provider plugin_env" in result.output
     assert rows[1][:2] == ["agentenv-grader", "0.3.1"] and rows[1][-2:] == ["1", "failed"]
 
 
@@ -108,17 +112,19 @@ def test_list_includes_the_cli_plugins_the_cli_loaded(monkeypatch):
     assert root.commands["plugin"] is plugin
 
 
-def test_list_reports_a_conflict_and_the_group_it_takes_down(monkeypatch):
+def test_list_reports_a_conflict_without_taking_its_group_down(monkeypatch):
     _install(monkeypatch, envs=[
         _EP("browser", "_BrowserEnv", dist="agentenv-browser", version="1.0.0"),
         _EP("browser", "_OtherBrowserEnv", dist="agentenv-web", version="2.1.0"),
+        _EP("mcp_server", "_BrowserEnv", dist="agentenv-web", version="2.1.0"),
     ])
 
     result = _run(_root_with_cli_plugins(monkeypatch), "list")
 
     assert result.exit_code == 0
-    assert "(error) nothing in agent_env.envs loads: 2 installed plugins register 'browser'" in result.output
-    assert "`agent-env plugin list` shows every claim" in result.output
+    rows = {line.split()[0]: line for line in result.output.splitlines() if line.startswith("agentenv-")}
+    assert rows["agentenv-browser"].endswith("1 conflict") and rows["agentenv-web"].endswith("1 conflict, 1 skipped")
+    assert "nothing in agent_env.envs loads" not in result.output
 
 
 def test_list_with_no_plugins_says_so(monkeypatch):
@@ -134,20 +140,36 @@ def test_list_json_is_the_whole_report(monkeypatch):
 
     payload = json.loads(_run(_root_with_cli_plugins(monkeypatch), "list", "--json").stdout)
 
-    assert set(payload) == {
-        "agent_env", "retired_agent_env", "config", "loaded", "group_errors", "discovery_errors", "plugins",
-    }
+    assert list(payload) == [
+        "format_version", "agent_env", "config", "loaded", "group_errors", "discovery_errors", "plugins",
+    ]
+    assert payload["format_version"] == 1
     (dist,) = payload["plugins"]
     assert dist["name"] == "agentenv-demo"
-    assert dist["contributions"][0] | {"reason": None} == {
+    assert dist["contributions"][0] == {
         "group": "agent_env.envs", "name": "browser", "value": f"{_HERE}:_BrowserEnv", "status": "active",
-        "reason": None, "replaced_in": None, "replacement": None, "conflicts_with": [],
+        "code": None, "reason": None, "replaced_by": None, "conflicts_with": [],
     }
+
+
+def test_a_command_is_listed_run_and_reported_under_its_entry_point_name(monkeypatch):
+    root = _root_with_cli_plugins(monkeypatch, commands=[_CliEP("demo", "cli_named_group", cli_plugins_mod.CLI_PLUGINS_GROUP)])
+
+    listing = CliRunner().invoke(root, ["--help"]).output
+    ran = CliRunner().invoke(root, ["demo", "--help"])
+    payload = json.loads(_run(root, "list", "--json").stdout)
+
+    assert "demo" in listing and "cli " not in listing
+    assert ran.exit_code == 0 and "Demo group." in ran.output
+    (tools,) = [plugin for plugin in payload["plugins"] if plugin["name"] == "agentenv-tools"]
+    (contribution,) = tools["contributions"]
+    assert (contribution["name"], contribution["status"]) == ("demo", "active")
 
 
 def test_list_no_load_imports_no_type_plugin(tmp_path, monkeypatch):
     (tmp_path / "agentenv_cli_demo.py").write_text(
-        "from agent_env.env.env import Env\n\n\nclass DemoEnv(Env):\n    type = 'cli_demo'\n"
+        "from agent_env.env.env import Env\n\n\nclass DemoEnv(Env):\n    type = 'cli_demo'\n\n"
+        "    @classmethod\n    def from_dict(cls, data):\n        return cls(data['id'], data.get('version'))\n"
     )
     dist_info = tmp_path / "agentenv_cli_demo-0.1.0.dist-info"
     dist_info.mkdir()
@@ -182,8 +204,10 @@ def test_show_lists_each_contribution_with_why(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert result.output.splitlines()[0] == "agentenv-demo 1.0"
-    assert f"replaced by [envs] impl '{_HERE}:_OtherBrowserEnv' in " in result.output
+    assert f"replaced: config names '{_HERE}:_OtherBrowserEnv' in [envs] of " in result.output
+    assert result.output.count("[replaced-by-config]") == 1
     assert "failed: failed to load: ModuleNotFoundError" in result.output
+    assert result.output.count("[load-failed]") == 1
     assert "config:   importing it leaves AGENT_ENV_CONFIG unset" in result.output
 
 
@@ -285,9 +309,25 @@ def test_check_treats_a_config_replacement_as_intended(monkeypatch, tmp_path):
     assert result.exit_code == 0 and "1 replaced by config" in result.output
 
 
+def test_check_does_not_fail_on_a_config_warning(monkeypatch, tmp_path):
+    """An unread table is `config show`'s to report; `check` gates what plugins contribute."""
+    _install(monkeypatch, envs=[_EP("browser", "_BrowserEnv")])
+    _use_config(monkeypatch, tmp_path, """
+        [sanbox]
+        default = "modal"
+    """)
+
+    result = _run(_root_with_cli_plugins(monkeypatch), "check")
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "ok: 1 plugin package(s), 1 contribution(s), all in effect"
+
+
 @pytest.mark.parametrize("groups, expected", [
     ({"envs": [_broken("browser")]}, "env browser: failed: failed to load: ModuleNotFoundError"),
     ({"envs": [_EP("website", "_BrowserEnv")]}, "env website: skipped: clashes with a built-in"),
+    ({"task_steps": [_EP("bare", "_BareStep")]},
+     "task step bare: failed: failed to load: TypeError('_BareStep must implement execute and from_dict') [invalid-plugin]"),
     ({"envs": [_EP("browser", "_BrowserEnv", dist="a"), _EP("browser", "_OtherBrowserEnv", dist="b")]},
      "env browser: conflict: also registered by 'browser' from b 1.0"),
 ])
@@ -331,8 +371,11 @@ def test_a_command_another_plugin_already_added_names_that_plugin(monkeypatch):
     ])
 
     result = CliRunner().invoke(root, ["plugin", "check"])
+    (problem,) = json.loads(CliRunner().invoke(root, ["plugin", "check", "--json"]).stdout)["problems"]
 
-    assert "clashes with existing command 'tools' from plugin 'tools' from 'agentenv-a'" in result.output
+    assert "clashes with existing command 'tools' from plugin 'tools' from 'agentenv-a' [name-conflict]" in result.output
+    assert (problem["package"], problem["status"], problem["code"]) == ("agentenv-b", "skipped", "name-conflict")
+    assert problem["conflicts_with"] == [{"package": "agentenv-a", "version": "0.2.0", "value": f"{_THIS}:tools"}]
 
 
 def test_a_root_option_attached_twice_is_still_reported(monkeypatch):
@@ -344,7 +387,85 @@ def test_a_root_option_attached_twice_is_still_reported(monkeypatch):
 
     result = _run(root, "show", "agentenv-tools", "--no-load")
 
-    assert "tenant_again" in result.output and "already attached" in result.output
+    assert "tenant_again" in result.output and "active: the same option object is already attached [already-attached]" in result.output
+
+
+help_again = click.Option(["--help"], expose_value=False)
+
+
+@pytest.mark.parametrize(("group", "attr", "status", "code", "reason"), [
+    (cli_plugins_mod.CLI_PLUGINS_GROUP, "missing", "failed", "load-failed", "failed to load: AttributeError"),
+    (cli_plugins_mod.CLI_PLUGINS_GROUP, "tenant", "failed", "invalid-plugin", "is not a click.Command"),
+    (cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, "missing", "failed", "load-failed", "failed to load: AttributeError"),
+    (cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, "shadow", "failed", "invalid-plugin", "is not a click.Option"),
+    (cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, "help_again", "skipped", "builtin-name",
+     "clashes with core root option '--help'"),
+])
+def test_each_way_a_cli_plugin_is_refused_has_its_code(monkeypatch, group, attr, status, code, reason):
+    _install(monkeypatch)
+    ep = _CliEP("refused", attr, group)
+    commands, options = ([ep], []) if group == cli_plugins_mod.CLI_PLUGINS_GROUP else ([], [ep])
+    root = _root_with_cli_plugins(monkeypatch, commands=commands, options=options)
+
+    (problem,) = json.loads(CliRunner().invoke(root, ["plugin", "check", "--json"]).stdout)["problems"]
+
+    assert (problem["group"], problem["status"], problem["code"]) == (group, status, code)
+    assert problem["reason"].startswith(reason)
+
+
+def test_a_command_the_root_group_refuses_to_add_is_failed(monkeypatch):
+    class _Refusing(click.Group):
+        def add_command(self, cmd, name=None):
+            if name == "tools":
+                raise RuntimeError("no more commands")
+            super().add_command(cmd, name)
+
+    _install(monkeypatch)
+    root = _Refusing()
+    root.add_command(plugin)
+    monkeypatch.setattr(cli_plugins_mod, "entry_points",
+                        lambda *, group: [_CliEP("tools", "tools", group)] if group == cli_plugins_mod.CLI_PLUGINS_GROUP else [])
+    load_cli_plugins(root)
+
+    (problem,) = json.loads(CliRunner().invoke(root, ["plugin", "check", "--json"]).stdout)["problems"]
+
+    assert (problem["status"], problem["code"]) == ("failed", "invalid-plugin")
+    assert problem["reason"] == "could not be registered: RuntimeError('no more commands')"
+
+
+def test_cli_plugins_whose_agent_env_requirement_is_not_met_are_not_loaded(monkeypatch):
+    _install(monkeypatch)
+    needs_more = ["agentenv-framework>=999"]
+    root = _root_with_cli_plugins(
+        monkeypatch,
+        commands=[_CliEP("tools", "tools", cli_plugins_mod.CLI_PLUGINS_GROUP, requires=needs_more)],
+        options=[_CliEP("tenant", "tenant", cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, requires=needs_more)],
+    )
+
+    result = CliRunner().invoke(root, ["plugin", "check"])
+
+    assert "tools" not in root.commands and tenant not in root.params
+    assert result.exit_code == 1
+    assert result.output.count("failed: needs agentenv-framework>=999 (installed: ") == 2
+    assert result.output.count("[incompatible-core]") == 2
+
+
+def test_one_option_object_two_packages_export_is_attached_once_not_a_conflict(monkeypatch):
+    """One object is one callback, so there is no winner to pick between."""
+    _install(monkeypatch)
+    root = _root_with_cli_plugins(monkeypatch, options=[
+        _CliEP("tenant", "tenant", cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, dist="agentenv-a"),
+        _CliEP("tenant_too", "tenant", cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP, dist="agentenv-b"),
+    ])
+
+    result = CliRunner().invoke(root, ["plugin", "check", "--json"])
+
+    report = json.loads(result.stdout)
+    assert result.exit_code == 0 and report["problems"] == []
+    assert [(d["name"], c["status"], c["code"]) for d in report["plugins"] for c in d["contributions"]] == [
+        ("agentenv-a", "active", None), ("agentenv-b", "active", "already-attached"),
+    ]
+    assert root.params.count(tenant) == 1
 
 
 def test_check_fails_on_a_cli_plugin_the_cli_skipped(monkeypatch):
@@ -354,7 +475,7 @@ def test_check_fails_on_a_cli_plugin_the_cli_skipped(monkeypatch):
     result = CliRunner().invoke(root, ["plugin", "check"])
 
     assert result.exit_code == 1
-    assert "agentenv-tools 0.2.0: CLI command plugin: skipped: clashes with existing command 'plugin'" in result.output
+    assert "agentenv-tools 0.2.0: CLI command plugin: skipped: clashes with existing command 'plugin' [builtin-name]" in result.output
 
 
 @pytest.mark.parametrize("broken", ["missing", "malformed"])
@@ -377,6 +498,39 @@ def test_json_stays_valid_when_a_plugin_prints_while_it_is_imported(monkeypatch)
     result = _run(_root_with_cli_plugins(monkeypatch), "list", "--json")
 
     assert json.loads(result.stdout)["plugins"][0]["contributions"][0]["status"] == "active"
+
+
+def _chatty(ctx, param, value):
+    print(f"callback saw {value!r}")
+
+
+chatty = click.Option(["--chatty"], is_flag=True, default=None, expose_value=False, callback=_chatty)
+
+
+def test_json_stays_valid_when_a_root_option_callback_prints_with_its_flag_absent(monkeypatch):
+    _install(monkeypatch, envs=[_EP("browser", "_BrowserEnv")])
+    root = _root_with_cli_plugins(monkeypatch, options=[_CliEP("chatty", "chatty", cli_plugins_mod.CLI_ROOT_OPTIONS_GROUP)])
+
+    absent = CliRunner().invoke(root, ["plugin", "list", "--json"])
+    given = CliRunner().invoke(root, ["--chatty", "plugin", "list"])
+
+    assert json.loads(absent.stdout)["format_version"] == 1
+    assert "callback saw None" in absent.stderr
+    assert "callback saw True" in given.stdout
+
+
+def test_a_package_with_unreadable_metadata_is_one_row(monkeypatch):
+    step = _EP("one", "_PluginStep", dist="", version="")
+    step.dist._path = "/site/broken_a-1.0.dist-info"
+    _install(monkeypatch, task_steps=[step])
+    command = _CliEP("tools", "tools", cli_plugins_mod.CLI_PLUGINS_GROUP, dist="", version="")
+    command.dist._path = "/site/broken_a-1.0.dist-info"
+
+    payload = json.loads(_run(_root_with_cli_plugins(monkeypatch, commands=[command]), "list", "--json").stdout)
+
+    (dist,) = payload["plugins"]
+    assert dist["name"] == "(unreadable metadata: broken_a-1.0.dist-info)"
+    assert [c["name"] for c in dist["contributions"]] == ["one", "tools"]
 
 
 def test_a_cli_plugin_that_prints_while_it_is_imported_prints_to_stderr(monkeypatch, capsys):
@@ -408,9 +562,9 @@ def test_check_fails_when_installed_entry_points_cannot_be_read(monkeypatch):
 
     assert result.exit_code == 1
     assert result.output.count("installed entry points could not be read for agent_env.envs, ") == 1
-    assert "agent_env.cli_root_options: TypeError: Pair.__new__()" in result.output
+    assert "agent_env.cli_root_options, agent_env.bundles: TypeError: Pair.__new__()" in result.output
     assert result.output.rstrip().endswith("Error: installed entry points could not be read")
-    assert payload["ok"] is False and len(payload["discovery_errors"]) == 8
+    assert payload["ok"] is False and set(payload["discovery_errors"]) == set(_KINDS)
     assert listing.count("(error) installed entry points could not be read for agent_env.envs, ") == 1
 
 
@@ -421,8 +575,11 @@ def test_check_json_reports_problems_and_exits_1(monkeypatch):
 
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
-    assert payload["ok"] is False
-    assert [(p["package"], p["name"], p["status"]) for p in payload["problems"]] == [("agentenv-demo", "browser", "failed")]
+    assert list(payload)[0] == "format_version" and payload["ok"] is False
+    assert [(p["package"], p["name"], p["status"], p["code"]) for p in payload["problems"]] == [
+        ("agentenv-demo", "browser", "failed", "load-failed"),
+    ]
+    assert payload["plugins"][0]["contributions"][0]["code"] == "load-failed"
 
 
 def test_the_commands_leave_the_process_config_and_the_working_directory_untouched(monkeypatch, tmp_path):
@@ -462,4 +619,5 @@ def test_environment_says_how_agent_env_was_installed(tmp_path):
 
 def test_core_owns_the_plugin_command_name():
     assert cli.commands["plugin"] is plugin
-    assert sorted(plugin.commands) == ["check", "list", "show"]
+    assert sorted(plugin.commands) == ["add", "check", "list", "remove", "show"]
+

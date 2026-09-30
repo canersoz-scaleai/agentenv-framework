@@ -4,6 +4,7 @@ import sys
 import click
 
 from agent_env.a2a_agent import A2AAgent
+from agent_env.store.routing import run_scope
 
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 1209600
@@ -47,7 +48,8 @@ def deploy(agent_id: str, agent_version: int | None, env_var_pairs: tuple[str, .
     click.echo(f"Found: id={agent.id} version={agent.version} image={agent.docker_image_artifact.id}")
 
     click.echo(f"Deploying (ttl={ttl_seconds}s)...")
-    deployed = asyncio.run(agent.deploy(ttl_seconds=ttl_seconds, env_vars=env_vars if env_vars else None, priority=priority))
+    with run_scope(agent.id):
+        deployed = asyncio.run(agent.deploy(ttl_seconds=ttl_seconds, env_vars=env_vars if env_vars else None, priority=priority))
 
     click.echo("Deployed!")
     click.echo("Instance ID: " + click.style(deployed.instance_id, fg="green"))

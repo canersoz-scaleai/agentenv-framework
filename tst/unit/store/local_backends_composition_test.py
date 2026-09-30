@@ -9,6 +9,7 @@ layer works; the full task-DAG no-infra e2e stays gated on images/secrets/seedin
 
 import gzip
 import io
+import re
 from pathlib import Path
 
 import pytest
@@ -19,28 +20,11 @@ from agent_env.artifact.artifacts.cli import CliArtifact
 from agent_env.artifact.artifacts.file import FileArtifact
 from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
 from agent_env.artifact.artifacts.skill import SkillArtifact, download_skill
-from agent_env.artifact.store import reset_artifact_store
 from agent_env.cli.artifact.file_artifact_universe import file_artifact_universe
-from agent_env.store import LocalFilesystemObjectStore
 from agent_env.store.ids import fs_safe, key_segment
-from agent_env.config import configure, get_config, reset_config, set_image_store
-from agent_env.store.document_store.sqlite_document_store import LocalSqliteDocumentStore
-from tst.unit.store.fakes import FakeImageStore
-
-
-@pytest.fixture
-def local_stores(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("AGENT_ENV_OBJECT_STORE", "local")
-    monkeypatch.setenv("AGENT_ENV_DOCUMENT_STORE", "local")
-    configure()
-    reset_artifact_store()  # rebind the cached store to this test's fresh local config
-    cfg = get_config()
-    assert isinstance(cfg.get_object_store(), LocalFilesystemObjectStore)
-    assert isinstance(cfg.get_document_store(), LocalSqliteDocumentStore)
-    yield cfg
-    reset_config()
-    reset_artifact_store()
+from agent_env.config import get_config, set_image_store, set_object_store
+from agent_env.store.image_store import LocalRegistryImageStore
+from tst.unit.store.fakes import FakeImageStore, FakeObjectStore
 
 
 def _write(tmp_path, name, data: bytes) -> str:
@@ -86,6 +70,51 @@ def test_file_artifact_put_existing(local_stores, tmp_path):
     assert FileArtifact.get("existing").load() == b"already-here"
 
 
+@pytest.mark.parametrize("url", ["fake://home", "fake://home/", "fake://home/dir/"])
+def test_put_existing_refuses_a_url_that_names_no_object(local_stores, url):
+    store = FakeObjectStore()
+    store.put("dir/x.bin", b"v")
+    set_object_store(store)
+
+    with pytest.raises(ValueError, match="not a prefix"):
+        FileArtifact.put_existing(id="prefix", description="d", object_url=url)
+
+
+def test_put_existing_refuses_a_local_directory(local_stores):
+    """A directory is not an object, with or without the trailing slash."""
+    store = local_stores.get_object_store()
+    store.put("dir/x.bin", b"v")
+    directory = store.object_url("dir")
+
+    with pytest.raises(ValueError, match="not a prefix"):
+        FileArtifact.put_existing(id="prefix", description="d", object_url=directory + "/")
+    with pytest.raises(ValueError, match="does not exist"):
+        FileArtifact.put_existing(id="prefix", description="d", object_url=directory)
+
+
+def test_put_existing_keeps_a_filename_that_holds_a_hash(local_stores, tmp_path):
+    """The filename is the url's last segment, where urlparse would stop at the '#'."""
+    store = local_stores.get_object_store()
+    written_url = store.put_file("artifacts/file/hashed/1/state#v2.zip", _write(tmp_path, "s.zip", b"PK"))
+
+    fa = FileArtifact.put_existing(id="hashed", description="d", object_url=written_url)
+    assert fa.filename == "state#v2.zip"
+    assert fa.content_type == "application/zip"
+
+
+def test_put_existing_registers_an_object_outside_the_stores_own_root(local_stores, tmp_path):
+    """Like the url-addressed reads, registration needs the store to read the object, not to
+    own it: an object in another root of the same backend (another bucket, say) is accepted."""
+    store = FakeObjectStore(root="home")
+    elsewhere = store.put_file_at("fake://shared/bundles/w.zip", _write(tmp_path, "w.zip", b"PK"))
+    set_object_store(store)
+    assert not store.owns(elsewhere)
+
+    fa = FileArtifact.put_existing(id="shared-bundle", description="d", object_url=elsewhere)
+    assert fa.filename == "w.zip"
+    assert fa.object_url == elsewhere
+
+
 def test_universe_put_bundled(local_stores, tmp_path):
     store = local_stores.get_object_store()
     files = {
@@ -111,6 +140,16 @@ def test_universe_put_existing_lists_via_list_at(local_stores, tmp_path):
     assert loaded == {"one.txt": b"1", "nested/two.txt": b"2"}
 
 
+def test_a_skill_prefix_without_skill_md_is_refused_through_the_stores_not_found_error():
+    """A missing SKILL.md is found through ObjectNotFoundError, not a backend-specific error."""
+    store = FakeObjectStore()
+    store.put("skills/demo/README.md", b"no skill file here")
+    set_object_store(store)
+
+    with pytest.raises(ValueError, match="SKILL.md not found"):
+        SkillArtifact.validate(s3_url=store.object_url("skills/demo"), expected_name="demo")
+
+
 def test_skill_artifact_put_and_download(local_stores, tmp_path):
     """SkillArtifact.put derives its bundle url from the store (not a hardcoded
     s3://), so skill create + download round-trips on the local backend."""
@@ -130,19 +169,11 @@ def test_skill_artifact_put_and_download(local_stores, tmp_path):
     assert names == ["SKILL.md", "ref.txt"]
 
 
-@pytest.fixture
-def local_ids_accepted(monkeypatch):
-    """Stands in for @local acceptance, which arrives with namespace-routed stores: lifts the
-    '@' reservation so these tests can drive the id sinks end to end on local backends."""
-    monkeypatch.setattr("agent_env.store.document_store.document_store.reject_reserved_id", lambda _id: None)
-    monkeypatch.setattr("agent_env.artifact.store.reject_reserved_id", lambda _id: None)
-
-
 HOSTILE = "@local/~/My Work/Tickets V2"
 HOSTILE_SEGMENT = "local/my-work-tickets-v2-ee679b8e5d3a"
 
 
-def test_a_local_id_file_artifact_lands_under_its_encoded_segment(local_stores, local_ids_accepted, tmp_path):
+def test_a_local_id_file_artifact_lands_under_its_encoded_segment(local_stores, cli_routing, tmp_path):
     src = _write(tmp_path, "payload.json", b'{"hostile": true}')
     fa = FileArtifact.put(id=HOSTILE, description="d", file_path=src)
     fb = FileArtifact.put_bytes(id=HOSTILE, description="d", filename="raw.bin", content=b"raw")
@@ -167,7 +198,7 @@ def _cli_dir(tmp_path, name, files):
     return root
 
 
-def test_a_local_id_cli_bundle_round_trips(local_stores, local_ids_accepted, tmp_path):
+def test_a_local_id_cli_bundle_round_trips(local_stores, cli_routing, tmp_path):
     cli_dir = _cli_dir(tmp_path, "cli", {"bin/tool": b"#!/bin/sh\n", "lib/data.txt": b"d"})
     art = CliArtifact.put(id=HOSTILE, command_name="tool", entrypoint="bin/tool", cli_dir=cli_dir)
 
@@ -177,7 +208,7 @@ def test_a_local_id_cli_bundle_round_trips(local_stores, local_ids_accepted, tmp
     assert loaded == {"bin/tool": b"#!/bin/sh\n", "lib/data.txt": b"d"}
 
 
-def test_a_local_id_bundle_never_lists_another_ids_files(local_stores, local_ids_accepted, tmp_path):
+def test_a_local_id_bundle_never_lists_another_ids_files(local_stores, cli_routing, tmp_path):
     parent = CliArtifact.put(
         id="@local/t/A", command_name="a", entrypoint="a", cli_dir=_cli_dir(tmp_path, "a", {"a": b"A"}),
     )
@@ -196,23 +227,26 @@ class _DockerSave:
         return 0
 
 
-@pytest.mark.parametrize("entity_id, repository, tarball", [
-    (HOSTILE, HOSTILE_SEGMENT, f"artifacts/docker_image/{HOSTILE_SEGMENT}/1/local-my-work-tickets-v2-ee679b8e5d3a-v1.tar.gz"),
-    ("legacy-image", "legacy-image", "artifacts/docker_image/legacy-image/1/legacy-image-v1.tar.gz"),
+@pytest.mark.parametrize("entity_id, registry, repository, tarball", [
+    (HOSTILE, "localhost:5000", HOSTILE_SEGMENT,
+     f"artifacts/docker_image/{HOSTILE_SEGMENT}/1/local-my-work-tickets-v2-ee679b8e5d3a-v1.tar.gz"),
+    ("legacy-image", "fake.registry", "legacy-image", "artifacts/docker_image/legacy-image/1/legacy-image-v1.tar.gz"),
 ])
 def test_a_docker_image_names_its_repository_and_tarball_from_the_encoded_id(
-    local_stores, local_ids_accepted, monkeypatch, entity_id, repository, tarball,
+    local_stores, cli_routing, monkeypatch, entity_id, registry, repository, tarball,
 ):
     images = FakeImageStore()
     set_image_store(images)
+    local_registry = []
+    monkeypatch.setattr(LocalRegistryImageStore, "ensure_repository", lambda self, repository: local_registry.append(repository))
     pushed = []
     monkeypatch.setattr(docker_image, "_push_local_image", lambda src, ref, store: pushed.append(ref))
     monkeypatch.setattr(docker_image.subprocess, "Popen", _DockerSave)
 
     art = docker_image.DockerImageArtifact.put(id=entity_id, description="d", image_name="src:latest")
 
-    assert images.repositories == [repository]
-    assert pushed == [f"fake.registry/{repository}:v1"] and art.image_name == pushed[0]
+    assert images.repositories + local_registry == [repository]
+    assert pushed == [f"{registry}/{repository}:v1"] and art.image_name == pushed[0]
     assert local_stores.get_object_store().get_object_key(art.tar_gz_object_url) == tarball
     assert gzip.decompress(docker_image.DockerImageArtifact.get(entity_id).load()) == b"image-tar-bytes"
 
@@ -230,14 +264,14 @@ def test_a_docker_image_names_its_repository_and_tarball_from_the_encoded_id(
         s3_url=get_config().get_object_store().object_url("bundle/"),
     ),
 ], ids=["docker_image", "file", "file_put_at", "universe_put_bundled"])
-def test_a_reserved_id_is_refused_before_any_image_or_object_is_written(local_stores, monkeypatch, tmp_path, put):
+def test_an_local_id_outside_the_cli_is_refused_before_any_image_or_object_is_written(local_stores, monkeypatch, tmp_path, put):
     images = FakeImageStore()
     set_image_store(images)
     pushed = []
     monkeypatch.setattr(docker_image, "_push_local_image", lambda src, ref, store: pushed.append(ref))
     monkeypatch.setattr(docker_image.subprocess, "Popen", _DockerSave)
 
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="only the @local namespace's store holds"):
         put(tmp_path)
 
     assert images.repositories == [] and pushed == []
@@ -248,24 +282,40 @@ def test_a_reserved_id_is_refused_before_any_image_or_object_is_written(local_st
     (HOSTILE, HOSTILE_SEGMENT),
     ("Legacy/Universe v1", "Legacy/Universe v1"),
 ])
-def test_put_bundled_defaults_its_prefix_to_the_encoded_id(local_stores, monkeypatch, tmp_path, universe_id, segment):
-    _write(tmp_path, "a.txt", b"a")
-    monkeypatch.setattr(local_stores, "get_s3_bucket", lambda: "bucket")
-    calls = []
+def test_put_bundled_writes_each_version_under_its_own_prefix(
+    local_stores, cli_routing, tmp_path, universe_id, segment,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"a")
+    prefix = local_stores.get_object_store().object_url(f"artifacts/file_artifact_universe/{segment}")
+    for version in (1, 2):
+        res = CliRunner().invoke(file_artifact_universe, ["put-bundled", "--id", universe_id, "--file-dir", str(source)])
+        assert res.exit_code == 0, res.output
+        url = FileArtifactUniverse.get(universe_id, version).bundle_object_url
+        assert re.fullmatch(rf"{re.escape(prefix)}/{version}-[0-9a-f]{{8}}/", url), url
 
-    def put_bundled(id, files, s3_url):
-        calls.append(s3_url)
-        return FileArtifactUniverse(
-            id=id, version=1, description="d", file_artifact_ids={}, bundle_object_url=s3_url + "bundle.tar.gz",
-        )
 
-    monkeypatch.setattr(FileArtifactUniverse, "put_bundled", put_bundled)
-    res = CliRunner().invoke(file_artifact_universe, ["put-bundled", "--id", universe_id, "--file-dir", str(tmp_path)])
+def test_a_put_bundled_that_fails_partway_doesnt_block_the_next(local_stores, monkeypatch, tmp_path):
+    files = {"a.txt": _write(tmp_path, "a.txt", b"A"), "b.txt": _write(tmp_path, "b.txt", b"B")}
+    put_at, calls = FileArtifact.put_at, []
 
-    assert res.exit_code == 0, res.output
-    assert calls == [f"s3://bucket/file_artifact_universe/{segment}/"]
+    def interrupted(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            raise ConnectionError("interrupted")
+        return put_at(**kwargs)
 
-def test_get_many_writes_each_local_id_into_its_own_encoded_directory(local_stores, local_ids_accepted, tmp_path):
+    monkeypatch.setattr(FileArtifact, "put_at", interrupted)
+    with pytest.raises(ConnectionError):
+        FileArtifactUniverse.put_bundled(id="interrupted", files=files)
+    monkeypatch.setattr(FileArtifact, "put_at", put_at)
+    universe = FileArtifactUniverse.put_bundled(id="interrupted", files=files)
+    assert universe.version == 1
+    assert {key: fa.load() for key, fa in universe.get_file_artifacts().items()} == {"a.txt": b"A", "b.txt": b"B"}
+
+
+def test_get_many_writes_each_local_id_into_its_own_encoded_directory(local_stores, cli_routing, tmp_path):
     store = local_stores.get_object_store()
     for uid, name in (("@local/t/A", "1"), ("@local/t/A/1", "f")):
         prefix = store.object_url(f"artifacts/file_artifact_universe/{key_segment(uid)}/1/")

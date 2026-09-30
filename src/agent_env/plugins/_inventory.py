@@ -2,13 +2,13 @@
 
 Internal: the public names are re-exported from ``agent_env.plugins``. The registries are built on
 a throwaway Config that reads the caller's document, so the Config in use keeps its registries and
-its ``load_failures()``, and a conflict is reported rather than raised.
+its ``load_failures()``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import KW_ONLY, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Optional
@@ -16,7 +16,7 @@ from typing import Any, Literal, Optional
 from agent_env.config import runtime
 from agent_env.config import snapshot as config_snapshot
 from agent_env.config.errors import ConfigError
-from agent_env.plugins import _discovery, _registration
+from agent_env.plugins import _discovery, _registration, _report, _requirements
 
 Status = Literal["active", "replaced", "failed", "skipped", "conflict", "blocked", "unloaded"]
 
@@ -25,17 +25,45 @@ _SETTLED = frozenset({"failed", "skipped", "conflict"})
 
 
 @dataclass(frozen=True)
+class Diagnostic:
+    """Why a group, the config or entry-point discovery failed."""
+
+    code: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Claimant:
+    """Another entry point that claims the same name."""
+
+    package: str
+    version: str
+    value: str
+
+
+@dataclass(frozen=True)
+class Replacement:
+    """The config that registers a different class under a contribution's name."""
+
+    file: Optional[Path]
+    table: str
+    impl: str
+
+
+@dataclass(frozen=True)
 class Contribution:
-    """One entry point a distribution declares, and what became of it."""
+    """One entry point a distribution declares, and what became of it. ``code`` says why it has
+    its status, and is set exactly when ``reason`` is."""
 
     group: str
     name: str
     value: str
     status: Status
+    _: KW_ONLY
+    code: Optional[str] = None
     reason: Optional[str] = None
-    replaced_in: Optional[str] = None
-    replacement: Optional[str] = None
-    conflicts_with: tuple[str, ...] = ()
+    replaced_by: Optional[Replacement] = None
+    conflicts_with: tuple[Claimant, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,17 +80,18 @@ class Inventory:
     """Every installed plugin distribution, and the error each group's real build would raise."""
 
     distributions: tuple[Distribution, ...]
-    # With load=False, only what metadata proves: a conflict, or that no config file was found.
-    group_errors: Mapping[str, str]
+    # With load=False, only what metadata proves: that no config file was found.
+    group_errors: Mapping[str, Diagnostic]
     # Groups whose installed entry points could not be read, so none of their plugins is listed.
-    discovery_errors: Mapping[str, str]
+    discovery_errors: Mapping[str, Diagnostic]
     config_path: Optional[Path]
-    config_error: Optional[str]
+    config_error: Optional[Diagnostic]
     loaded: bool
 
 
-for _public in (Contribution, Distribution, Inventory):
+for _public in (Claimant, Contribution, Diagnostic, Distribution, Inventory, Replacement):
     _public.__module__ = "agent_env.plugins"
+
 
 def _groups() -> dict[str, tuple[Callable[[], Any], Callable[[runtime.Config], Any]]]:
     """Per group: its built-in names, and how the probe builds it."""
@@ -70,8 +99,9 @@ def _groups() -> dict[str, tuple[Callable[[], Any], Callable[[runtime.Config], A
     from agent_env.artifact.registry import ARTIFACT_REGISTRY
     from agent_env.env import registry as env_registry
     from agent_env.explorer.plugin import load_plugins
-    from agent_env.providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS
-    from agent_env.providers.state.env_state_provider import _BUILTIN_STATE_PROVIDERS
+    from agent_env.providers.env_providers import env_provider
+    from agent_env.providers.sandbox_providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS
+    from agent_env.providers.env_state.env_state_provider import _BUILTIN_STATE_PROVIDERS
     from agent_env.task_step import registry as task_step_registry
 
     return {
@@ -80,6 +110,7 @@ def _groups() -> dict[str, tuple[Callable[[], Any], Callable[[runtime.Config], A
         _registration.TASK_STEPS: (task_step_registry._builtin_registry, lambda probe: probe.task_step_registry()),
         _registration.SANDBOX_PROVIDERS: (lambda: _BUILTIN_SANDBOX_PROVIDERS, lambda probe: probe.sandbox_registry()),
         _registration.STATE_PROVIDERS: (lambda: _BUILTIN_STATE_PROVIDERS, lambda probe: probe.state_registry()),
+        _registration.ENV_PROVIDERS: (env_provider._builtin_env_providers, lambda probe: probe.env_provider_registry()),
         _registration.EXPLORER_PLUGINS: (dict, lambda probe: load_plugins(source=probe)),
     }
 
@@ -104,19 +135,23 @@ def inventory(config: Optional[runtime.Config] = None, *, load: bool = True) -> 
         # No config file was found: every real build raises this before merging anything, so the
         # plugins are checked against an empty document and then blocked.
         document, missing = config_snapshot.Snapshot(path=None, _document={}), exc
-    unreadable = missing or document.error
-    config_error = None if unreadable is None else str(unreadable)
+    if missing is not None:
+        config_error = Diagnostic(_report.CONFIG_NOT_FOUND, str(missing))
+    elif document.error is not None:
+        config_error = Diagnostic(_report.CONFIG_UNREADABLE, str(document.error))
+    else:
+        config_error = None
     # A malformed document is used as it is, so each build raises its parse error where a real one does.
     probe = _registration.InventoryProbe(_snapshot=document) if load else None
-    group_errors: dict[str, str] = {}
-    discovery_errors: dict[str, str] = {}
+    group_errors: dict[str, Diagnostic] = {}
+    discovery_errors: dict[str, Diagnostic] = {}
     by_distribution: dict[tuple[str, str], list[Contribution]] = {}
     groups = _groups()
     for group, (builtins_of, build) in groups.items():
         try:
             claims = _discovery.claims(group)
         except Exception as exc:
-            discovery_errors[group] = _discovery.discovery_error(exc)
+            discovery_errors[group] = Diagnostic(_report.ENTRY_POINTS_UNREADABLE, _discovery.discovery_error(exc))
             continue
         if not claims:
             continue
@@ -125,31 +160,20 @@ def inventory(config: Optional[runtime.Config] = None, *, load: bool = True) -> 
         if probe is not None:
             try:
                 build(probe)
-            except Exception as exc:
-                group_errors[group] = f"{type(exc).__name__}: {exc}"
+            except (Exception, SystemExit) as exc:
+                group_errors[group] = Diagnostic(_build_error_code(exc, document), f"{type(exc).__name__}: {exc}")
             registrations = probe.registrations.get(group)
-            if registrations is not None and registrations.conflicts:
-                # A real build raises the first conflict merge met, before anything the probe raised later.
-                first, claimants = next(iter(registrations.conflicts.items()))
-                group_errors[group] = _registration.conflict_message(first, group, list(claimants))
-        else:
-            conflicted = [name for name, found in claims.items() if name not in builtins and len(found) > 1]
-            if conflicted:
-                first = conflicted[0]
-                group_errors[group] = _registration.conflict_message(first, group, [p for p, _ in claims[first]])
         if missing is not None:
-            group_errors[group] = f"{type(missing).__name__}: {missing}"
+            group_errors[group] = Diagnostic(_report.CONFIG_NOT_FOUND, f"{type(missing).__name__}: {missing}")
         for name, found in claims.items():
             for plugin, ep in found:
-                contribution = _classify(group, name, plugin, found, builtins, registrations, document.path)
+                contribution = _classify(group, name, plugin, ep, found, builtins, registrations, document.path)
                 if group in group_errors and contribution.status not in _SETTLED:
+                    error = group_errors[group]
                     contribution = Contribution(
-                        group, name, plugin.value, "blocked", reason=group_errors[group]
+                        group, name, plugin.value, "blocked", code=error.code, reason=error.reason
                     )
-                elif load and contribution.status == "unloaded":
-                    # Unreachable while every registry records what it did; visible, not silent, if not.
-                    contribution = replace(contribution, reason="its status could not be determined")
-                by_distribution.setdefault(_identity(plugin, ep), []).append(contribution)
+                by_distribution.setdefault(_discovery.identity(ep), []).append(contribution)
     order = list(groups)
     distributions = tuple(
         Distribution(dist, version, tuple(sorted(found, key=lambda c: (order.index(c.group), c.name))))
@@ -169,6 +193,7 @@ def _classify(
     group: str,
     name: str,
     plugin: _discovery.Plugin,
+    ep: Any,
     found: list[tuple[_discovery.Plugin, Any]],
     builtins: frozenset[str],
     registrations: Optional[_registration.Registrations],
@@ -176,35 +201,62 @@ def _classify(
 ) -> Contribution:
     # Same precedence as merge: a built-in name is skipped for every claimant, before conflicts.
     if name in builtins:
-        return Contribution(group, name, plugin.value, "skipped", reason="clashes with a built-in")
+        return Contribution(
+            group, name, plugin.value, "skipped", code=_report.BUILTIN_NAME, reason="clashes with a built-in"
+        )
+    # Read from metadata, so it is reported without loading. A claim that cannot load claims nothing,
+    # so it takes no part in a conflict, as in a build.
+    if (unmet := _requirements.incompatibility(getattr(ep, "dist", None))) is not None:
+        return Contribution(group, name, plugin.value, "failed", code=_report.INCOMPATIBLE_CORE, reason=unmet)
+    found = _usable(found)
     if len(found) > 1:
-        others = tuple(str(other) for other, _ in found if other != plugin)
+        others = [(other, other_ep) for other, other_ep in found if other != plugin]
         alone = all((other.dist, other.version) == (plugin.dist, plugin.version) for other, _ in found)
-        reason = "this package declares the name more than once" if alone else "another installed package registers this name"
-        return Contribution(group, name, plugin.value, "conflict", reason=reason, conflicts_with=others)
+        who = "; ".join(str(other) for other, _ in others)
+        return Contribution(
+            group, name, plugin.value, "conflict", code=_report.NAME_CONFLICT,
+            reason=(f"this package declares the name more than once: {who}; report it to its author" if alone
+                    else f"also registered by {who}; remove all but one with `agent-env plugin remove <package>`"),
+            conflicts_with=tuple(_claimant(other, other_ep) for other, other_ep in others),
+        )
     if registrations is None:
-        return Contribution(group, name, plugin.value, "unloaded")
+        return Contribution(
+            group, name, plugin.value, "unloaded", code=_report.NOT_LOADED, reason="not imported (installed metadata only)"
+        )
     if name in registrations.added:
         return Contribution(group, name, plugin.value, "active")
     if name in registrations.released:
-        where, replacement = registrations.released[name]
+        table, impl, replacement = registrations.released[name]
         if replacement is registrations.classes.get(name):
             return Contribution(group, name, plugin.value, "active")
+        where = f"[{table}] of {config_path}" if config_path else f"[{table}]"
         return Contribution(
-            group, name, plugin.value, "replaced",
-            replaced_in=f"{where} in {config_path}" if config_path else where,
-            replacement=f"{replacement.__module__}:{replacement.__qualname__}",
+            group, name, plugin.value, "replaced", code=_report.REPLACED_BY_CONFIG,
+            reason=f"config names {impl!r} in {where}", replaced_by=Replacement(config_path, table, impl),
         )
     if name in registrations.failures:
         reason = registrations.failures[name].removeprefix(f"registered by {plugin} but ")
-        return Contribution(group, name, plugin.value, "failed", reason=reason)
-    return Contribution(group, name, plugin.value, "unloaded")
+        return Contribution(group, name, plugin.value, "failed", code=registrations.codes[name], reason=reason)
+    # Unreachable while every registry records what it did; visible, not silent, if not.
+    return Contribution(
+        group, name, plugin.value, "unloaded", code=_report.STATUS_UNKNOWN, reason="its status could not be determined"
+    )
 
 
-def _identity(plugin: _discovery.Plugin, ep: Any) -> tuple[str, str]:
-    """The distribution a contribution is grouped under; one with unreadable metadata is told
-    apart by where it is installed, so two such packages are not merged."""
-    if plugin.dist:
-        return plugin.dist, plugin.version
-    where = getattr(getattr(ep, "dist", None), "_path", None)
-    return f"(unreadable metadata: {Path(where).name})" if where else "(unreadable metadata)", plugin.version
+def _usable(found: list[tuple[_discovery.Plugin, Any]]) -> list[tuple[_discovery.Plugin, Any]]:
+    """The claims whose requirements admit this agent-env; the others cannot load."""
+    return [(p, ep) for p, ep in found if _requirements.incompatibility(getattr(ep, "dist", None)) is None]
+
+
+def _claimant(plugin: _discovery.Plugin, ep: Any) -> Claimant:
+    package, version = _discovery.identity(ep)
+    return Claimant(package, version, plugin.value)
+
+
+def _build_error_code(exc: BaseException, document: config_snapshot.Snapshot) -> str:
+    """The code for what a group's build raised."""
+    if document.error is not None and exc is document.error:
+        return _report.CONFIG_UNREADABLE
+    if isinstance(exc, ConfigError):
+        return _report.CONFIG_INVALID
+    return _report.GROUP_BUILD_FAILED

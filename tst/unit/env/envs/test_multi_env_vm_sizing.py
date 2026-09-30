@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_env.env.envs.multi_env import MultiEnv
+from agent_env.providers.env_providers.env_gateway_provider import EnvironmentGatewayProvider
 
 
 def _env(n_mcp: int = 0, n_web: int = 0) -> MultiEnv:
@@ -26,21 +27,21 @@ def _env(n_mcp: int = 0, n_web: int = 0) -> MultiEnv:
 
 
 async def _deployed_kwargs(env: MultiEnv, **deploy_kwargs) -> dict:
-    """What create_gateway was handed.
+    """What the gateway's deploy path was handed.
 
-    deploy() does more after that call than these tests care about, so the provider is a
-    fully async mock and any downstream explosion is swallowed.
+    deploy() does more after that call than these tests care about, so any downstream
+    explosion is swallowed.
     """
-    provider = AsyncMock()
-    with patch("agent_env.providers.GatewayProvider", return_value=provider), \
+    with patch.object(EnvironmentGatewayProvider, "_deploy_gateway", AsyncMock()) as deploy_gateway, \
+         patch("agent_env.env.env.Env.get"), \
          patch("agent_env.providers.get_env_sandbox_provider", MagicMock()), \
-         patch("agent_env.providers.state.acquire_state_for_deploy", AsyncMock(return_value=None)):
+         patch("agent_env.providers.env_state.acquire_state_for_deploy", AsyncMock(return_value=None)):
         try:
             await env.deploy(**deploy_kwargs)
         except Exception:
             pass
-    provider.create_gateway.assert_awaited()
-    return provider.create_gateway.await_args.kwargs
+    deploy_gateway.assert_awaited()
+    return deploy_gateway.await_args.kwargs
 
 
 @pytest.mark.asyncio

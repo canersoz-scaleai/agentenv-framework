@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from typing import Any, Self
+
 from agent_env.store.image_store.oci_registry_credentials import (
     OciRegistryCredentials,
     RegistryAuth,
@@ -20,9 +22,10 @@ class ImageStore(ABC):
     """
 
     @classmethod
-    def from_config(cls, **config) -> ImageStore:
-        """Construct from a resolved config table; backends that build a client override this."""
-        return cls(**config)
+    def from_config(cls, *args: Any, **config: Any) -> Self:
+        """Construct from a resolved config table; backends that build a client override this, taking
+        the table's keys as named parameters, which ``(*args, **config)`` lets a type checker accept."""
+        return cls(*args, **config)
 
     @abstractmethod
     def image_ref(self, repository: str, tag: str) -> str:
@@ -30,6 +33,12 @@ class ImageStore(ABC):
 
     def ensure_repository(self, repository: str) -> None:
         """Create the repository if the backend requires pre-creation; no-op otherwise."""
+
+    def owns(self, ref: str) -> bool:
+        """Whether ``ref`` is in this store, as ``auth`` decides it: a caller can tell a pull this
+        store authorizes from one it knows nothing about. The default owns nothing. Overriding
+        ``owns`` does not change which refs ``auth`` logs in for."""
+        return False
 
     @abstractmethod
     def auth(self, ref: str) -> RegistryAuth | None:
@@ -57,7 +66,7 @@ class OciRegistryImageStore(ImageStore):
         registry_host: str,
         repository_prefix: str = "",
         credentials: OciRegistryCredentials | Mapping[str, object] | None = None,
-    ) -> OciRegistryImageStore:
+    ) -> Self:
         if isinstance(credentials, Mapping):
             from agent_env.config import ConfigError, load_impl
 
@@ -89,6 +98,11 @@ class OciRegistryImageStore(ImageStore):
 
     def image_ref(self, repository: str, tag: str) -> str:
         return f"{self._registry}/{self._repo_name(repository)}:{tag}"
+
+    def owns(self, ref: str) -> bool:
+        """A ref on this store's registry, whatever its repository: a registry login covers the
+        whole host."""
+        return registry_host_from_ref(ref) == self._registry
 
     def auth(self, ref: str) -> RegistryAuth | None:
         if registry_host_from_ref(ref) != self._registry or self._credentials is None:

@@ -69,7 +69,6 @@ def _mcp_server_env() -> MCPServerEnv:
         version=4,
         docker_image_artifact=_docker_image("slack-mcp-image", 5, "slack-mcp:v5"),
         environment_name="slack",
-        service_version=3,
         metadata={"owner": "env-pod"},
     )
 
@@ -81,7 +80,6 @@ def _website_env() -> WebsiteEnv:
         backend_docker_image_artifact=_docker_image("shop-backend-image", 3, "shop-backend:v3"),
         frontend_docker_image_artifact=_docker_image("shop-frontend-image", 3, "shop-frontend:v3"),
         environment_name="shop",
-        service_version=1,
         metadata={"owner": "env-pod"},
     )
 
@@ -143,10 +141,10 @@ ARTIFACT_FIXTURES = {
         skill_metadata={"category": "documents"},
     ),
     "vm_image": lambda: VMImageArtifact(
-        id="cua-ubuntu",
+        id="ubuntu-vm",
         version=6,
-        description="Ubuntu CUA desktop image",
-        ecr_url="123456789012.dkr.ecr.us-west-2.amazonaws.com/cua/ubuntu:v6",
+        description="Ubuntu VM image",
+        ecr_url="123456789012.dkr.ecr.us-west-2.amazonaws.com/vm/ubuntu:v6",
         disk_size_gb=30.0,
         cpu=4.0,
         memory_mb=8192,
@@ -316,19 +314,22 @@ def test_service_universe_artifact_legacy_keys_are_unchanged():
     assert "environment_artifact_refs" not in doc
 
 
-def test_mcp_server_env_to_dict_writes_both_name_spellings_and_one_version_key():
+def test_mcp_server_env_to_dict_writes_both_name_spellings_and_no_version_key():
+    """``service_version`` was deleted from both env types, as from the artifact above: neither
+    spelling may appear. Stored documents keep the key for ever and ``from_dict`` does not read
+    it; this pins that ``to_dict`` never writes it back."""
     doc = _env_wire("mcp_server")
     assert doc["service_name"] == "slack"
     assert doc["environment_name"] == "slack"
-    assert doc["service_version"] == 3
+    assert "service_version" not in doc
     assert "environment_version" not in doc
 
 
-def test_website_env_to_dict_writes_both_name_spellings_and_one_version_key():
+def test_website_env_to_dict_writes_both_name_spellings_and_no_version_key():
     doc = _env_wire("website")
     assert doc["service_name"] == "shop"
     assert doc["environment_name"] == "shop"
-    assert doc["service_version"] == 1
+    assert "service_version" not in doc
     assert "environment_version" not in doc
 
 

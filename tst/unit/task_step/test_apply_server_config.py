@@ -13,7 +13,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.apply_server_config import (
     ApplyServerConfigError,
@@ -54,7 +54,7 @@ def _ext(uri: str, endpoint: str, method: str = "POST") -> dict:
 
 
 def _make_context(*, env_id="env-x", gateway_url=_GATEWAY, metadata=None):
-    env = DeployedEnv(
+    env = DeployedGatewayEnv(
         env_id=env_id, env_version=1, gateway_url=gateway_url, mcp_url="",
         db_web_url=None, sandbox_id="sb-env",
     )
@@ -520,6 +520,75 @@ async def test_card_404_raises():
             await _step().execute(_make_context())
 
 
+# --- stored env card: child env cards come from the deployed record ---
+
+
+@pytest.mark.asyncio
+async def test_stored_card_applies_at_the_child_env_endpoint_with_no_card_read():
+    gw = _MockGateway({})
+    ctx = _carded_context(await _composed_card({"mcp-slack": [_ext(_SET_ERRORS_URI, "/agentenv/ext/set_errors")]}))
+    with _patch_httpx(gw):
+        out = await _step().execute(ctx)
+
+    assert gw.get_calls == []
+    assert gw.post_calls == [(f"{_CARD}/svc/mcp-slack/agentenv/ext/set_errors",
+                              {"tool_name": "slack_send_message", "error_rate": 0.5, "error_type": "rate_limit"})]
+    assert out.metadata["server_config_changes"][0]["service"] == "slack"
+
+
+@pytest.mark.asyncio
+async def test_stored_card_skips_a_child_env_missing_from_it_under_tolerate():
+    gw = _MockGateway({})
+    ctx = _carded_context(await _composed_card({"mcp-email": []}))
+    with _patch_httpx(gw):
+        out = await _step(tolerate_unadvertised=True).execute(ctx)
+
+    assert gw.get_calls == [] and gw.post_calls == []
+    assert [(s["service"], s["reason"]) for s in out.metadata["server_config_skipped"]] == [("slack", "no_env_card")]
+
+
+@pytest.mark.asyncio
+async def test_stored_card_raises_for_a_child_env_missing_from_it():
+    gw = _MockGateway({})
+    ctx = _carded_context(await _composed_card({"mcp-email": []}))
+    with _patch_httpx(gw):
+        with pytest.raises(ApplyServerConfigError, match="'slack' has no env card"):
+            await _step().execute(ctx)
+
+    assert gw.get_calls == [] and gw.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stored_card_broadcast_applies_to_each_child_env_on_it_and_skips_the_rest():
+    """The production shape: a broadcast set_acting_user under tolerate_unadvertised."""
+    gw = _MockGateway({})
+    ctx = _carded_context(await _composed_card({
+        "mcp-slack": [_ext(_SET_ACTING_USER_URI, "/agentenv/ext/set_acting_user")],
+        "mcp-email": [],
+    }))
+    step = _step(tolerate_unadvertised=True, directives=[
+        {"service": "*", "uri": _SET_ACTING_USER_URI, "args": {"user_email": "a@x.com"}},
+    ])
+    with _patch_httpx(gw), patch("agent_env.env.env.Env.get", return_value=_fake_env("slack", "email", "calendar")):
+        out = await step.execute(ctx)
+
+    assert gw.get_calls == []
+    assert gw.post_calls == [(f"{_CARD}/svc/mcp-slack/agentenv/ext/set_acting_user", {"user_email": "a@x.com"})]
+    assert sorted((s["service"], s["reason"]) for s in out.metadata["server_config_skipped"]) == [
+        ("calendar", "no_env_card"), ("email", "extension_not_advertised"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_read_strips_a_trailing_slash_from_the_gateway_url():
+    gw = _MockGateway({"slack": _card(_ext(_SET_ERRORS_URI, "/agentenv/ext/set_errors"))})
+    with _patch_httpx(gw):
+        await _step().execute(_make_context(gateway_url=f"{_GATEWAY}/"))
+
+    assert gw.get_calls == [f"{_GATEWAY}/svc/mcp-slack/.well-known/agent-env.json"]
+    assert [url for url, _ in gw.post_calls] == [f"{_GATEWAY}/svc/mcp-slack/agentenv/ext/set_errors"]
+
+
 # --- schema / validation (pure, no I/O) ---
 
 
@@ -540,7 +609,7 @@ def test_config_round_trips_through_to_dict_from_dict():
     assert d["tolerate_unadvertised"] is True
     assert len(d["directives"]) == 2
     assert ApplyServerConfigStep.from_dict(d).to_dict() == d
-    # JSON-serializable (it gets persisted to Mongo + sent through Temporal).
+    # JSON-serializable (it gets persisted and sent to external runners).
     assert json.loads(json.dumps(d)) == d
 
 
@@ -629,3 +698,31 @@ def test_step_with_environment_directives_serializes_to_both_keys():
         {"service": "slack", "environment": "slack", "uri": _SET_ERRORS_URI, "args": {"tool_name": "t"}},
     ]
     assert ApplyServerConfigStep.from_dict(d).to_dict() == d
+
+
+# The card's address differs from the gateway URL, so a call built from the stored card is told apart from one built from /svc/... itself.
+_CARD = "https://sandbox.example/sandbox/sb-env-18765"
+
+
+async def _composed_card(children: dict[str, list]) -> dict:
+    """The real gateway's composed card over child envs at the given gateway keys, each advertising the given extensions."""
+    from agent_env.env.gateway.gateway import Gateway
+
+    gw = Gateway(host="127.0.0.1", port=0, server_name="env1234", internal_mcp_servers=[],
+                 rest_proxy_urls={key: f"http://{key}:18765" for key in children})
+
+    async def fetch(client, key, base_url):
+        return gw._rewrite_child_card(key, {**_card(*children[key]), "name": key.removeprefix("mcp-"), "url": "/agentenv"})
+
+    gw._fetch_child_card = fetch
+    return json.loads((await gw._serve_env_card()).body)
+
+
+def _carded_context(card: dict) -> TaskStepContext:
+    """`_make_context()` with a stored card at `_CARD`."""
+    from agent_env.env.gateway.constants import WELL_KNOWN_PATH
+
+    ctx = _make_context()
+    ctx.deployed_envs[0].environment_card_url = f"{_CARD}{WELL_KNOWN_PATH}"
+    ctx.deployed_envs[0].environment_card = card
+    return ctx

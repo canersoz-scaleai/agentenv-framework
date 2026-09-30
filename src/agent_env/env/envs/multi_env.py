@@ -22,36 +22,42 @@ def _snapshot_after_load_default() -> bool:
 
 if TYPE_CHECKING:
     from agent_env.artifact import EnvironmentArtifact, EnvironmentUniverseArtifact
+    from agent_env.providers.env_state import DatabaseStateProvider
 
-from agent_env.env.env import Env
+from agent_env.env.env import Env, gateway_url_of
 from agent_env.env.gateway import GatewayMode
-from agentenv_protocol import WELL_KNOWN_PATH
-from agent_env.env.envs.gateway_server import GatewayEnv
+from agent_env.env.envs._deployment import (
+    as_builtin, builtin_provider_for, close_deployed, close_replaced, deploy_refusal, deploy_through_provider, host_staging_refusal,
+    plugin_provider_like_a_builtin, provider_or_class,
+)
 from agent_env.env.envs.mcp_server import MCPServerEnv
-from agent_env.env.envs.service_db import ServiceDBEnv
 from agent_env.env.envs.website import WebsiteEnv
-from agent_env.env.store import register_env_instance
-from agent_env.providers.gateway_provider import DATABASE_SERVICE_NAME, DB_MCP_SERVICE_NAME, PGWEB_SERVICE_NAME
-from agent_env.providers.sandbox_provider import SANDBOX_MODE_CONTAINER
+from agent_env.store.routing import refuse_local_derivation
+from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_CONTAINER
 from agent_env.attribution import Attribution
 
 
 class MultiEnv(Env):
     type: ClassVar[str] = "multi"
-    description = "Multi environment combining multiple MCP servers and websites"
+    description = "Multi environment combining multiple MCP servers and websites, deployed through the environment provider its env_provider_type names"
 
-    def __init__(self, id: str, version: Optional[int], mcp_server_envs: list[MCPServerEnv], website_envs: list[WebsiteEnv] | None = None, metadata: Optional[dict[str, str]] = None, name: Optional[str] = None):
+    def __init__(self, id: str, version: Optional[int], mcp_server_envs: list[MCPServerEnv], website_envs: list[WebsiteEnv] | None = None, metadata: Optional[dict[str, str]] = None, name: Optional[str] = None, env_provider_type: str = "gateway"):
         super().__init__(id, version, metadata=metadata)
         if name is not None and (not name or any(ch.isspace() for ch in name)):
             raise ValueError("name must be non-empty with no whitespace")
+        if not env_provider_type:
+            raise ValueError("env_provider_type cannot be empty")
         self.name = name
+        self.env_provider_type = env_provider_type  # the children's own types are ignored: this one deploys them all
         self.mcp_server_envs = mcp_server_envs
         self.website_envs = website_envs or []
         self._sandbox = None
         self._gateway_url = None
         self._gateway_mode = GatewayMode.PERFORMANCE
-        self._gateway_provider = None
+        self._env_provider = None
         self._mcp_server_name: Optional[str] = None
+        self._deployed: Optional[DeployedEnv] = None
+        self._replaced: list[tuple] = []  # the provider and sandbox of each deployment a later deploy replaced, for close()
 
     def to_dict(self) -> dict:
         base = super().to_dict()
@@ -65,6 +71,7 @@ class MultiEnv(Env):
         ]
         if self.name:
             base["name"] = self.name
+        base["env_provider_type"] = self.env_provider_type
         return base
 
     @classmethod
@@ -77,171 +84,46 @@ class MultiEnv(Env):
             Env.get(ref["id"], version=ref["version"])
             for ref in data.get("website_envs", [])
         ]
-        return cls(id=data["id"], version=data.get("version"), mcp_server_envs=mcp_server_envs, website_envs=website_envs, metadata=data.get("metadata", {}), name=data.get("name"))
+        return cls(id=data["id"], version=data.get("version"), mcp_server_envs=mcp_server_envs, website_envs=website_envs, metadata=data.get("metadata", {}),
+                   name=data.get("name"), env_provider_type=data.get("env_provider_type", "gateway"))
 
     async def deploy(self, ttl_seconds: int = 10800, disk_size_gb: float = 10, gateway_mode: GatewayMode = GatewayMode.PERFORMANCE, cpu: float | None = None, memory_mb: int | None = None, sandbox_type: str | None = None, priority: Optional[int] = None, env_state_type: str | None = None, env_state_instance_id: str | None = None, *, attribution: Optional[Attribution] = None) -> DeployedEnv:
-        attribution = dict(attribution or {})
-        from agent_env.env.env import DeployedEnv
-        from agent_env.providers import GatewayProvider, MCPServerConfig, WebsiteConfig, build_sandbox_provider, get_env_sandbox_provider
-        from agent_env.providers.state import acquire_state_for_deploy
-
+        deployed_env = await deploy_through_provider(
+            self, environment_name=None, ttl_seconds=ttl_seconds, sandbox_type=sandbox_type,
+            disk_size_gb=disk_size_gb, gateway_mode=gateway_mode, cpu=cpu, memory_mb=memory_mb, priority=priority,
+            env_state_type=env_state_type, env_state_instance_id=env_state_instance_id, attribution=attribution,
+        )
         self._gateway_mode = gateway_mode
-        self._gateway_provider = GatewayProvider()
-        sandbox_provider = build_sandbox_provider(sandbox_type) if sandbox_type else get_env_sandbox_provider()
+        self._mcp_server_name = deployed_env.mcp_server_name
+        _hand_provider_to_child_envs(self)
+        _hand_record_to_child_envs(self, deployed_env)
+        return deployed_env
 
-        try:
-            mcp_servers = [
-                MCPServerConfig(image=env.docker_image_artifact.image_name, environment_name=env.environment_name)
-                for env in self.mcp_server_envs
-            ]
-            mcp_server_images = [env.docker_image_artifact for env in self.mcp_server_envs]
-            website_configs = [
-                WebsiteConfig(
-                    backend_image=env.backend_docker_image_artifact.image_name,
-                    frontend_image=env.frontend_docker_image_artifact.image_name,
-                    environment_name=env.environment_name,
-                )
-                for env in self.website_envs
-            ]
-            website_images = []
-            for env in self.website_envs:
-                website_images.append(env.backend_docker_image_artifact)
-                website_images.append(env.frontend_docker_image_artifact)
-            state_instance = await acquire_state_for_deploy(
-                env_state_type=env_state_type, ttl_seconds=ttl_seconds, name_hint=self.id, env_state_instance_id=env_state_instance_id,
-            )
-            result = await self._gateway_provider.create_gateway(
-                sandbox_provider=sandbox_provider,
-                mcp_servers=mcp_servers,
-                mcp_server_images=mcp_server_images,
-                website_configs=website_configs or None,
-                website_images=website_images or None,
-                gateway_mode=gateway_mode,
-                ttl_seconds=ttl_seconds,
-                disk_size_gb=disk_size_gb,
-                cpu=cpu,
-                memory_mb=memory_mb,
-                attribution=attribution,
-                priority=priority,
-                env_id=self.id,
-                state_instance=state_instance,
-                mcp_server_name=self.name,
-            )
-            self._sandbox = self._gateway_provider.sandbox
-            self._gateway_url = result.gateway_url
-            for env in self.mcp_server_envs:
-                env._sandbox = self._gateway_provider.environment_sandbox(env.environment_name) or self._sandbox
-                env._gateway_url = self._gateway_url
-                env._gateway_provider = self._gateway_provider
-            for env in self.website_envs:
-                env._sandbox = self._sandbox
-                env._gateway_url = self._gateway_url
-                env._gateway_provider = self._gateway_provider
-            gp = self._gateway_provider
-            sandbox_id = self._sandbox.sandbox_id
-            sandbox_type = self._sandbox.type
-            sandbox_ids: dict[str, str | dict[str, str]] = {GatewayEnv.type: sandbox_id}
-            if gp._environment_sandboxes:
-                sandbox_ids[MCPServerEnv.type] = {name: sb.sandbox_id for name, sb in gp._environment_sandboxes.items()}
-            service_db_ids = {role: sb.sandbox_id for role, sb in [
-                (DATABASE_SERVICE_NAME, gp._db_sandbox),
-                (PGWEB_SERVICE_NAME, gp._pgweb_sandbox),
-                (DB_MCP_SERVICE_NAME, gp._db_mcp_sandbox),
-            ] if sb is not None}
-            if service_db_ids:
-                sandbox_ids[ServiceDBEnv.type] = service_db_ids
-            deployed_env = DeployedEnv(
-                env_id=self.id,
-                env_version=self.version,
-                gateway_url=result.gateway_url,
-                mcp_url=result.mcp_url,
-                db_web_url=result.db_web_url,
-                sandbox_id=sandbox_id, sandbox_type=sandbox_type,
-                db_mcp_url=result.db_mcp_url,
-                environment_card_url=f"{result.gateway_url}{WELL_KNOWN_PATH}",
-                environment_card=result.environment_card,
-                environment_card_read_at_utc=result.environment_card_read_at_utc,
-                website_frontend_urls=result.website_frontend_urls,
-                gateway_mode=gateway_mode.value,
-                sandbox_ids=sandbox_ids,
-                env_state_instance_ids=result.env_state_instance_ids,
-                mcp_server_name=result.mcp_server_name,
-            )
-            deployed_env = register_env_instance(deployed_env, ttl_seconds)
-            self._instance_id = deployed_env.instance_id
-            self._mcp_server_name = deployed_env.mcp_server_name
-            return deployed_env
-        except BaseException:
-            await self.close()
-            raise
+    def deploy_refusal(self, **options) -> str | None:
+        """Why deploy() would refuse these options before building anything, or None; raises, as deploy() does, for a type this process can't find."""
+        return deploy_refusal(self, provider_or_class(self), options)
 
     @classmethod
     async def from_deployed_env(cls, deployed: DeployedEnv) -> MultiEnv:
-        from agent_env.env.env import DeployedEnv
-        from agent_env.providers import GatewayProvider, build_sandbox_provider, get_env_sandbox_provider
-
         env = Env.get(deployed.env_id, deployed.env_version)
         if not isinstance(env, MultiEnv):
             raise TypeError(f"Expected MultiEnv, got {type(env).__name__}")
-        provider = build_sandbox_provider(deployed.sandbox_type) if deployed.sandbox_type else get_env_sandbox_provider()
-        sandbox_ids = deployed.sandbox_ids or {}
-
-        gp = GatewayProvider()
-        gp._sandbox = await provider.get_sandbox(deployed.sandbox_id)
-
-        for environment_name, sb_id in (sandbox_ids.get(MCPServerEnv.type) or {}).items():
-            sb = await provider.get_sandbox(sb_id)
-            gp._environment_sandboxes[environment_name] = sb
-            gp._container_sandboxes.append(sb)
-
-        db_ids = sandbox_ids.get(ServiceDBEnv.type) or {}
-        for role, slot_name in [
-            (DATABASE_SERVICE_NAME, "_db_sandbox"),
-            (PGWEB_SERVICE_NAME, "_pgweb_sandbox"),
-            (DB_MCP_SERVICE_NAME, "_db_mcp_sandbox"),
-        ]:
-            sb_id = db_ids.get(role)
-            if sb_id:
-                sb = await provider.get_sandbox(sb_id)
-                setattr(gp, slot_name, sb)
-                gp._container_sandboxes.append(sb)
-
-        if gp._sandbox.mode == SANDBOX_MODE_CONTAINER:
-            gp._container_sandboxes.append(gp._sandbox)
-
-        from agent_env.providers.state import LocalPostgresStateProvider, build_state_provider
-        from agent_env.providers.state.store import get_env_state_instance_store
-        from agent_env.store.base import NotFoundError
-
-        state_instance = None
-        ids = deployed.env_state_instance_ids
-        if ids:
-            try:
-                state_instance = get_env_state_instance_store().get(ids[0])
-            except NotFoundError:
-                logger.warning(f"env_state_instance {ids[0]} not found on reattach; defaulting to local")
-        # No record (env predates state instances, or it expired) → default to the local store.
-        state_instance = state_instance or LocalPostgresStateProvider.default_instance()
-        gp._state_instance = state_instance
-        gp._state_provider = build_state_provider(state_instance.state_type)
-
-        env._gateway_provider = gp
-        env._sandbox = gp._sandbox
-        env._gateway_url = deployed.gateway_url
-        for child in env.mcp_server_envs:
-            child._sandbox = gp.environment_sandbox(child.environment_name) or env._sandbox
-            child._gateway_url = env._gateway_url
-            child._gateway_provider = gp
-        for child in env.website_envs:
-            child._sandbox = env._sandbox
-            child._gateway_url = env._gateway_url
-            child._gateway_provider = gp
+        provider = builtin_provider_for(env.env_provider_type) or plugin_provider_like_a_builtin(env.env_provider_type)
+        if builtin := as_builtin(provider):
+            env._sandbox = await builtin._reattach(env, deployed)
+        # Any other plugin's deployment holds its own sandboxes: its children load through its card, and nothing is reattached.
+        env._env_provider = provider
+        env._gateway_url = gateway_url_of(deployed)
+        env._deployed = deployed
+        _hand_provider_to_child_envs(env)
+        _hand_record_to_child_envs(env, deployed)
         env._instance_id = deployed.instance_id
         env._mcp_server_name = deployed.mcp_server_name
         return env
 
     async def load_environment_artifact(self, environment_artifact: EnvironmentArtifact) -> None:
-        if self._gateway_url is None:
+        # A built-in's deploy, or a caller wiring one up by hand, leaves a gateway; a plugin's leaves only its record.
+        if self._gateway_url is None and self._deployed is None:
             raise RuntimeError("Environment not deployed - call deploy() first")
         # MCP servers are checked first; if a website shares the same environment_name, the MCP server wins.
         for env in self.mcp_server_envs:
@@ -283,12 +165,17 @@ class MultiEnv(Env):
         from agent_env.env.env import LoadEnvironmentUniverseArtifactResult
         from agent_env.env.snapshot_store import compute_env_fingerprint, get_env_snapshot_store
 
+        # Refused before any service is touched, rather than after they all load.
+        if (refusal := host_staging_refusal(self, "Staging a universe's metadata files onto the env's host")) \
+                and environment_universe_artifact.get_metadata():
+            raise RuntimeError(refusal)
+
         # Check for a clean snapshot before doing slow REST-based loading.
 
         # Shortcutting data-load by using a snapshot is only supported when the env_state_type is local_postgres -
         # a remote-backed deploy has no local servicedb container to swap, so it falls through to
-        # the normal load.
-        state_provider = self._gateway_provider._state_provider if self._gateway_provider else None
+        # the normal load. So does a plugin's deployment, which has no state provider of ours.
+        state_provider = _gateway_state_provider(self)
         can_restore = state_provider is not None and state_provider.supports_restore_from_snapshot
         # Keyed on the service images rather than self.id, so re-registering the same
         # servers under a new env id still hits (and a rebuilt server correctly misses).
@@ -328,10 +215,10 @@ class MultiEnv(Env):
             # changed" look identical from the outside and call for different fixes.
             logger.warning(
                 "No clean snapshot for env=%s (fingerprint=%s) universe=%s v%s — "
-                "re-ingesting all %d services over HTTP, each under its own timeout. "
-                "Bake a snapshot to make subsequent loads an image swap instead.",
+                "re-ingesting all %d services over HTTP, each under its own timeout.%s",
                 self.id, env_fingerprint, environment_universe_artifact.id,
                 environment_universe_artifact.version, total,
+                " Bake a snapshot to make subsequent loads an image swap instead." if can_restore else "",
             )
 
             # Bound how many load at once. Unbounded, every service races every other for
@@ -341,7 +228,7 @@ class MultiEnv(Env):
             # ~1/13th of a core and a 409MB service exceeds its 600s cap, while a 3.5GB one
             # finishes; the cost tracks record count, not bytes. Throttling trades total
             # wall-clock (which nothing caps) for per-service headroom (which is capped).
-            # Resume an interrupted load instead of re-running all of it. A Temporal retry
+            # Resume an interrupted load instead of re-running all of it. A step retry
             # re-enters this step from scratch, and because the load is destructive
             # (reset-then-add per service) that meant re-wiping and re-ingesting every
             # service -- three attempts x the full universe is how one slow service became
@@ -626,6 +513,12 @@ class MultiEnv(Env):
         )
         return True, None
 
+    async def load_file_artifact_universe(self, file_artifact_universe: "Any", destination_path: Optional[str] = None,
+                                          ) -> "LoadFileArtifactUniverseResult":
+        if refusal := host_staging_refusal(self, "Staging files onto the env's host"):
+            raise RuntimeError(refusal)
+        return await super().load_file_artifact_universe(file_artifact_universe, destination_path)
+
     async def load_artifact(self, artifact):
         from agent_env.artifact import EnvironmentArtifact, EnvironmentUniverseArtifact
         if isinstance(artifact, EnvironmentUniverseArtifact):
@@ -641,8 +534,10 @@ class MultiEnv(Env):
         from agent_env.env.env import Env
         from agent_env.env.envs.service_db import DB_USER
         from agent_env.env.gateway import AGENT_ENV_GATEWAY_MCP_PORT
-        from agent_env.providers.gateway_provider import DATABASE_SERVICE_NAME, DB_MCP_SERVICE_NAME, DOCKER_COMPOSE_PATH, GATEWAY_APP_DIR, GATEWAY_SERVICE_NAME, GatewayProvider, MCPServerConfig, PGWEB_SERVICE_NAME, WebsiteConfig
-        from agent_env.providers.state import LocalPostgresStateProvider
+        from agent_env.providers import EnvironmentGatewayProvider, MCPServerConfig, WebsiteConfig
+        from agent_env.env.envs.service_db import DATABASE_SERVICE_NAME, DB_MCP_SERVICE_NAME, PGWEB_SERVICE_NAME
+        from agent_env.providers.env_providers.constants import DOCKER_COMPOSE_PATH, GATEWAY_APP_DIR, GATEWAY_SERVICE_NAME
+        from agent_env.providers.env_state import LocalPostgresStateProvider
         from agent_env.config import get_config
 
         if self._sandbox is None:
@@ -663,7 +558,7 @@ class MultiEnv(Env):
         service_db_config = service_db.to_config()
         service_db_config.db_image = db_image.image_name
 
-        gw = GatewayProvider()
+        gw = EnvironmentGatewayProvider()
         gw._sandbox = self._sandbox
         gw._state_provider = LocalPostgresStateProvider(service_db_config=service_db_config)
         gw._state_instance = LocalPostgresStateProvider.default_instance()
@@ -737,6 +632,7 @@ COMPOSE_EOF'''
 
         Deploys the env, fetches + persists its composed EnvironmentCard, then tears down.
         """
+        refuse_local_derivation(self.id, "env", "validating")
         from agent_env.task import Task
         from agent_env.task_step import DeployEnvTaskStep, VerifyEnvironmentCardStep
 
@@ -757,10 +653,9 @@ COMPOSE_EOF'''
 
         for deployed_env in context.deployed_envs:
             try:
-                env = await MultiEnv.from_deployed_env(deployed_env)
-                await env.close()
+                await close_deployed(deployed_env, MultiEnv)
             except Exception as e:
-                logger.warning(f"Failed to clean up env sandbox {deployed_env.sandbox_id}: {e}")
+                logger.warning(f"Failed to clean up env {deployed_env.env_id}: {e}")
         return context.instance_id
 
     async def validate_universe_compatibility(self, universe_artifact_id: str, universe_artifact_version: int | None = None, on_progress: Callable[[str], None] | None = None) -> str:
@@ -773,6 +668,7 @@ COMPOSE_EOF'''
         merged into the ``UNIVERSE_COMPATIBILITY`` result as per-service critical issues — so they
         surface (and gate ``compatible``) the same way programmatic issues do.
         """
+        refuse_local_derivation(self.id, "env", "validating")
         from agent_env.task import Task
         from agent_env.task_step import (
             CombineUniverseVerdictsStep,
@@ -822,10 +718,9 @@ COMPOSE_EOF'''
 
         for deployed_env in context.deployed_envs:
             try:
-                env = await MultiEnv.from_deployed_env(deployed_env)
-                await env.close()
+                await close_deployed(deployed_env, MultiEnv)
             except Exception as e:
-                logger.warning(f"Failed to clean up env sandbox {deployed_env.sandbox_id}: {e}")
+                logger.warning(f"Failed to clean up env {deployed_env.env_id}: {e}")
         # Tear down any judge agent (ttl is a backstop if this is skipped).
         for deployed_agent in context.deployed_agents:
             if deployed_agent.sandbox_id:
@@ -842,12 +737,44 @@ COMPOSE_EOF'''
         return context.instance_id
 
     async def close(self) -> None:
-        if self._gateway_provider is not None:
-            await self._gateway_provider.close()
-            self._gateway_provider = None
+        await close_replaced(self)
+        if self._env_provider is not None:
+            try:
+                await self._env_provider.close()
+                self._env_provider = None
+            except Exception as e:
+                logger.warning(f"Failed to close env provider, kept for the next close(): {e}")
         if self._sandbox is not None:
             try:
                 await self._sandbox.terminate()
             except BaseException as e:
                 logger.warning(f"Failed to terminate sandbox {self._sandbox.sandbox_id}: {e}")
             self._sandbox = None
+
+
+def _hand_provider_to_child_envs(env: MultiEnv) -> None:
+    """Point each child env at the MultiEnv's deployment: the provider and URL its loads use, and behind our gateway the sandbox they
+    stage into. A plugin's provider leaves them no sandbox, so they load through the record's card."""
+    provider = env._env_provider
+    builtin = as_builtin(provider)
+    for child in env.mcp_server_envs:
+        child._sandbox = (builtin.environment_sandbox(child.environment_name) if builtin else None) or env._sandbox
+        child._gateway_url = env._gateway_url
+        child._env_provider = provider
+    for child in env.website_envs:
+        child._sandbox = env._sandbox
+        child._gateway_url = env._gateway_url
+        child._env_provider = provider
+
+
+def _gateway_state_provider(env: MultiEnv) -> DatabaseStateProvider | None:
+    """The state provider behind our gateway, which a snapshot restores into or captures from; None for a deployment without it."""
+    from agent_env.providers import EnvironmentGatewayProvider
+    return env._env_provider._state_provider if isinstance(env._env_provider, EnvironmentGatewayProvider) else None
+
+
+def _hand_record_to_child_envs(env: MultiEnv, deployed: DeployedEnv) -> None:
+    """Give each child env the record its loads read the card from; a name an MCP server and a website share keeps the live probe, since the card can't tell them apart by name."""
+    shared = {c.environment_name for c in env.mcp_server_envs} & {c.environment_name for c in env.website_envs}
+    for child in [*env.mcp_server_envs, *env.website_envs]:
+        child._deployed = None if child.environment_name in shared else deployed

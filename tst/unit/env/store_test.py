@@ -6,8 +6,12 @@ through, the field round-trips as None and the env silently deploys without it.
 """
 from __future__ import annotations
 
-from agent_env.env.env import DeployedEnv
-from agent_env.env.store import EnvInstanceStore
+from dataclasses import dataclass
+
+import pytest
+
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, DeployedSandboxEnv
+from agent_env.env.store import EnvInstanceStore, register_env_instance, update_env_instance_metadata
 from agent_env.config import set_document_store
 from tst.unit.store.fakes import FakeDocumentStore
 
@@ -15,7 +19,7 @@ from tst.unit.store.fakes import FakeDocumentStore
 def test_deployed_env_roundtrip_preserves_all_fields():
     store = EnvInstanceStore()
     set_document_store(FakeDocumentStore())
-    original = DeployedEnv(
+    original = DeployedGatewayEnv(
         env_id="multi-test",
         env_version=3,
         gateway_url="https://gw.example/",
@@ -47,7 +51,7 @@ def test_deployed_env_roundtrip_preserves_all_fields():
     assert persisted.environment_card == original.environment_card  # create_instance rebuilds the record from its doc
 
     stamped_by_store = {"instance_id", "created_at_utc", "expires_at_utc"}
-    for f in DeployedEnv.__dataclass_fields__:
+    for f in type(original).__dataclass_fields__:
         if f in stamped_by_store:
             continue
         assert getattr(rehydrated, f) == getattr(original, f), f"field {f!r} not preserved through store round-trip"
@@ -69,10 +73,11 @@ def test_deployed_env_from_dict_tolerates_missing_env_state_instance_ids():
 
 
 def test_deployed_env_from_dict_tolerates_records_without_a_card_or_gateway():
-    """Records written before the stored card load without one, and gateway_url may be absent."""
+    """Records written before the stored card load without one, and gateway_url may be absent: such a record loads as its shape."""
     doc = {"env_id": "mcp-test", "env_version": 1, "mcp_url": "https://sb.example/mcp", "sandbox_id": "sb-abc"}
     rehydrated = DeployedEnv.from_dict(doc)
-    assert rehydrated.gateway_url is None
+    assert type(rehydrated) is DeployedSandboxEnv and getattr(rehydrated, "gateway_url", None) is None
+    assert (rehydrated.mcp_url, rehydrated.sandbox_id) == ("https://sb.example/mcp", "sb-abc")
     assert rehydrated.environment_card is None and rehydrated.environment_card_read_at_utc is None
 
 
@@ -92,6 +97,29 @@ class _RecordingStore:
 
     def set_keys(self) -> list[str]:
         return [key for spec in self.updates for key in spec.set]
+
+
+@pytest.mark.parametrize("record", [
+    DeployedEnv(env_id="e", env_version=1, env_provider_type="hosted"),
+    DeployedSandboxEnv(env_id="e", env_version=1, env_provider_type="server", sandbox_id="sb-1"),
+    DeployedGatewayEnv(env_id="e", env_version=1, gateway_url="https://gw.example", sandbox_id="sb-gw"),
+], ids=["no-sandbox", "sandbox", "gateway"])
+def test_a_record_that_loads_back_as_its_own_class_registers(record):
+    set_document_store(FakeDocumentStore())
+    assert register_env_instance(record, ttl_seconds=60).instance_id
+
+
+def test_a_record_that_would_load_back_as_another_class_is_refused_before_it_is_stored():
+    """A plugin record's own fields are dropped when it loads back as the kernel class its shape names."""
+
+    @dataclass(kw_only=True)
+    class _WithOwnField(DeployedSandboxEnv):
+        region: str = "us-west-2"
+
+    set_document_store(store := FakeDocumentStore())
+    with pytest.raises(TypeError, match="a _WithOwnField record loads back as DeployedSandboxEnv, dropping its own fields"):
+        register_env_instance(_WithOwnField(env_id="e", env_version=1, env_provider_type="hosted", sandbox_id="sb-1"), ttl_seconds=60)
+    assert store.docs == []
 
 
 def _instance_store(tmp_path, doc):
@@ -132,11 +160,11 @@ def test_merge_metadata_persists_when_the_record_has_metadata_null(tmp_path):
     bundle = _instance_store(tmp_path, {"instance_id": "i-1", "metadata": None})
     store, recording = bundle
 
-    store.merge_metadata("i-1", {"deploy_step_id": "s1", "deployed_by_oauth_subject": "sub-42"})
+    store.merge_metadata("i-1", {"deploy_step_id": "s1", "owner": "user-42"})
 
     doc = _read(bundle)
     assert doc["metadata"]["deploy_step_id"] == "s1"
-    assert doc["metadata"]["deployed_by_oauth_subject"] == "sub-42"
+    assert doc["metadata"]["owner"] == "user-42"
     # The load-bearing part: no dotted path was ever written beneath the null.
     assert not [k for k in recording.set_keys() if k.startswith("metadata.")], (
         "a dotted $set under a null parent is rejected by MongoDB; "
@@ -148,9 +176,9 @@ def test_merge_metadata_persists_when_metadata_is_absent(tmp_path):
     bundle = _instance_store(tmp_path, {"instance_id": "i-1"})
     store, recording = bundle
 
-    store.merge_metadata("i-1", {"deployed_by_oauth_subject": "sub-42"})
+    store.merge_metadata("i-1", {"owner": "user-42"})
 
-    assert _read(bundle)["metadata"]["deployed_by_oauth_subject"] == "sub-42"
+    assert _read(bundle)["metadata"]["owner"] == "user-42"
     assert not [k for k in recording.set_keys() if k.startswith("metadata.")]
 
 
@@ -162,12 +190,25 @@ def test_merge_metadata_merges_without_clobbering_existing_keys(tmp_path):
     )
     store, recording = bundle
 
-    store.merge_metadata("i-1", {"deployed_by_oauth_subject": "sub-42"})
+    store.merge_metadata("i-1", {"owner": "user-42"})
 
     doc = _read(bundle)
     assert doc["metadata"]["deployed_agent"] == "keep-me"
-    assert doc["metadata"]["deployed_by_oauth_subject"] == "sub-42"
-    assert "metadata.deployed_by_oauth_subject" in recording.set_keys()
+    assert doc["metadata"]["owner"] == "user-42"
+    assert "metadata.owner" in recording.set_keys()
+
+
+def test_update_env_instance_metadata_swallows_a_store_failure(monkeypatch, caplog):
+    # Best-effort: failing to annotate the record must not fail a deploy that succeeded.
+    def _raise(self, instance_id, values):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(EnvInstanceStore, "merge_metadata", _raise)
+
+    with caplog.at_level("WARNING"):
+        update_env_instance_metadata("i-1", {"deploy_step_id": "s1"})
+
+    assert "Failed to update env instance metadata" in caplog.text
 
 
 def test_merge_metadata_is_a_noop_for_empty_values(tmp_path):

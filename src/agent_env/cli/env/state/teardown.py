@@ -13,7 +13,7 @@ import click
 @click.option("--instance-id", "instance_id", required=True, help="Env state instance id (esi-…)")
 def teardown_env_state(instance_id: str):
     """Tear down an env-state store by instance id and retire its record."""
-    from agent_env.providers.state import build_state_provider, get_env_state_instance_store
+    from agent_env.providers.env_state import build_state_provider, get_env_state_instance_store
     from agent_env.store.base import NotFoundError
 
     try:

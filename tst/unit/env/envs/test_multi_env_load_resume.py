@@ -1,12 +1,12 @@
 """An interrupted universe load resumes instead of re-running the whole thing.
 
-The load is destructive per service (reset-then-add), and a Temporal retry re-enters the
+The load is destructive per service (reset-then-add), and a step retry re-enters the
 step from scratch -- so one slow service used to cost three full re-wipes of all 13, which
 is how a ~11 minute failure became a ~44 minute one.
 
-Progress lives in Mongo, not the step context, because the worker snapshots the context
-BEFORE running a step and re-sends that frozen copy on every heartbeat: anything written
-mid-step never reaches the heartbeat a retry restores from.
+Progress lives in the document store, not the step context, because a runner may retry a
+step from the context as it was before the step started: anything written mid-step never
+reaches the context a retry restores.
 
 The safety property under test is the changelog gate. Skipping services must NEVER weaken
 the documented guarantee that loading a universe wipes and re-seeds it -- so resume applies
@@ -20,9 +20,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_env.env.envs.multi_env import MultiEnv
-from agent_env.providers.gateway_provider import GatewayProvider
-from agent_env.providers.sandbox_provider import SANDBOX_MODE_CONTAINER
-from agent_env.providers.state import LocalPostgresStateProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider
+from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_CONTAINER
+from agent_env.providers.env_state import LocalPostgresStateProvider
 
 
 def _universe(names: list[str], version: int = 39):
@@ -44,9 +44,9 @@ ALL = ["a", "b", "gmail"]
 def _env(*, instance_id: str | None = "inst-1", mode: str = "vm"):
     env = MultiEnv(id="env-1", version=1, mcp_server_envs=[])
     env._instance_id = instance_id
-    gp = GatewayProvider()
+    gp = EnvironmentGatewayProvider()
     gp._state_provider = LocalPostgresStateProvider()
-    env._gateway_provider = gp
+    env._env_provider = gp
     s = MagicMock()
     s.mode = mode
     s.exec_script = AsyncMock(return_value="8\n")

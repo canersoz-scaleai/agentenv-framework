@@ -58,14 +58,14 @@ class VerifyCoreEnvironmentProtocolStep(TaskStep):
 
         card = None
         try:
-            card = await protocol_v1.get_card(deployed.gateway_url)
+            card = await protocol_v1.get_card(deployed.environment_url)
         except Exception as e:
-            logger.warning(f"env card for '{self.env_id}' inaccessible at {deployed.gateway_url}: {type(e).__name__}: {e}")
+            logger.warning(f"env card for '{self.env_id}' inaccessible at {deployed.environment_url}: {type(e).__name__}: {e}")
 
         protocol = {}
         for method, probe_params in _CORE_OPERATIONS:
             if probe_params is not None:
-                supported = await self._probe_operation(deployed.gateway_url, method, probe_params)
+                supported = await self._probe_operation(deployed.environment_url, method, probe_params)
             else:
                 supported = self._advertised_support(card, method)
             protocol[method] = {"supported": supported}
@@ -90,13 +90,13 @@ class VerifyCoreEnvironmentProtocolStep(TaskStep):
         advertised = (backing.get("capabilities") or {}).get("operations")
         return True if advertised is None else method in advertised
 
-    async def _probe_operation(self, gateway_url: str, method: str, params: dict) -> Optional[bool]:
+    async def _probe_operation(self, environment_url: str, method: str, params: dict) -> Optional[bool]:
         """Mutation-free: -32601 = unregistered; -32000 = gateway couldn't forward (None);
         anything else — a result, or -32602 from the empty-parts add probe — proves registration."""
         body = {"jsonrpc": "2.0", "id": f"verify-{method}", "method": method, "params": params}
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.post(f"{gateway_url.rstrip('/')}{RPC_PATH}", json=body)
+                response = await client.post(f"{environment_url}{RPC_PATH}", json=body)
             error = (response.json() or {}).get("error") or {}
         except Exception as e:
             logger.warning(f"operation probe {method} for '{self.env_id}' failed: {e}")

@@ -5,6 +5,8 @@ import + ABC-guard + from_config construction step, driven with fakes (no
 network — the tst/unit socket guard forbids it).
 """
 
+import importlib
+
 import pytest
 
 from agent_env.config import ConfigError
@@ -186,6 +188,37 @@ def test_build_store_routes_through_from_config_and_interpolates(monkeypatch):
     assert store.received == {"endpoint": "https://real", "plain": "x"}
 
 
+def test_build_store_names_an_unknown_or_missing_config_key():
+    section = {
+        "impl": "agent_env.store.document_store.mongo_document_store:MongoDocumentStore",
+        "config": {"uri": "mongodb://x", "databse": "agent_env"},
+    }
+    with pytest.raises(ConfigError) as raised:
+        config_loader.build_store(section, DocumentStore, secret_resolver=_resolver)
+    assert str(raised.value) == (
+        "The config table for 'agent_env.store.document_store.mongo_document_store:MongoDocumentStore' "
+        "has unknown key 'databse' and no value for 'database'; it takes uri, database"
+    )
+
+
+def test_build_store_checks_a_default_from_config_against_the_constructor():
+    section = {"impl": "tst.unit.store.fakes:FakeDocumentStore", "config": {"fail_insert": 2}}
+    with pytest.raises(ConfigError, match="unknown key 'fail_insert'; it takes fail_inserts"):
+        config_loader.build_store(section, DocumentStore, secret_resolver=_resolver)
+
+
+class _FailingStore(FakeDocumentStore):
+    @classmethod
+    def from_config(cls, *, endpoint: str):
+        return cls(retries=endpoint)  # a bug inside from_config, not a bad config table
+
+
+def test_build_store_leaves_a_type_error_inside_from_config_alone():
+    section = {"impl": "tst.unit.config.test_loader:_FailingStore", "config": {"endpoint": "x"}}
+    with pytest.raises(TypeError):
+        config_loader.build_store(section, DocumentStore, secret_resolver=_resolver)
+
+
 def test_build_store_missing_impl_raises():
     with pytest.raises(ConfigError, match="impl"):
         config_loader.build_store({"config": {}}, DocumentStore, secret_resolver=_resolver)
@@ -239,6 +272,55 @@ def test_load_impl_bad_format_raises():
 def test_load_impl_unimportable_module_raises():
     with pytest.raises(ConfigError, match="Cannot import"):
         config_loader.load_impl("nonexistent.module:Thing", DocumentStore)
+
+
+def _with_name_from(error: ImportError, name_from: str) -> ImportError:
+    error.name_from = name_from
+    return error
+
+
+_NO_STORAGE = "cannot import name 'storage' from 'google.cloud' (unknown location)"
+
+
+@pytest.mark.parametrize(
+    ("error", "extra"),
+    [
+        (ModuleNotFoundError("No module named 'google.cloud.storage'", name="google.cloud.storage"), "gcp"),
+        (_with_name_from(ImportError(_NO_STORAGE, name="google.cloud"), "storage"), "gcp"),
+        (ImportError(_NO_STORAGE, name="google.cloud"), "gcp"),  # 3.11 has no name_from
+        (ModuleNotFoundError("No module named 'fastapi'", name="fastapi"), "explorer"),
+        (ImportError("cannot import name 'genai' from 'google' (unknown location)", name="google"), None),
+        (ModuleNotFoundError("No module named 'not_a_dependency'", name="not_a_dependency"), None),
+        (ImportError("this backend needs a C compiler"), None),
+    ],
+    ids=["missing-module", "name-from", "message", "explorer", "unrelated-namespace-member", "no-extra", "no-module-name"],
+)
+def test_load_impl_names_the_extra_a_missing_module_comes_from(monkeypatch, error, extra):
+    real = importlib.import_module
+
+    def import_module(name, *args, **kwargs):
+        if name == "some.backend":
+            raise error
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(config_loader.importlib, "import_module", import_module)
+    with pytest.raises(ConfigError, match="Cannot import") as raised:
+        config_loader.load_impl("some.backend:Store", DocumentStore)
+    if extra is None:
+        assert "extra" not in str(raised.value)
+    else:
+        assert str(raised.value).endswith(f"it needs the {extra!r} extra, as in pip install 'agentenv-framework[{extra}]'")
+
+
+def test_load_impl_without_installed_metadata_still_raises_config_error(monkeypatch):
+    """Run from a source tree, the distribution has no metadata to name an extra from."""
+    def no_metadata(name):
+        raise config_loader.PackageNotFoundError(name)
+
+    monkeypatch.setattr(config_loader, "metadata", no_metadata)
+    with pytest.raises(ConfigError, match="Cannot import") as raised:
+        config_loader.load_impl("nonexistent.module:Thing", DocumentStore)
+    assert "extra" not in str(raised.value)
 
 
 def test_load_impl_missing_attr_raises():

@@ -1,4 +1,4 @@
-"""Verify a deployed environment's composed EnvironmentCard and persist it to env metadata."""
+"""Verify the EnvironmentCard a deployed environment serves at its card's address, and persist it to env metadata."""
 
 from __future__ import annotations
 
@@ -53,10 +53,10 @@ class VerifyEnvironmentCardStep(TaskStep):
         card = None
         error = None
         try:
-            card = await protocol_v1.get_card(deployed.gateway_url)
+            card = await protocol_v1.get_card(deployed.environment_url)
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
-            logger.warning(f"env card for '{self.env_id}' inaccessible at {deployed.gateway_url}: {error}")
+            logger.warning(f"env card for '{self.env_id}' inaccessible at {deployed.environment_url}: {error}")
 
         env = Env.get(self.env_id, deployed.env_version)
 
@@ -91,8 +91,8 @@ class VerifyEnvironmentCardStep(TaskStep):
             if not matches:
                 logger.warning(
                     f"env card name drift for '{self.env_id}': registered environment_name={registered_name!r} is not "
-                    f"among the served card names {served_names!r} — the server likely declares a different "
-                    f"@environment_card(name=...); registration should match the card."
+                    f"among the served card names {served_names!r} — the image's agentenv-protocol likely predates "
+                    f"ENVIRONMENT_NAME taking precedence over @environment_card(name=...); rebuild it on a current SDK."
                 )
 
         validated = {

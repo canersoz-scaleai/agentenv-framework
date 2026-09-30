@@ -9,20 +9,27 @@ import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional
 
-import boto3
-import httpx
+from agentenv_protocol.a2a_agent import STANDARD_EXTENSIONS
 
-from agent_env.providers.sandbox import NetworkPolicy, NetworkPolicyUnsupportedError
+from agent_env.config import get_config
+from agent_env.entity_refs import EntityRef
+from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy, NetworkPolicyUnsupportedError
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
-from agent_env.providers.sandbox_provider import all_sandbox_container_env, all_sandbox_url_rewrites
+from agent_env.a2a_agent.object_transfer import (
+    TRANSFER_TIMEOUT_SECONDS,
+    invoke_transfer,
+    skill_add_call,
+)
+from agent_env.providers.sandbox_providers.sandbox_provider import all_sandbox_container_env, all_sandbox_url_rewrites
 from agent_env.utils.paths import validate_relative_filename
 from agent_env.attribution import Attribution
 
 if TYPE_CHECKING:
     from agent_env.a2a_agent.store import A2AAgentQuery
+    from agent_env.bundle.authoring import AuthoringContext
     from agent_env.artifact import CliArtifact
     from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
-    from agent_env.providers.sandbox import Sandbox
+    from agent_env.providers.sandbox_providers.sandbox import Sandbox
     from agent_env.task_step.task_steps.add_skills import Skill
 
 logger = logging.getLogger(__name__)
@@ -78,6 +85,12 @@ class NegotiatedAgentConfig:
 
 class A2AAgent:
     type: ClassVar[str] = "a2a_agent"
+    toml_refs: ClassVar[tuple[EntityRef, ...]] = (EntityRef.artifact("image", artifact_type="docker_image"),)
+    toml_keys: ClassVar[dict[str, type]] = {"image": object, "default_env_vars": dict, "metadata": dict}
+    # What an agent.toml's [metadata] may set: the types each key takes, and how a problem names them.
+    toml_metadata: ClassVar[dict[str, tuple[tuple[type, ...], str]]] = {
+        "default_model": ((str,), "a string"), "min_disk_size_gb": ((int, float), "a number"),
+    }
 
     EXT_MCP_CONFIG: ClassVar[str] = "urn:agentenv:mcp-config/v1"
     EXT_SKILL_CONFIG: ClassVar[str] = "urn:agentenv:skill-config/v1"
@@ -105,11 +118,30 @@ class A2AAgent:
 
     @staticmethod
     def extension_method(card: dict, uri: str, method: str) -> dict | None:
-        """Return an extension method's params entry (incl. its endpoint), or None if absent."""
-        ext = A2AAgent.find_extension(card, uri)
-        if not ext:
-            return None
-        return ((ext.get("params") or {}).get("methods") or {}).get(method)
+        """Return an advertised extension method, or ``None`` if absent."""
+        return A2AAgent.operation(A2AAgent.find_extension(card, uri), method)[0]
+
+    @staticmethod
+    def operation(extension: dict | None, name: str) -> tuple[dict | None, str | None]:
+        """An advertised extension's ``name`` method (None when unlisted) and its endpoint path.
+
+        As the protocol renders cards: a method's own endpoint wins; otherwise one the protocol
+        serves at the extension's path uses the card's extension endpoint, and one it serves
+        elsewhere uses the protocol's path for it."""
+        if extension is None:
+            return None, None
+        config = extension.get("config") or extension.get("params") or {}
+        method = (config.get("methods") or {}).get(name)
+        if method and method.get("endpoint"):
+            return method, method["endpoint"]
+        definition = STANDARD_EXTENSIONS.get(extension.get("uri"))
+        spec = next(
+            (op for op in (definition.operations.values() if definition else ()) if op.name == name),
+            None,
+        )
+        if spec is not None and spec.path != definition.endpoint:
+            return method, spec.path
+        return method, config.get("endpoint") or (spec.path if spec else None)
 
     @staticmethod
     def negotiate_agent_config(card: dict, desired: dict) -> Optional[NegotiatedAgentConfig]:
@@ -126,43 +158,71 @@ class A2AAgent:
 
     @staticmethod
     async def add_skill(deployed: "DeployedA2AAgent", skill: "Skill") -> dict:
+        """Validate ``skill`` and register it on the deployed agent."""
+        A2AAgent._skill_extension(deployed)
+        await asyncio.to_thread(skill.validate)
+        if skill.skill_artifact_id is not None:
+            from agent_env.artifact import SkillArtifact
+            artifact = SkillArtifact.get(skill.skill_artifact_id, skill.skill_artifact_version)
+            return await A2AAgent.register_skill(
+                deployed,
+                name=artifact.skill_name,
+                description=artifact.description,
+                object_url=artifact.skill_object_url,
+            )
+        if skill.s3_url is not None:
+            return await A2AAgent.register_skill(
+                deployed, name=skill.name, description=skill.description, object_url=skill.s3_url
+            )
+        return await A2AAgent.register_skill(
+            deployed, name=skill.name, description=skill.description, skill_md=skill.to_skill_md()
+        )
+
+    @staticmethod
+    async def register_skill(
+        deployed: "DeployedA2AAgent",
+        *,
+        name: str,
+        description: str,
+        skill_md: str | None = None,
+        object_url: str | None = None,
+    ) -> dict:
+        """Send one skill, as SKILL.md text or the objects under ``object_url``, in a form the
+        agent's card and the object store allow; returns the agent's answer."""
+        add_method, add_path = A2AAgent.operation(A2AAgent._skill_extension(deployed), "add")
+        call = await asyncio.to_thread(
+            skill_add_call,
+            add_method,
+            get_config().get_object_store(),
+            name=name,
+            description=description,
+            skill_md=skill_md,
+            object_url=object_url,
+        )
+        return await invoke_transfer(
+            deployed.a2a_url + add_path,
+            call,
+            verb="POST",
+            operation=f"skill add ({name})",
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _skill_extension(deployed: "DeployedA2AAgent") -> dict:
         skill_ext = A2AAgent.find_extension(deployed.agent_card, A2AAgent.EXT_SKILL_CONFIG)
         if not skill_ext:
             raise RuntimeError(
                 f"Deployed agent {deployed.instance_id or deployed.agent_id} does not advertise {A2AAgent.EXT_SKILL_CONFIG}"
             )
-        ext_config = skill_ext.get("config") or skill_ext.get("params") or {}
-        endpoint = deployed.a2a_url + ext_config.get("endpoint", "/ext/skill-config")
-
-        skill.validate()
-
-        if skill.skill_artifact_id is not None:
-            from agent_env.artifact import SkillArtifact
-            skill_artifact = SkillArtifact.get(skill.skill_artifact_id, skill.skill_artifact_version)
-            payload = {
-                "name": skill_artifact.skill_name,
-                "description": skill_artifact.description,
-                "skill_s3_url": skill_artifact.skill_object_url,
-            }
-        elif skill.s3_url is not None:
-            payload = {"name": skill.name, "description": skill.description, "skill_s3_url": skill.s3_url}
-        else:
-            payload = {"name": skill.name, "description": skill.description, "skill_md": skill.to_skill_md()}
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(endpoint, json=payload, timeout=180)
-            if resp.status_code >= 400:
-                logger.error(f"Failed to register skill '{payload['name']}': {resp.status_code} {resp.text}")
-            resp.raise_for_status()
-            return resp.json()
+        return skill_ext
 
     @staticmethod
     async def install_cli(deployed: "DeployedA2AAgent", cli_artifact: "CliArtifact", gateway_url: str) -> str:
         """Install a CliArtifact bundle into the agent's filesystem at /opt/cli/<command>/.
         Writes a sidecar bin/.env with the gateway URL and chmod +x's the entrypoint.
         Idempotent. Returns the in-process path to the executable entrypoint."""
-        from agent_env.providers.sandbox import VmSandbox
-        from agent_env.providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox import VmSandbox
+        from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
         provider = build_sandbox_provider(deployed.sandbox_type) if deployed.sandbox_type else get_agent_sandbox_provider()
         sandbox = await provider.get_sandbox(deployed.sandbox_id)
         target_root = f"/opt/cli/{cli_artifact.command_name}"
@@ -190,8 +250,8 @@ class A2AAgent:
         destination_path: str,
     ) -> dict[str, str]:
         """Stage every FileArtifact in `universe` into the agent sandbox under destination_path."""
-        from agent_env.providers.sandbox import VmSandbox
-        from agent_env.providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox import VmSandbox
+        from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
 
         destination = destination_path.rstrip("/") or "/"
         provider = build_sandbox_provider(deployed.sandbox_type) if deployed.sandbox_type else get_agent_sandbox_provider()
@@ -288,6 +348,34 @@ class A2AAgent:
         )
 
     @classmethod
+    def from_toml(cls, data: dict[str, Any], ctx: AuthoringContext) -> A2AAgent:
+        """Write the agent authored as ``data`` (its agent.toml, with ``image`` resolved to an image
+        artifact's id) under ``ctx.id`` and return it. The card isn't authored: the image serves it."""
+        fields = cls.accept_toml(data, ctx)
+        return cls.put(id=ctx.id, docker_image_artifact=ctx.artifact(fields["image"], DockerImageArtifact),
+                       default_env_vars=fields.get("default_env_vars"), metadata=fields.get("metadata"))
+
+    @classmethod
+    def accept_toml(cls, data: dict[str, Any], ctx: AuthoringContext) -> dict[str, Any]:
+        """The keys of ``data``, an agent.toml, that an agent takes, each checked the way ``from_toml``
+        needs it. Raises BundleError listing every problem."""
+        fields, problems = ctx.accepted(data, **cls.toml_keys)
+        values = [f"default_env_vars.{name} must be a string, not {value!r}"
+                  for name, value in fields.get("default_env_vars", {}).items() if not isinstance(value, str)]
+        for name, value in fields.get("metadata", {}).items():
+            if name not in cls.toml_metadata:
+                values.append(f"unknown [metadata] key {name!r}; an agent's [metadata] takes "
+                              f"{' and '.join(cls.toml_metadata)}")
+                continue
+            kinds, described = cls.toml_metadata[name]
+            if isinstance(value, bool) or not isinstance(value, kinds):
+                values.append(f"metadata.{name} must be {described}, not {value!r}")
+        problems += [f"agent.toml: {problem}" for problem in values]
+        if problems:
+            ctx.refuse(problems)
+        return fields
+
+    @classmethod
     def get(cls, id: str, version: Optional[int] = None) -> A2AAgent:
         from .store import get_a2a_agent_store
         return get_a2a_agent_store().get(id, version)
@@ -333,12 +421,11 @@ class A2AAgent:
         *,
         attribution: Optional[Attribution] = None,
     ) -> DeployedA2AAgent:
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
             build_sandbox_provider,
             get_agent_sandbox_provider,
         )
-        from agent_env.config import get_config
 
         attribution = dict(attribution or {})
         if disk_size_gb is None:
@@ -351,7 +438,7 @@ class A2AAgent:
         if "LITELLM_BASE_URL" not in resolved_env and "LITELLM_BASE_URL" not in self.default_env_vars:
             resolved_env["LITELLM_BASE_URL"] = config.get_litellm_base_url()
 
-        merged_env = self._build_merged_env(resolved_env, a2a_port)
+        merged_env = await asyncio.to_thread(self._build_merged_env, resolved_env, a2a_port)
         image_name = self.docker_image_artifact.image_name
 
         try:
@@ -405,7 +492,7 @@ class A2AAgent:
             deployed = get_a2a_agent_instance_store().create_instance(deployed, ttl_seconds)
             logger.info(f"A2A agent '{self.id}' deployed at {a2a_url} (instance={deployed.instance_id})")
             return deployed
-        except Exception:
+        except BaseException:  # a cancelled deploy closes its sandbox too
             await self.close()
             raise
 
@@ -413,16 +500,9 @@ class A2AAgent:
         merged_env = dict(self.default_env_vars)
         merged_env.update(resolved_env)
         merged_env["A2A_PORT"] = str(a2a_port)
-        if "AWS_ACCESS_KEY_ID" not in merged_env:
-            session = boto3.Session()
-            creds = session.get_credentials()
-            if creds:
-                frozen = creds.get_frozen_credentials()
-                merged_env["AWS_ACCESS_KEY_ID"] = frozen.access_key
-                merged_env["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
-                merged_env["AWS_DEFAULT_REGION"] = session.region_name or "us-west-2"
-                if frozen.token:
-                    merged_env["AWS_SESSION_TOKEN"] = frozen.token
+        shared = get_config().get_object_store().shared_credentials_env()
+        if shared.keys().isdisjoint(merged_env):
+            merged_env.update(shared)
 
         merged_env.update(all_sandbox_container_env())
         rewrites = all_sandbox_url_rewrites()

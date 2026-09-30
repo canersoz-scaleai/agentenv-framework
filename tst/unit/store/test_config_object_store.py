@@ -2,13 +2,14 @@
 
 S3-free (the tst/unit socket guard forbids network): injection returns a fake
 verbatim, and the ``local`` selector / a custom ``impl`` build real stores under
-a temp cwd.
+the test's state root.
 """
 
 import pytest
 
 from agent_env.store import ConfigError, LocalFilesystemObjectStore
 from agent_env.config import Config, configure, get_config, set_object_store
+from agent_env.config.paths import state_root
 from agent_env.store.document_store import Filter
 from agent_env.store.object_store import S3ObjectStore
 from tst.unit.store.fakes import FakeObjectStore
@@ -49,7 +50,8 @@ def test_env_selector_builds_local_filesystem(monkeypatch, tmp_path):
     assert isinstance(store, LocalFilesystemObjectStore)
     locator = store.put("artifacts/x/1/a.json", b"hi")
     assert store.get(locator) == b"hi"
-    assert (tmp_path / ".agentenv" / "object_store").exists()
+    assert (state_root() / "object_store").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_default_backend_is_local(monkeypatch, tmp_path):
@@ -65,20 +67,6 @@ def test_s3_alias_raises_actionable(monkeypatch):
     monkeypatch.setenv("AGENT_ENV_OBJECT_STORE", "s3")
     with pytest.raises(ConfigError, match=r"\[stores\.object\].*AGENT_ENV_OBJECT_STORE"):
         Config().get_object_store()
-
-
-def test_get_s3_bucket_re_sources_from_the_configured_store(monkeypatch, tmp_path):
-    cfg = Config()
-    cfg.set_object_store(S3ObjectStore(client=object(), bucket="my-bucket"))
-    assert cfg.get_s3_bucket() == "my-bucket"
-
-
-def test_get_s3_bucket_raises_actionable_without_an_s3_store(monkeypatch, tmp_path):
-    monkeypatch.delenv("AGENT_ENV_OBJECT_STORE", raising=False)
-    monkeypatch.delenv("AGENT_ENV_CONFIG", raising=False)
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(ConfigError, match=r"\[stores\.object\]"):
-        Config().get_s3_bucket()
 
 
 def test_unknown_backend_raises(monkeypatch):
@@ -128,13 +116,15 @@ def test_local_stores_create_nothing_until_first_write(monkeypatch, tmp_path):
     config = Config()
     objects, documents = config.get_object_store(), config.get_document_store()
     assert objects.list("") == []
-    assert list(tmp_path.iterdir()) == []
+    assert not state_root().exists()
 
     objects.put("k", b"v")
     documents.insert("c", {"id": "x"})
-    for state in (tmp_path / ".agentenv" / "object_store", tmp_path / ".agentenv" / "document_store"):
+    for state in (state_root() / "object_store", state_root() / "document_store"):
         assert (state / ".gitignore").read_text() == "*\n"
-    assert not (tmp_path / ".agentenv" / ".gitignore").exists()
+        assert state.stat().st_mode & 0o777 == 0o700
+    assert not (state_root() / ".gitignore").exists()
+    assert list(tmp_path.iterdir()) == []
     assert objects.list("") == ["k"]
 
 
@@ -146,7 +136,7 @@ def test_existing_local_state_stays_readable_and_untouched(monkeypatch, tmp_path
     first = Config()
     first.get_object_store().put("k", b"v")
     first.get_document_store().insert("c", {"id": "x"})
-    root = tmp_path / ".agentenv" / "object_store"
+    root = state_root() / "object_store"
     (root / ".gitignore").unlink()
 
     again = Config()

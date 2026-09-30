@@ -188,11 +188,7 @@ function isJudgeSetupStep(type: unknown) {
 
 /** Steps a graded run resumes at; grading replays these against a prior context. */
 function isGradingStep(type: unknown) {
-  return (
-    type === 'cua_evaluate' ||
-    type === 'rubrics_verifier' ||
-    type === 'run_openclaw_unit_test'
-  );
+  return type === 'rubrics_verifier' || type === 'run_openclaw_unit_test';
 }
 
 function isTerminal(inst: Record<string, unknown>) {
@@ -1546,7 +1542,7 @@ export function TaskRunnerPage({
     parentConfigHash !== appliedConfigHash;
 
   // Whether to surface the Run control. Standalone always; embedded once a task exists this session.
-  // Run absorbs "Apply Latest Config", so without it the CUA interactive-hack flow has no button.
+  // Run absorbs "Apply Latest Config", so without it an embedded session has no button.
   const canRun = !isEmbedded || isRunnableInteractively || !!resolvedTaskId;
 
   // Cap concurrent runs at 1 unless the parent opted into max_runs. Blocks a new run while one is active so
@@ -1739,12 +1735,9 @@ export function TaskRunnerPage({
       type: (s.type ?? undefined) as string | undefined,
       base_path: (s.base_path ?? undefined) as string | undefined,
       artifact_paths: (s.artifact_paths ?? undefined) as string[] | undefined,
-      init_config: s.init_config,
-      evaluator: s.evaluator,
       env_id: (s.env_id ?? null) as string | null,
       agent_name: (s.agent_name ?? null) as string | null,
       triggers: s.triggers,
-      osworld_v2_task_url: s.osworld_v2_task_url as string | undefined,
     }));
   }, [task]);
 
@@ -1891,20 +1884,6 @@ export function TaskRunnerPage({
     applyLatestConfig,
   ]);
 
-  const isCuaTask = taskSteps.some(
-    s =>
-      s.type === 'cua_initialize' ||
-      s.type === 'cua_evaluate' ||
-      (s.type === 'deploy_env' &&
-        typeof s.env_id === 'string' &&
-        s.env_id.includes('cua')),
-  );
-  const cuaEvalStep = taskSteps.find(s => s.type === 'cua_evaluate') as
-    | Record<string, unknown>
-    | undefined;
-  const evaluatorConfig = cuaEvalStep?.evaluator as
-    | Record<string, unknown>
-    | undefined;
   const rubricsStep = taskSteps.find(s => s.type === 'rubrics_verifier') as
     | Record<string, unknown>
     | undefined;
@@ -2410,8 +2389,6 @@ export function TaskRunnerPage({
                   key={selectedInstanceId}
                   instance={inst}
                   taskId={resolvedTaskId ?? undefined}
-                  envType={isCuaTask ? 'cua' : undefined}
-                  evaluatorConfig={evaluatorConfig}
                   rubricsCriteria={rubricsCriteria}
                   rubricsAggregator={rubricsAggregator}
                   taskSteps={viewerTaskSteps}

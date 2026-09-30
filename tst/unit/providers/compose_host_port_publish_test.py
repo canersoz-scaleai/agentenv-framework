@@ -15,15 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_env.providers.gateway_provider import (
-    DB_MCP_CONTAINER_PORT,
-    DB_MCP_PORT,
-    DB_WEB_PORT,
-    GatewayProvider,
-    MCPServerConfig,
-    SidecarConfig,
-)
-from agent_env.providers.state.local_postgres import LocalPostgresStateProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider, MCPServerConfig, SidecarConfig
+from agent_env.env.envs.service_db import DB_MCP_CONTAINER_PORT, DB_MCP_PORT, DB_WEB_PORT
+from agent_env.providers.env_state.local_postgres import LocalPostgresStateProvider
 
 SRC = Path(__file__).resolve().parents[3] / "src"
 
@@ -156,9 +150,9 @@ def _sidecar(name: str, host_port: int, container_port: int = 8000) -> SidecarCo
     "sidecars",
     [
         pytest.param([], id="no-sidecars"),
-        pytest.param([("cua-controller", 18768)], id="one-sidecar"),
+        pytest.param([("relay", 18768)], id="one-sidecar"),
         pytest.param(
-            [("cua-controller", 18768), ("ios-bridge", 18769)], id="many-sidecars",
+            [("relay", 18768), ("exporter", 18769)], id="many-sidecars",
         ),
     ],
 )
@@ -166,8 +160,8 @@ def test_gateway_compose_resolves_every_host_port(stub_postgres, environments, s
     """The gateway line and each sidecar line, across every combination of attached
     services -- rendered with the real Postgres state provider, so pgweb and the DB MCP
     sidecar are in the document too."""
-    compose = GatewayProvider.create_docker_compose(
-        GatewayProvider.__new__(GatewayProvider),
+    compose = EnvironmentGatewayProvider.create_docker_compose(
+        EnvironmentGatewayProvider.__new__(EnvironmentGatewayProvider),
         mcp_servers=[
             MCPServerConfig(image=f"{name}:test", environment_name=name) for name in environments
         ],
@@ -187,11 +181,11 @@ def test_gateway_compose_resolves_every_host_port(stub_postgres, environments, s
 def test_gateway_compose_defaults_to_identity(stub_postgres):
     """No resolver means same-port publishing -- the per-VM behaviour, unchanged. Backends
     that give each deployment its own namespace must keep working untouched."""
-    compose = GatewayProvider.create_docker_compose(
-        GatewayProvider.__new__(GatewayProvider),
+    compose = EnvironmentGatewayProvider.create_docker_compose(
+        EnvironmentGatewayProvider.__new__(EnvironmentGatewayProvider),
         mcp_servers=[MCPServerConfig(image="slack:test", environment_name="slack")],
         gateway_image="gateway:test",
-        sidecars=[_sidecar("cua-controller", 18768)],
+        sidecars=[_sidecar("relay", 18768)],
         state_provider=stub_postgres,
         state_instance=_StateInstance(),
     )

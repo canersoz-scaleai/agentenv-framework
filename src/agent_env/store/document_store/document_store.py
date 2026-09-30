@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Optional, TypeVar, Union
 
+from agent_env.store.ids import is_local_id
+
 T = TypeVar("T")
 
 
@@ -151,7 +153,8 @@ class UpdateSpec:
 
 
 class DuplicateKeyError(Exception):
-    """Raised by ``DocumentStore.insert`` when a unique constraint is violated."""
+    """Raised by a ``DocumentStore`` write that would violate a unique index: an ``insert``, or the
+    insert an upsert falls back to when its filter matches nothing."""
 
 
 def _dig(doc: dict, path: str) -> tuple[bool, Any]:
@@ -291,7 +294,7 @@ class DocumentStore(ABC):
     def update(
         self, collection: str, filter: Filter, update: UpdateSpec, upsert: bool = False
     ) -> int:
-        """Apply ``update`` to the first match; return matched count (0/1), where 0 is the CAS miss. ``upsert=True`` synthesizes a doc from the filter on no match."""
+        """Apply ``update`` to the first match; return matched count (0/1), where 0 is the CAS miss. ``upsert=True`` synthesizes a doc from the filter on no match, and raises DuplicateKeyError if inserting it violates a unique index."""
 
     @abstractmethod
     def update_one_and_get(
@@ -302,13 +305,13 @@ class DocumentStore(ABC):
         return_after: bool = True,
         upsert: bool = False,
     ) -> Optional[dict]:
-        """Apply ``update`` to the first match; return the doc (post-update if ``return_after`` else pre-update), or None on no match."""
+        """Apply ``update`` to the first match; return the doc (post-update if ``return_after`` else pre-update), or None on no match. An upsert raises DuplicateKeyError as ``update`` does."""
 
     @abstractmethod
     def replace(
         self, collection: str, filter: Filter, doc: dict, upsert: bool = False
     ) -> int:
-        """Replace the first matching document wholesale; return matched count (0/1)."""
+        """Replace the first matching document wholesale; return matched count (0/1). An upsert that inserts ``doc`` raises DuplicateKeyError on a unique violation."""
 
     @abstractmethod
     def delete(self, collection: str, filter: Filter) -> int:
@@ -322,7 +325,12 @@ class DocumentStore(ABC):
         unique: bool = False,
         ttl_seconds: Optional[int] = None,
     ) -> None:
-        """Register an index over ``fields`` (idempotent); ``unique=True`` is enforced by ``insert`` via ``DuplicateKeyError``. ``ttl_seconds`` requests server-side expiry off the single indexed datetime field (backends without TTL may ignore it)."""
+        """Register an index over ``fields`` (idempotent); ``unique=True`` is enforced by ``insert`` and upserts via ``DuplicateKeyError``. ``ttl_seconds`` requests server-side expiry off the single indexed datetime field (backends without TTL may ignore it)."""
+
+    def check_id(self, entity_id: str) -> None:
+        """Raise ValueError unless an entity with ``entity_id`` may be written here. No store takes an id
+        opening with the reserved ``@`` but the ``@local`` namespace's own, which takes only ``@local`` ids."""
+        reject_reserved_id(entity_id)
 
 
 RESERVED_ID_PREFIX = "@"
@@ -330,16 +338,31 @@ RESERVED_ID_PREFIX = "@"
 
 def reject_reserved_id(entity_id: object) -> None:
     """Refuse an id claiming the ``@`` prefix, which opens a registry-qualified
-    ``@namespace/id``.
+    ``@namespace/id``. Only the ``@local`` namespace's store holds such ids, its own.
 
     Reserved while agent-env is still private: once third parties have created ids, taking
-    the prefix back stops being free. No stored document starts with it.
+    the prefix back stops being free.
     """
+    if isinstance(entity_id, str) and is_local_id(entity_id):
+        raise ValueError(
+            f"id {entity_id!r} is an @local id, which only the @local namespace's store holds; "
+            "the agent-env CLI writes @local ids there"
+        )
     if isinstance(entity_id, str) and entity_id.startswith(RESERVED_ID_PREFIX):
         raise ValueError(
             f"id {entity_id!r} starts with the reserved {RESERVED_ID_PREFIX!r} prefix: that "
             "addresses a registry-qualified name (@namespace/id), so a local id cannot use it"
         )
+
+
+# Collections of versioned (id, version) entities, which namespace routing places by id. The core
+# ones are known up front, so a read made before their store exists is placed too; every
+# VersionedEntityStore adds its own, a plugin's included, before its first read or write.
+_entity_collections: set[str] = {"a2a_agents", "artifacts", "envs", "evals", "task_steps", "tasks"}
+
+
+def is_entity_collection(collection: str) -> bool:
+    return collection in _entity_collections
 
 
 class VersionedEntityStore(Generic[T]):
@@ -353,6 +376,7 @@ class VersionedEntityStore(Generic[T]):
         deserialize: Callable[[dict], T],
         secondary_indexes: Optional[list[list[str]]] = None,
     ) -> None:
+        _entity_collections.add(collection)
         self._doc_store = docs
         self._collection = collection
         self._serialize = serialize
@@ -373,12 +397,12 @@ class VersionedEntityStore(Generic[T]):
     def next_version(self, id: str) -> int:
         """Allocate the version a write to ``id`` would land on.
 
-        The reservation is enforced here and not only at ``put`` because every artifact
+        The id is checked here and not only at ``put`` because every artifact
         helper calls this first and then writes remote data — an object to S3, an image to a
         registry — before it has a document to store. Refusing the id at the end would leave
         that data orphaned with no artifact record pointing at it.
         """
-        reject_reserved_id(id)
+        self._doc_store.check_id(id)
         doc = self._doc_store.find_one(
             self._collection, Filter.of(id=id), sort=Sort.by("version", descending=True)
         )
@@ -389,7 +413,9 @@ class VersionedEntityStore(Generic[T]):
         if self._serialize is None:
             raise RuntimeError("VersionedEntityStore was built without a serializer; put() is unsupported")
         doc = self._serialize(entity)
-        reject_reserved_id(doc.get("id"))
+        if not isinstance(doc.get("id"), str):
+            raise ValueError(f"an entity in {self._collection!r} needs a string id, got {doc.get('id')!r}")
+        self._doc_store.check_id(doc["id"])
         last_error: Optional[DuplicateKeyError] = None
         for _ in range(max_retries):
             version = self.next_version(doc["id"])

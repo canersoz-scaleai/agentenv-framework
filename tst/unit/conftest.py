@@ -18,6 +18,12 @@ import os
 import pytest
 from pytest_socket import disable_socket, enable_socket
 
+from agent_env.artifact.store import reset_artifact_store
+from agent_env.config import configure, get_config, reset_config
+from agent_env.store import LocalFilesystemObjectStore
+from agent_env.store.document_store.sqlite_document_store import LocalSqliteDocumentStore
+from agent_env.store.routing import enable_namespace_routing
+
 _PLACEHOLDER_AWS_ENV = {
     "AWS_ACCESS_KEY_ID": "testing",
     "AWS_SECRET_ACCESS_KEY": "testing",
@@ -38,3 +44,31 @@ def _disable_network():
     disable_socket(allow_unix_socket=True)
     yield
     enable_socket()
+
+
+@pytest.fixture(autouse=True)
+def isolated_state_root(tmp_path_factory, monkeypatch):
+    """A fresh per-user state root for every unit test, overriding the run's."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("state")))
+
+
+@pytest.fixture
+def cli_routing():
+    """Namespace routing on, as the CLI runs, so @local ids are written to the @local namespace's store."""
+    enable_namespace_routing()
+
+
+@pytest.fixture
+def local_stores(tmp_path, monkeypatch):
+    """Local document and object stores under this test's state root, with no infra."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_ENV_OBJECT_STORE", "local")
+    monkeypatch.setenv("AGENT_ENV_DOCUMENT_STORE", "local")
+    configure()
+    reset_artifact_store()  # rebind the cached store to this test's fresh local config
+    cfg = get_config()
+    assert isinstance(cfg.get_object_store(), LocalFilesystemObjectStore)
+    assert isinstance(cfg.get_document_store(), LocalSqliteDocumentStore)
+    yield cfg
+    reset_config()
+    reset_artifact_store()

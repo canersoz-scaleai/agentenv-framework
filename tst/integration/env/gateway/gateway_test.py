@@ -34,7 +34,6 @@ from agent_env.env.envs.website_browser import (
     PLAYWRIGHT_MCP_VERSION,
     WEBSITE_BROWSER_IMAGE_TAG,
     WEBSITE_BROWSER_ENVIRONMENT_NAME,
-    WEBSITE_BROWSER_SERVICE_VERSION,
 )
 from agent_env.config import get_config
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
@@ -247,7 +246,6 @@ def website_browser_env() -> MCPServerEnv:
         id="website-browser",
         docker_image_artifact=artifact,
         environment_name=WEBSITE_BROWSER_ENVIRONMENT_NAME,
-        service_version=WEBSITE_BROWSER_SERVICE_VERSION,
     )
     logger.info(f"Created website-browser MCPServerEnv: {env.id} version={env.version}")
     return env
@@ -295,7 +293,6 @@ def slack_website_env() -> WebsiteEnv:
         backend_docker_image_artifact=backend_artifact,
         frontend_docker_image_artifact=frontend_artifact,
         environment_name="slack",
-        service_version=1,
     )
     logger.info(f"Created WebsiteEnv: {env.id} version={env.version}")
     return env
@@ -337,7 +334,6 @@ def mcp_server_envs() -> dict[str, MCPServerEnv]:
             id=f"mcp-server-{img.name}",
             docker_image_artifact=artifact,
             environment_name=img.service_name,
-            service_version=1,
         )
         envs[img.name] = env
         logger.info(f"Created MCPServerEnv: {env.id} version={env.version}")
@@ -377,7 +373,6 @@ def agentenv_items_env() -> MCPServerEnv:
         id="mcp-server-items",
         docker_image_artifact=artifact,
         environment_name="items",
-        service_version=1,
     )
     logger.info(f"Created MCPServerEnv: {env.id} version={env.version}")
     return env
@@ -431,7 +426,6 @@ def agentenv_website_env() -> WebsiteEnv:
         backend_docker_image_artifact=backend_artifact,
         frontend_docker_image_artifact=frontend_artifact,
         environment_name="webitems",
-        service_version=1,
     )
     logger.info(f"Created v1 WebsiteEnv: {env.id} version={env.version}")
     return env
@@ -1239,12 +1233,12 @@ async def test_gateway_with_multi_mcp_server(sandbox_provider, multi_env, enviro
         await _verify_list_tools(mcp_url=result.db_mcp_url, tool_verifier_callback=assert_changelog_has_entry)
 
         rehydrated = await MultiEnv.from_deployed_env(result)
-        assert rehydrated._gateway_provider is not None
+        assert rehydrated._env_provider is not None
         assert rehydrated._sandbox is not None
         for child in rehydrated.mcp_server_envs:
-            assert child._gateway_provider is rehydrated._gateway_provider
+            assert child._env_provider is rehydrated._env_provider
         if sandbox_provider == "modal":
-            gp = rehydrated._gateway_provider
+            gp = rehydrated._env_provider
             assert gp._db_sandbox is not None
             assert gp._pgweb_sandbox is not None
             assert gp._db_mcp_sandbox is not None
@@ -1253,7 +1247,7 @@ async def test_gateway_with_multi_mcp_server(sandbox_provider, multi_env, enviro
         elif sandbox_provider == "modal_vm":
             # VM mode: db/pgweb/db-mcp are docker-compose services inside the one VM,
             # not separate sandboxes, so these container-mode handles stay None.
-            gp = rehydrated._gateway_provider
+            gp = rehydrated._env_provider
             assert gp._db_sandbox is None
             assert gp._pgweb_sandbox is None
             assert gp._db_mcp_sandbox is None
@@ -1875,7 +1869,6 @@ def cardless_probe_env() -> MCPServerEnv:
         id="mcp-server-cardless-probe",
         docker_image_artifact=artifact,
         environment_name="probeitems",
-        service_version=1,
     )
 
 
@@ -1898,6 +1891,55 @@ async def test_cardless_environment_resolves_name_from_environment_name(cardless
         assert card["name"] == "probeitems", f"cardless server mis-resolved its name: {card['name']!r}"
         assert [t["name"] for t in card["capabilities"]["tools"]] == ["probeitems_add_item"]
         assert "UnnamedProbeEnv" not in json.dumps(card)
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_renamed_registration_serves_its_registered_name(agentenv_items_env, monkeypatch):
+    """A carded server registered under another name serves that name, so a card-first load finds it.
+
+    The image declares @environment_card(name="items"). If the declared name won, the composed card
+    would list "items", the lookup for "renameditems" would miss, and the load would take legacy REST.
+    """
+    renamed = MCPServerEnv.put(
+        id="mcp-server-renameditems",
+        docker_image_artifact=agentenv_items_env.docker_image_artifact,
+        environment_name="renameditems",
+    )
+    env = Env.get(renamed.id, version=renamed.version)
+    try:
+        result = await env.deploy()
+        base = f"{result.gateway_url}/svc/mcp-renameditems"
+        assert [c["name"] for c in result.environment_card["children_environments"]] == ["renameditems"]
+        card = await protocol_v1.get_card(base)
+        assert card["name"] == "renameditems"
+        assert [t["name"] for t in card["capabilities"]["tools"]] == ["renameditems_add_item"]
+
+        sent: list[tuple[str, str]] = []
+        real_send = httpx.AsyncClient.send
+
+        async def recording_send(self, request, *args, **kwargs):
+            sent.append((request.method, request.url.path))
+            return await real_send(self, request, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", recording_send)
+        await env.load_environment_artifact(EnvironmentArtifact.put(
+            id="test-renameditems-service-data",
+            environment_name="renameditems",
+            file_artifact=FileArtifact.put_bytes(
+                id="test-renameditems-data",
+                description="renameditems v1 seed",
+                filename="items.json",
+                content=json.dumps({"items": ["r"]}).encode(),
+                content_type="application/json",
+            ),
+        ))
+        monkeypatch.undo()
+        routes = [r for r in sent if r[1].startswith("/svc/")]
+        assert routes == [("POST", "/svc/mcp-renameditems/agentenv")] * 2, routes
+        assert (await protocol_v1.get_data(base)).parts[0].data == {"items": ["r"]}
     finally:
         await env.close()
 
@@ -2130,16 +2172,16 @@ async def test_snapshot_agent_state_v1_and_fallback(multi_env_items_email, items
             env_id=env.id, universe_artifact_id=items_email_universe.id,
         )
         context = TaskStepContext(deployed_envs=[result])
-        prefix = f"s3://{get_config().get_s3_bucket()}/agent_snapshots/snap-v1-fallback-test/"
+        prefix = get_config().get_object_store().object_url("agent_snapshots/snap-v1-fallback-test/")
         await step._capture_universe_state(context, prefix)
 
         from agent_env.artifact.store import get_artifact_store
 
         urls = json.loads(context.metadata["snapshot_json_url"])
         assert set(urls) == {"items", "email"}
-        # snapshot_json_url holds unsigned s3:// refs (the consumer re-signs); read
-        # them via the store rather than httpx, which can't fetch the s3:// scheme.
-        assert all(u.startswith("s3://") for u in urls.values())
+        # snapshot_json_url holds unsigned object refs (the consumer re-signs); read
+        # them via the store rather than httpx, which can't fetch the store's scheme.
+        assert all(u.startswith(prefix) for u in urls.values())
         store = get_artifact_store()
         items_state = json.loads(store.get_object(urls["items"]))
         email_state = json.loads(store.get_object(urls["email"]))
@@ -2152,8 +2194,8 @@ async def test_snapshot_agent_state_v1_and_fallback(multi_env_items_email, items
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_verify_universe_roundtrip_export_all_v1_and_fallback(multi_env_items_email, items_email_universe):
-    """verify_universe_roundtrip._export_all over a mixed env: items exported via
-    v1 get_data, email via the legacy export_state fallback."""
+    """verify_universe_roundtrip._export_all over a mixed env: items, which the env card lists, exported via
+    v1 get_data; email, which serves no card, via the legacy export_state fallback."""
     from agent_env.env import legacy_protocol
     from agent_env.task_step.task_steps.multienv_validator.verify_universe_roundtrip import (
         VerifyUniverseLoadExportRoundtripStep,
@@ -2169,7 +2211,7 @@ async def test_verify_universe_roundtrip_export_all_v1_and_fallback(multi_env_it
         assert await protocol_v1.supports_v1(items_base) is True
         assert await protocol_v1.supports_v1(email_base) is False
 
-        exported = await VerifyUniverseLoadExportRoundtripStep._export_all(result.gateway_url, ["items", "email"])
+        exported = await VerifyUniverseLoadExportRoundtripStep._export_all(result, ["items", "email"])
         assert exported["items"] == {"items": ["snap-x", "snap-y"]}
         assert isinstance(exported["email"], dict) and exported["email"]
     finally:
@@ -2796,7 +2838,6 @@ async def test_gateway_triggers_nl_executor(sandbox_provider, mcp_server_envs, e
                 a2a_agent_id="claude-code-cli", agent_name="executor",
                 agent_description="nl trigger executor (constrained role)",
                 system_prompt=executor_system_prompt, role="executor",
-                env_vars={"OPENCLAW_DEFAULT_MODEL": "claude-sonnet-4-6"},
                 sandbox_type="modal_vm", ttl_seconds=1800)
             ctx = await deploy_exec.execute(ctx)
             executor = next(a for a in ctx.deployed_agents if a.agent_name == "executor")
@@ -3425,7 +3466,7 @@ def reminder_env() -> MCPServerEnv:
         id=f"mcp-reminder-clock-{rid}", description="reminder server with clock/v1 consumer", image_name="mcp-reminder-clock",
     )
     env = MCPServerEnv.put(
-        id=f"mcp-server-reminder-clock-{rid}", docker_image_artifact=artifact, environment_name="reminder", service_version=1,
+        id=f"mcp-server-reminder-clock-{rid}", docker_image_artifact=artifact, environment_name="reminder",
     )
     logger.info(f"Created reminder MCPServerEnv: {env.id} version={env.version}")
     return env
@@ -3546,7 +3587,7 @@ def _build_clock_mcp_env(spec: "_ClockServerSpec") -> MCPServerEnv:
     )
     return MCPServerEnv.put(
         id=f"mcp-server-{spec.env_name}-clock-{rid}", docker_image_artifact=artifact,
-        environment_name=spec.env_name, service_version=1,
+        environment_name=spec.env_name,
     )
 
 

@@ -150,11 +150,9 @@ function main(): void {
   // ---- 2. Auto-dispatch through parseOtelTrajectory ----
   // The viewer always calls parseOtelTrajectory; verify it routes here with a
   // model hint (opencode's stream carries no top-level model envelope).
-  const viaDispatch = parseOtelTrajectory(
-    records as unknown as OtelSpan[],
-    undefined,
-    { modelHint: 'anthropic/claude-sonnet-4-6' },
-  );
+  const viaDispatch = parseOtelTrajectory(records as unknown as OtelSpan[], {
+    modelHint: 'anthropic/claude-sonnet-4-6',
+  });
   assert(
     viaDispatch.model === 'anthropic/claude-sonnet-4-6',
     `dispatched parse honours modelHint (got "${viaDispatch.model}")`,

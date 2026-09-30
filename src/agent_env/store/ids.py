@@ -4,7 +4,9 @@ An id opening ``@<namespace>/`` names the store it lives in; ``@local/…`` is t
 today. Documents keep an id verbatim. Everything derived from an ``@local`` id uses one bounded
 segment, ``local/<slug>-<sha256(id)[:12]>``, and every other id passes through byte-identical.
 The encoders never raise: they expect ids that ``validate_local_id`` accepts, and still return a
-safe segment for any other input.
+safe segment for any other input. An id may contain spaces, ``&`` and parentheses, so quote one
+before it reaches a shell or a URL, and derive object keys, image repositories and filenames with
+the helpers here rather than from the raw id.
 """
 
 from __future__ import annotations
@@ -21,7 +23,10 @@ MAX_LOCAL_ID_BYTES = 4096
 _SLUG_LENGTH = 48
 _HASH_LENGTH = 12
 _NON_SLUG_RUN = re.compile(r"[^a-z0-9]+")
-_ID_PUNCTUATION = frozenset(" ._-~/")
+_ENCODED_LOCAL_ID = re.compile(
+    rf"{LOCAL_NAMESPACE}(?:/|-(?:[a-z0-9]+(?:-[a-z0-9]+)*-)?[0-9a-f]{{{_HASH_LENGTH}}}(?:/|$))"
+)
+_ID_PUNCTUATION = frozenset(" ._-~/@()+,&")
 _ID_CATEGORIES = frozenset("LNM")
 _INVISIBLE = re.compile(
     "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\ufe00-\ufe0f\uffa0\U000e0100-\U000e01ef]"
@@ -42,7 +47,8 @@ def is_local_id(entity_id: str) -> bool:
 def validate_local_id(entity_id: str) -> None:
     """Raise ValueError unless ``entity_id`` is ``@local/`` followed by non-empty path segments,
     none of them ``.`` or ``..`` or opening or closing with a space, made only of letters, digits,
-    spaces and ``. _ - ~ /``, and at most 4096 bytes of UTF-8 in all (Linux's PATH_MAX).
+    spaces and ``. _ - ~ / @ ( ) + , &``, and at most 4096 bytes of UTF-8 in all (Linux's PATH_MAX).
+    Only the leading ``@`` names a namespace, so one inside a segment is an ordinary character.
 
     Letters include every script's, with its combining marks, as long as each mark follows a
     letter, digit or mark. The invisible (default-ignorable) letters and marks are refused."""
@@ -55,7 +61,7 @@ def validate_local_id(entity_id: str) -> None:
     if disallowed:
         raise ValueError(
             f"local id {entity_id!r} contains {ascii(''.join(disallowed))}; "
-            "a local id may contain only letters, digits, spaces and . _ - ~ /"
+            "a local id may contain only letters, digits, spaces and . _ - ~ / @ ( ) + , &"
         )
     segments = entity_id[len(LOCAL_PREFIX):].split("/")
     if any(segment in ("", ".", "..") for segment in segments):
@@ -85,6 +91,12 @@ def _local_segment(entity_id: str) -> str:
     return f"{LOCAL_NAMESPACE}/{slug}-{digest}" if slug else f"{LOCAL_NAMESPACE}/{digest}"
 
 
+def aliases_local_encoding(entity_id: str) -> bool:
+    """Whether a bare id is spelled like an ``@local`` id's encoding: ``local/…``, or the filename form
+    ``local-<slug>-<hash>`` alone or opening a path. Its objects, images and files would take that id's."""
+    return _ENCODED_LOCAL_ID.match(entity_id) is not None
+
+
 def key_segment(entity_id: str) -> str:
     """The object-key segment for ``entity_id`` (``artifacts/<type>/<segment>/<version>/…``)."""
     return _local_segment(entity_id) if is_local_id(entity_id) else entity_id
@@ -99,6 +111,11 @@ def fs_safe(entity_id: str) -> str:
     """A filename for an ``@local`` id: its key segment with no ``/``. Any other id is returned
     unchanged, so it is only as filename-safe as it already was."""
     return _local_segment(entity_id).replace("/", "-", 1) if is_local_id(entity_id) else entity_id
+
+
+# The longest id derive_id makes is a skill's or CLI's per-file artifact, ``{id}__files__<16 hex>``,
+# so an authored id leaves room for those 25 bytes.
+MAX_AUTHORED_LOCAL_ID_BYTES = MAX_LOCAL_ID_BYTES - len("__files__") - 16
 
 
 def derive_id(base: str, suffix: str) -> str:

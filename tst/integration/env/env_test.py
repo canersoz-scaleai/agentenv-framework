@@ -42,7 +42,7 @@ class TestEnvPersistence:
     def test_put_creates_env(self, docker_image_artifact):
         """Test that put() creates an env."""
         env_id = _unique_id("test_env")
-        env = MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        env = MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         assert env.id == env_id
         assert env.type == "mcp_server"
@@ -51,7 +51,7 @@ class TestEnvPersistence:
     def test_get_retrieves_env(self, docker_image_artifact):
         """Test that Env.get() retrieves the env."""
         env_id = _unique_id("retrievable_env")
-        created = MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        created = MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
         retrieved = Env.get(env_id)
 
         assert retrieved.id == created.id
@@ -62,8 +62,8 @@ class TestEnvPersistence:
     def test_versioning(self, docker_image_artifact):
         """Test that multiple puts create new versions in the database."""
         env_id = _unique_id("versioned_env")
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         # Query all versions - should have 2 documents
         envs = Env.query().id(env_id).execute()
@@ -72,8 +72,8 @@ class TestEnvPersistence:
     def test_get_specific_version(self, docker_image_artifact):
         """Test that Env.get() can retrieve a specific version."""
         env_id = _unique_id("multi_version_env")
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         # Both should retrieve successfully (different versions in DB)
         v1 = Env.get(env_id, version=1)
@@ -87,8 +87,8 @@ class TestEnvPersistence:
         env_id_1 = _unique_id("mcp_1")
         env_id_2 = _unique_id("mcp_2")
 
-        MCPServerEnv.put(id=env_id_1, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
-        MCPServerEnv.put(id=env_id_2, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        MCPServerEnv.put(id=env_id_1, docker_image_artifact=docker_image_artifact, environment_name="test")
+        MCPServerEnv.put(id=env_id_2, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         # Query each env by id and verify type
         env1 = Env.query().id(env_id_1).first()
@@ -100,8 +100,8 @@ class TestEnvPersistence:
     def test_query_by_id(self, docker_image_artifact):
         """Test querying envs by id."""
         env_id = _unique_id("query_test")
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
-        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
+        MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         envs = Env.query().id(env_id).execute()
         assert len(envs) == 2
@@ -113,7 +113,7 @@ class TestEnvPersistence:
         """Test counting envs."""
         count_ids = [_unique_id("count") for _ in range(3)]
         for env_id in count_ids:
-            MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test", service_version=1)
+            MCPServerEnv.put(id=env_id, docker_image_artifact=docker_image_artifact, environment_name="test")
 
         # Verify each env was created
         for env_id in count_ids:

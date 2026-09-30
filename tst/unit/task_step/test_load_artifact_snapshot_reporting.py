@@ -1,7 +1,7 @@
 """load_artifact carries the snapshot decision into the task doc and the result back out.
 
 `snapshot_after_load` has to survive to_dict/from_dict because the step is persisted to
-Mongo and rehydrated by the Temporal worker — a field that round-trips to None silently
+the document store and rehydrated by the runner — a field that round-trips to None silently
 turns the bake off for every task that asked for it.
 """
 

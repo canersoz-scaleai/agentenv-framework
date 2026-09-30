@@ -10,12 +10,8 @@ WEBSITE_BROWSER_IMAGE_TAG = "mcp-website-browser"
 # The environment_name used when creating MCPServerEnv.
 WEBSITE_BROWSER_ENVIRONMENT_NAME = "website-browser"
 
-# The service_version used when creating MCPServerEnv.
-WEBSITE_BROWSER_SERVICE_VERSION = 1
-
 __all__ = [
     "PLAYWRIGHT_MCP_VERSION",
     "WEBSITE_BROWSER_IMAGE_TAG",
     "WEBSITE_BROWSER_ENVIRONMENT_NAME",
-    "WEBSITE_BROWSER_SERVICE_VERSION",
 ]

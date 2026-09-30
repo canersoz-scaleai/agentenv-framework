@@ -5,7 +5,6 @@ import React, {
   useState,
   useEffect,
   useCallback,
-  useMemo,
   createContext,
   useContext,
 } from 'react';
@@ -1573,7 +1572,7 @@ function ToolCard({
   const isEmail = detectEmailInput(event.input);
   const screenshotBaseUri = useContext(ScreenshotBaseUriContext);
   const eventShotSrc = screenshotImgSrc(
-    event.result?.actedScreenshotAnnotated ?? event.result?.screenshot,
+    event.result?.screenshot,
     screenshotBaseUri,
   );
 
@@ -1729,11 +1728,7 @@ function ToolCard({
           src={eventShotSrc}
           loading="lazy"
           decoding="async"
-          alt={
-            event.result?.actedScreenshotAnnotated
-              ? 'Screenshot before action (action marked)'
-              : 'Screenshot after action'
-          }
+          alt="Screenshot after action"
           className="mt-2 rounded border border-[var(--border)] max-w-full"
           style={{ maxHeight: '400px', objectFit: 'contain' }}
         />
@@ -1803,50 +1798,12 @@ function StepEvents({
 
 // --- Main component ---
 
-/** Per-step action-group labels from `context.metadata.ios_cua_action_coverage`;
- * present only on iOS CUA runs through the action-coverage labeler. */
-export interface ActionCoverage {
-  per_step: Record<
-    string,
-    { action_group_id: string | null; confidence: number | null }
-  >;
-  covered: Record<string, { name: string; path: string; prohibited: boolean }>;
-}
-
 interface TrajectoryViewerProps {
   trajectory: ParsedTrajectory;
   timelineScrollRef?: React.MutableRefObject<HTMLDivElement | null>;
   isInProgress?: boolean;
   // S3 URI of this trajectory; only used to lazy-load screenshot-trimmed frames.
   screenshotBaseUri?: string;
-  // iOS CUA per-step action-group labels (badges each action step with its A5 group).
-  actionCoverage?: ActionCoverage;
-}
-
-// Read-only iOS observer tools (no state change; incl. the ios_get_*/ios_is_* prefix rule). Must stay in sync with the action index.
-const IOS_NON_ACTION_TOOLS = new Set([
-  'ios_screenshot',
-  'ios_screen_size',
-  'ios_accessibility_tree',
-  'ios_foreground_app',
-  'ios_get_clipboard',
-  'ios_get_orientation',
-  'ios_is_app_installed',
-  'ios_is_installed',
-  'ios_is_locked',
-  'ios_app_state',
-  'ios_find_element',
-  'ios_platform',
-  'ios_session',
-  'ios_token',
-]);
-
-function isIosActionTool(name: string): boolean {
-  const n = name.toLowerCase();
-  if (!n.startsWith('ios_')) return false;
-  if (IOS_NON_ACTION_TOOLS.has(n)) return false;
-  if (n.startsWith('ios_get_') || n.startsWith('ios_is_')) return false;
-  return true; // ios_wait is intentionally an action
 }
 
 export function TrajectoryViewer({
@@ -1854,7 +1811,6 @@ export function TrajectoryViewer({
   timelineScrollRef,
   isInProgress = false,
   screenshotBaseUri,
-  actionCoverage,
 }: TrajectoryViewerProps) {
   const {
     model,
@@ -1869,30 +1825,6 @@ export function TrajectoryViewer({
   } = trajectory;
 
   const [activeStep, setActiveStep] = useState(0);
-
-  // Step index → action group. Reconstruct the action index by counting only action tools (steps are 1:1 with tool_use blocks incl. observers). Mismatches degrade to no badge.
-  const stepActionGroup = useMemo(() => {
-    const out = new Map<
-      number,
-      { name: string; path: string; prohibited: boolean }
-    >();
-    if (!actionCoverage?.per_step) return out;
-    let actionIdx = 0;
-    steps.forEach((s, i) => {
-      const tc = s.events.find(e => e.type === 'tool_call') as
-        | ToolCallEvent
-        | undefined;
-      if (!tc || !isIosActionTool(tc.name)) return;
-      const label = actionCoverage.per_step[String(actionIdx)];
-      actionIdx += 1;
-      const gid = label?.action_group_id;
-      if (gid && actionCoverage.covered[gid]) {
-        const c = actionCoverage.covered[gid];
-        out.set(i, { name: c.name, path: c.path, prohibited: c.prohibited });
-      }
-    });
-    return out;
-  }, [steps, actionCoverage]);
 
   const internalTimelineRef = useRef<HTMLDivElement | null>(null);
   const setTimelineNode = useCallback(
@@ -1948,24 +1880,9 @@ export function TrajectoryViewer({
     return () => window.removeEventListener('keydown', handler);
   }, [activeStep, goToStep]);
 
-  const isMobileCua = useMemo(
-    () =>
-      events.some(
-        e => e.type === 'tool_call' && e.name.toLowerCase().startsWith('ios'),
-      ),
-    [events],
-  );
-
+  // The frame the agent saw before the step's action: the last screenshot from an earlier step.
   const stepScreenshot = useCallback(
     (step: TrajectoryStep) => {
-      // Show the frame the agent saw BEFORE the step's action, not the result after. Prefer the harness-baked pre-action frame from the step's first gesture.
-      for (let i = 0; i < step.events.length; i++) {
-        const e = step.events[i];
-        if (e && e.type === 'tool_call' && e.result?.actedScreenshotAnnotated) {
-          return e.result.actedScreenshotAnnotated;
-        }
-      }
-      // No baked pre-frame (e.g. a non-gesture step): use the last screenshot from an earlier step, else the run's initial screenshot.
       const idx = steps.indexOf(step);
       for (let s = idx - 1; s >= 0; s--) {
         const evs = steps[s]?.events ?? [];
@@ -1976,9 +1893,9 @@ export function TrajectoryViewer({
           }
         }
       }
-      return trajectory.initialScreenshot;
+      return undefined;
     },
-    [steps, trajectory.initialScreenshot],
+    [steps],
   );
 
   return (
@@ -2071,23 +1988,6 @@ export function TrajectoryViewer({
                   <span className="text-xs font-bold text-[var(--muted-foreground)] flex-shrink-0">
                     Step {idx + 1}
                   </span>
-                  {(() => {
-                    const ag = stepActionGroup.get(idx);
-                    if (!ag) return null;
-                    return (
-                      <span
-                        className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold text-white flex-shrink-0"
-                        style={{
-                          background: ag.prohibited ? '#dc2626' : '#16a34a',
-                        }}
-                        title={`${ag.path}${
-                          ag.prohibited ? ' [prohibited]' : ''
-                        }`}
-                      >
-                        {ag.name}
-                      </span>
-                    );
-                  })()}
                   {step.events.length > 0 && (
                     <span className="text-sm leading-relaxed">
                       {step.label}
@@ -2098,7 +1998,8 @@ export function TrajectoryViewer({
                   <StepEvents
                     step={step}
                     stepIndex={idx}
-                    hideScreenshots={!!shotSrc}
+                    // No later step shows the last action's resulting frame, so it stays inline.
+                    hideScreenshots={!!shotSrc && idx < steps.length - 1}
                   />
                 ) : (
                   // Narration-only step: the agent emitted text between tool calls but the next action was reasoning, not a tool. Render as a substantive card, not a bare stub.
@@ -2177,40 +2078,22 @@ export function TrajectoryViewer({
                   })}
                 </div>
 
-                {shotSrc && isMobileCua ? (
-                  <div className="flex gap-5 rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
-                    <div className="flex-shrink-0 flex items-start">
-                      <img
-                        src={shotSrc}
-                        loading="lazy"
-                        decoding="async"
-                        alt={`Step ${idx + 1} screenshot`}
-                        className="max-h-full w-auto max-w-[260px] rounded-xl border border-[var(--border)] bg-[var(--muted)] cursor-zoom-in object-contain"
-                        onClick={() => window.open(shotSrc, '_blank')}
-                      />
-                    </div>
-                    <div ref={setTimelineNode} className="flex-1 min-w-0">
-                      {stepDetail}
-                    </div>
-                  </div>
-                ) : (
-                  <div
-                    ref={setTimelineNode}
-                    className="flex flex-col gap-4 rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
-                  >
-                    <div>{stepDetail}</div>
-                    {shotSrc && (
-                      <img
-                        src={shotSrc}
-                        loading="lazy"
-                        decoding="async"
-                        alt={`Step ${idx + 1} screenshot`}
-                        className="max-h-[360px] max-w-full w-auto self-start flex-shrink-0 rounded-lg border border-[var(--border)] bg-[var(--muted)] cursor-zoom-in object-contain"
-                        onClick={() => window.open(shotSrc, '_blank')}
-                      />
-                    )}
-                  </div>
-                )}
+                <div
+                  ref={setTimelineNode}
+                  className="flex flex-col gap-4 rounded-lg border border-[var(--border)] bg-[var(--card)] p-4"
+                >
+                  <div>{stepDetail}</div>
+                  {shotSrc && (
+                    <img
+                      src={shotSrc}
+                      loading="lazy"
+                      decoding="async"
+                      alt={`Step ${idx + 1} screenshot`}
+                      className="max-h-[360px] max-w-full w-auto self-start flex-shrink-0 rounded-lg border border-[var(--border)] bg-[var(--muted)] cursor-zoom-in object-contain"
+                      onClick={() => window.open(shotSrc, '_blank')}
+                    />
+                  )}
+                </div>
               </div>
             );
           })()}

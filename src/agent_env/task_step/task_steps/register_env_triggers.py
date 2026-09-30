@@ -7,6 +7,7 @@ from typing import ClassVar, Optional
 
 import httpx
 
+from agent_env.env.gateway.constants import EXT_TRIGGERS_URI
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -82,12 +83,10 @@ class RegisterEnvTriggersStep(TaskStep):
             body["executor"] = {"a2a_url": agent.a2a_url or agent.api_url,
                                 "timeout_seconds": self.executor_timeout_seconds,
                                 "role": agent.role}
-        url = f"{deployed.gateway_url}/triggers/register"
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=body, timeout=30)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"trigger registration failed (HTTP {resp.status_code}): {resp.text}")
-            result = resp.json()
+        try:
+            result = await deployed.invoke(EXT_TRIGGERS_URI, "register", body)
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"trigger registration failed (HTTP {e.response.status_code}): {e.response.text}") from e
         logger.info(f"registered triggers on env={self.env_id}: {result}")
         context.metadata.setdefault("env_trigger_registrations", []).append({
             "step_id": self.id,

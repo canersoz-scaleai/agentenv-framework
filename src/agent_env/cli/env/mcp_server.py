@@ -13,8 +13,10 @@ from agent_env.cli.utils import (
     build_platform_option,
     detect_env_metadata,
     docker_build_platform_args,
+    env_provider_type_option,
     environment_name_options,
     resolve_environment_name,
+    skips_local_validation,
 )
 from agent_env.utils.card_naming import card_name_from_github, card_name_from_source
 from agent_env.env import Env, MCPServerEnv
@@ -75,7 +77,7 @@ def _gate_release(env, report_dirs, override: bool) -> None:
     durable ``release_gate`` on the env, and exit non-zero if blocked (unless
     ``--override``). The single publish-enforcement point.
     """
-    click.echo("\nValidating environment (use --skip-validation to skip)...")
+    click.echo("\nValidating environment...")
     instance_id = asyncio.run(env.validate(on_progress=click.echo))
     click.echo(f"Validation task: {instance_id}")
 
@@ -96,7 +98,7 @@ def _gate_release(env, report_dirs, override: bool) -> None:
 
     if decision["blocked"] and not decision["overridden"]:
         click.secho(f"\nRelease gate FAILED: {'; '.join(decision['reasons'])}", fg="red", err=True)
-        click.echo("Re-run with --override to publish anyway, or --skip-validation to skip the gate.", err=True)
+        click.echo("Re-run with --override to publish anyway.", err=True)
         sys.exit(1)
     if decision["overridden"]:
         click.secho(f"\nRelease gate OVERRIDDEN ({'; '.join(decision['reasons'])}); publishing anyway.", fg="yellow")
@@ -111,12 +113,15 @@ def _gate_release(env, report_dirs, override: bool) -> None:
 @click.option("--dockerfile-github-url", "dockerfile_github_url", default=None, help="GitHub URL to Dockerfile (e.g. https://github.com/owner/repo/tree/main/path/Dockerfile)")
 @click.option("--docker-context-github-url", "docker_context_github_url", default=None, help="GitHub URL to build context directory (defaults to Dockerfile's parent)")
 @environment_name_options
-@click.option("--service-version", "service_version", type=int, default=1, help="MCP service version (default: 1)")
+@env_provider_type_option("What deploys the env: 'gateway' (a gateway and service database in front of the server), 'server' (the "
+                          "server on its own), or the type of an installed agent_env.env_providers plugin")
 @click.option("--metadata", "metadata_pairs", multiple=True, help="Metadata key=value pair (repeatable)")
-@click.option("--skip-validation", is_flag=True, default=False, help="Skip the release gate entirely (do not run validation)")
-@click.option("--override", "override", is_flag=True, default=False, help="Run the release gate but publish even if it fails (records an audited override)")
+@click.option("--validate", "run_validation", is_flag=True, default=False,
+              help="Run the release gate after registering: validate the env and exit non-zero if it fails")
+@click.option("--override", "override", is_flag=True, default=False,
+              help="Run the release gate but publish even if it fails (records an audited override); implies --validate")
 @build_platform_option
-def put(env_id: str, dockerfile: str | None, context_path: str | None, dockerfile_github_url: str | None, docker_context_github_url: str | None, environment_name: str | None, service_version: int, metadata_pairs: tuple[str, ...], skip_validation: bool, override: bool, build_platform: str):
+def put(env_id: str, dockerfile: str | None, context_path: str | None, dockerfile_github_url: str | None, docker_context_github_url: str | None, environment_name: str | None, env_provider_type: str, metadata_pairs: tuple[str, ...], run_validation: bool, override: bool, build_platform: str):
     """Build and upload an MCP server environment."""
 
     environment_name = resolve_environment_name(environment_name, allow_missing=True)
@@ -166,13 +171,13 @@ def put(env_id: str, dockerfile: str | None, context_path: str | None, dockerfil
             dockerfile_github_url=dockerfile_github_url,
             docker_context_github_url=docker_context_github_url,
             environment_name=environment_name,
-            service_version=service_version,
+            env_provider_type=env_provider_type,
             github_token=os.environ.get("GITHUB_TOKEN"),
             metadata=user_metadata if user_metadata else None,
             on_progress=_on_progress,
         ))
-        click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name} service_version={env.service_version}")
-        if not skip_validation:
+        click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name} env_provider_type={env.env_provider_type}")
+        if (run_validation or override) and not skips_local_validation(env.id, "env"):
             # GitHub-sourced build: validation_report.json lives in the repo, not
             # locally, so the unit-test verdict is unknown here (doesn't block).
             _gate_release(env, [], override)
@@ -217,11 +222,11 @@ def put(env_id: str, dockerfile: str | None, context_path: str | None, dockerfil
         id=env_id,
         docker_image_artifact=artifact,
         environment_name=environment_name,
-        service_version=service_version,
+        env_provider_type=env_provider_type,
         metadata=metadata if metadata else None,
     )
-    click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name} service_version={env.service_version}")
-    if not skip_validation:
+    click.echo(f"Created MCPServerEnv: id={env.id} version={env.version} environment_name={env.environment_name} env_provider_type={env.env_provider_type}")
+    if (run_validation or override) and not skips_local_validation(env.id, "env"):
         # Local build: look for the env-build handoff report next to the build context.
         _gate_release(env, [str(context), str(dockerfile_path.parent)], override)
 
@@ -291,7 +296,11 @@ def load_environment_artifact(env_id: str | None, environment_artifact_id: str,
     click.echo(f"Found environment artifact: id={environment_artifact.id} version={environment_artifact.version} environment_name={environment_artifact.environment_name}")
 
     click.echo("Loading environment artifact...")
-    asyncio.run(env.load_environment_artifact(environment_artifact))
+    try:
+        asyncio.run(env.load_environment_artifact(environment_artifact))
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
     click.echo("Loaded environment artifact into env")
 
 

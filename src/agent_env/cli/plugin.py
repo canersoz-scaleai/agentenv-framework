@@ -3,11 +3,8 @@
 import dataclasses
 import json
 import logging
-import os
 import re
-import subprocess
 import sys
-import tempfile
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, redirect_stdout
@@ -17,19 +14,34 @@ from typing import Optional
 
 import click
 
+from agent_env.bundle import BundleError
+from agent_env.bundle.installed import BUNDLES, InstalledBundle, checked, installed_bundles, run_name
+from agent_env.cli import _installers, _plugin_changes
+from agent_env.cli._installers import FORCEABLE, InstallerError
 from agent_env.plugins import (
     ARTIFACTS,
+    ENV_PROVIDERS,
     ENVS,
     EXPLORER_PLUGINS,
     SANDBOX_PROVIDERS,
     STATE_PROVIDERS,
     TASK_STEPS,
+    Claimant,
     Contribution,
+    Diagnostic,
     Distribution,
     Inventory,
     inventory,
 )
 from agent_env.plugins._cli import CLI_PLUGINS_GROUP, CLI_ROOT_OPTIONS_GROUP, cli_contributions, cli_discovery_errors
+from agent_env.plugins._discovery import discovery_error
+from agent_env.plugins._report import (
+    ENTRY_POINTS_UNREADABLE,
+    FORMAT_VERSION,
+    INVALID_PLUGIN,
+    NAME_CONFLICT,
+    QUALIFIED_ONLY,
+)
 
 # A contribution with one of these statuses did not take effect, so `check` fails on it.
 PROBLEMS = ("conflict", "blocked", "failed", "skipped")
@@ -42,37 +54,15 @@ _KINDS = {
     TASK_STEPS: ("task step", "task steps"),
     SANDBOX_PROVIDERS: ("sandbox provider", "sandbox providers"),
     STATE_PROVIDERS: ("state provider", "state providers"),
+    ENV_PROVIDERS: ("environment provider", "environment providers"),
     EXPLORER_PLUGINS: ("explorer plugin", "explorer plugins"),
     CLI_PLUGINS_GROUP: ("CLI command", "CLI commands"),
     CLI_ROOT_OPTIONS_GROUP: ("root option", "root options"),
+    BUNDLES: ("bundle", "bundles"),
 }
 _CORE = "agentenv-framework"
-_RETIRED = "agent-env"
 # `list` names a package's contributions up to this many, and counts them by kind beyond it.
 _NAMED_UP_TO = 3
-# How long `show` waits for a package's entry points to import in the fresh interpreter.
-_PROBE_TIMEOUT_S = 120
-# Loads one distribution's entry points in a fresh interpreter and writes AGENT_ENV_CONFIG after
-# to the file in argv[2]. The other CLI plugins are hidden, because importing agent_env.cli would
-# otherwise load them all and credit their import effects to this one.
-_CONFIG_PROBE = """
-import importlib.metadata as md, json, os, sys
-real = md.entry_points
-def entry_points(**params):
-    if params.get("group") in ("agent_env.cli_plugins", "agent_env.cli_root_options"):
-        return md.EntryPoints(())
-    return real(**params)
-md.entry_points = entry_points
-os.environ.pop("AGENT_ENV_CONFIG", None)
-for ep in md.distribution(sys.argv[1]).entry_points:
-    if ep.group.startswith("agent_env."):
-        try:
-            ep.load()
-        except Exception:
-            pass
-with open(sys.argv[2], "w") as out:
-    json.dump(os.environ.get("AGENT_ENV_CONFIG"), out)
-"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,11 +72,10 @@ class Report:
     core_version: str
     environment: str
     location: Path
-    retired_version: Optional[str]
     inventory: Inventory
     distributions: tuple[Distribution, ...]
     # Entry-point groups, type and CLI, whose installed metadata could not be read.
-    discovery_errors: Mapping[str, str]
+    discovery_errors: Mapping[str, Diagnostic]
 
 
 def _json(payload: object) -> str:
@@ -99,16 +88,8 @@ def _json(payload: object) -> str:
 
 def environment(prefix: Path, base_prefix: Path) -> tuple[str, Path]:
     """How agent-env was installed, and where: the answer decides where a plugin has to go."""
-    if (prefix / "uv-receipt.toml").is_file():
-        return "uv tool", prefix
-    if (prefix / "pipx_metadata.json").is_file():
-        return "pipx", prefix
-    root = prefix.parent
-    if prefix.name == ".venv" and (root / "pyproject.toml").is_file() and (root / "uv.lock").is_file():
-        return "uv project", root
-    if prefix != base_prefix:
-        return "virtualenv", prefix
-    return "system Python", prefix
+    env = _installers.detect(prefix, base_prefix, Path(sys.executable))
+    return env.kind, env.location
 
 
 def _version(name: str) -> Optional[str]:
@@ -142,38 +123,77 @@ def collect(root: click.Group, *, load: bool) -> Report:
     # A plugin that prints while it is imported must not corrupt `--json` on stdout.
     with _quiet(), redirect_stdout(sys.stderr):
         inv = inventory(load=load)
+        bundles, bundle_errors = _bundle_contributions(load=load)
     merged: dict[tuple[str, str], list[Contribution]] = {
         (d.name, d.version): list(d.contributions) for d in inv.distributions
     }
     for key, found in cli_contributions(root).items():
         merged.setdefault(key, []).extend(found)
+    for key, found in bundles.items():
+        merged.setdefault(key, []).extend(found)
     kind, location = environment(Path(sys.prefix), Path(sys.base_prefix))
-    # Both installed: they unpack to the same tree, and whichever wrote last is what runs.
-    retired = _version(_RETIRED) if _version(_CORE) is not None else None
     return Report(
         core_version=_core_version(),
         environment=kind,
         location=location,
-        retired_version=retired,
         inventory=inv,
         distributions=tuple(
             Distribution(name, version, tuple(found))
             for (name, version), found in sorted(merged.items(), key=lambda item: (item[0][0].lower(), item[0][1]))
         ),
-        discovery_errors={**inv.discovery_errors, **cli_discovery_errors(root)},
+        discovery_errors={**inv.discovery_errors, **cli_discovery_errors(root), **bundle_errors},
     )
 
 
+def _bundle_contributions(*, load: bool) -> tuple[dict[tuple[str, str], list[Contribution]], dict[str, Diagnostic]]:
+    """Each installed bundle as a contribution of its package, and the discovery error if there is one."""
+    try:
+        bundles = installed_bundles()
+    except Exception as e:
+        return {}, {BUNDLES: Diagnostic(ENTRY_POINTS_UNREADABLE, discovery_error(e))}
+    found: dict[tuple[str, str], list[Contribution]] = {}
+    for bundle in bundles:
+        found.setdefault((bundle.package, bundle.version), []).append(_bundle_contribution(bundle, bundles, load=load))
+    return found, {}
+
+
+def _bundle_contribution(bundle: InstalledBundle, bundles: tuple[InstalledBundle, ...], *, load: bool) -> Contribution:
+    """Whether ``bundle`` runs, by the checks ``agent-env run`` makes before it reads a store. Without loading
+    plugins, only that the folder parses."""
+    namesakes = tuple(Claimant(other.package, other.version, other.value)
+                      for other in bundles if other.name == bundle.name and other is not bundle)
+    if bundle.problem:
+        status = "conflict" if bundle.code == NAME_CONFLICT else "failed"
+        return Contribution(BUNDLES, bundle.name, bundle.value, status, code=bundle.code, reason=bundle.problem,
+                            conflicts_with=namesakes if status == "conflict" else ())
+    try:
+        checked(bundle, load=load)
+    except BundleError as e:
+        return Contribution(BUNDLES, bundle.name, bundle.value, "failed", code=INVALID_PLUGIN,
+                            reason=f"it isn't a valid bundle: {e.summary}")
+    if run_name(bundle, bundles) != bundle.name:
+        return Contribution(BUNDLES, bundle.name, bundle.value, "active", code=QUALIFIED_ONLY,
+                            reason=f"another package also installs {bundle.name!r}, so run this one as "
+                                   f"{bundle.qualified!r}", conflicts_with=namesakes)
+    return Contribution(BUNDLES, bundle.name, bundle.value, "active")
+
+
 def _as_dict(report: Report) -> dict:
+    """The document `list --json` prints; `show` and `check` add to it. See "Plugin report format"."""
+    error = report.inventory.config_error
     return {
+        "format_version": FORMAT_VERSION,
         "agent_env": {"version": report.core_version, "environment": report.environment, "location": report.location},
-        "retired_agent_env": report.retired_version,
-        "config": {"path": report.inventory.config_path, "error": report.inventory.config_error},
+        "config": {"path": report.inventory.config_path, "error": dataclasses.asdict(error) if error else None},
         "loaded": report.inventory.loaded,
-        "group_errors": dict(report.inventory.group_errors),
-        "discovery_errors": dict(report.discovery_errors),
+        "group_errors": {group: dataclasses.asdict(e) for group, e in report.inventory.group_errors.items()},
+        "discovery_errors": {group: dataclasses.asdict(e) for group, e in report.discovery_errors.items()},
         "plugins": [dataclasses.asdict(d) for d in report.distributions],
     }
+
+
+def _coded(text: str, code: Optional[str]) -> str:
+    return f"{text} [{code}]" if code else text
 
 
 def _provides(contributions: tuple[Contribution, ...]) -> str:
@@ -196,11 +216,11 @@ def _summary(contributions: tuple[Contribution, ...]) -> str:
 
 def _unreadable(report: Report) -> list[str]:
     # One unparseable entry_points.txt breaks every group alike, so each distinct error is one line.
-    by_error: dict[str, list[str]] = {}
+    by_error: dict[Diagnostic, list[str]] = {}
     for group, error in report.discovery_errors.items():
         by_error.setdefault(error, []).append(group)
     return [
-        f"installed entry points could not be read for {', '.join(groups)}: {error}"
+        _coded(f"installed entry points could not be read for {', '.join(groups)}: {error.reason}", error.code)
         for error, groups in by_error.items()
     ]
 
@@ -210,14 +230,8 @@ def _header(report: Report) -> list[str]:
     inv = report.inventory
     lines.append(f"config: {inv.config_path}" if inv.config_path else "config: (none)")
     if inv.config_error:
-        lines.append(f"(error) {inv.config_error}")
+        lines.append(_coded(f"(error) {inv.config_error.reason}", inv.config_error.code))
     lines += [f"(error) {line}" for line in _unreadable(report)]
-    if report.retired_version:
-        lines.append(
-            f"(warning) the retired {_RETIRED} {report.retired_version} distribution is also installed: it writes the "
-            f"same agent_env package as {_CORE}, so whichever installed last wins. Uninstall both, then reinstall "
-            f"{_CORE}."
-        )
     return lines
 
 
@@ -237,48 +251,32 @@ def render_list(report: Report) -> str:
         for name, version, provides, status in rows
     ]
     for group, error in report.inventory.group_errors.items():
-        lines += ["", f"(error) nothing in {group} loads: {error}"]
+        lines += ["", _coded(f"(error) nothing in {group} loads: {error.reason}", error.code)]
     if not report.inventory.loaded:
         lines += ["", "--no-load: type plugins were not imported (CLI plugins load when the CLI starts)."]
     return "\n".join(lines)
 
 
 def _outcome(c: Contribution) -> str:
-    if c.status == "replaced":
-        return f"replaced by {c.replaced_in} ({c.replacement})"
-    if c.status == "conflict":
-        return f"conflict: also registered by {'; '.join(c.conflicts_with)}"
-    return f"{c.status}: {c.reason}" if c.reason else c.status
+    return _coded(f"{c.status}: {c.reason}", c.code) if c.reason else c.status
 
 
 def config_effect(name: str) -> str:
     """Whether importing ``name``'s entry points sets AGENT_ENV_CONFIG, checked in a fresh
     interpreter: this process has already imported the CLI plugins, so it cannot tell."""
-    env = {k: v for k, v in os.environ.items() if k != "AGENT_ENV_CONFIG"}
-    with tempfile.TemporaryDirectory() as scratch:
-        result = Path(scratch) / "config.json"
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", _CONFIG_PROBE, name, str(result)],
-                capture_output=True, text=True, env=env, timeout=_PROBE_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired:
-            return f"not checked: importing it took more than {_PROBE_TIMEOUT_S}s"
-        try:
-            value = json.loads(result.read_text())
-        except (OSError, ValueError):
-            last = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else f"exit status {proc.returncode}"
-            return f"not checked: {last}"
+    try:
+        value = _plugin_changes.config_set_by(name)
+    except _plugin_changes.ProbeError as exc:
+        return f"not checked: {exc}"
     return f"importing it sets AGENT_ENV_CONFIG to {value}" if value else "importing it leaves AGENT_ENV_CONFIG unset"
 
 
 def _requires_core(name: str) -> list[str]:
-    """The requirements naming agent-env, under any spelling of its distribution names."""
-    wanted = {_normalized(_CORE), _normalized(_RETIRED)}
+    """The requirements naming agent-env."""
     found = []
     for requirement in distribution(name).requires or []:
         project = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-        if project and _normalized(project.group(1)) in wanted:
+        if project and _normalized(project.group(1)) == _normalized(_CORE):
             found.append(requirement)
     return found
 
@@ -290,8 +288,11 @@ def render_show(report: Report, dist: Distribution, effect: Optional[str]) -> st
         location = distribution(dist.name).locate_file("")
     except PackageNotFoundError:
         requires, location = [], None
-    lines.append(f"  requires: {', '.join(requires) or 'no agent-env requirement declared'} "
-                 f"(installed {report.core_version})")
+    if dist.name == _CORE:
+        lines.append("  agent-env itself")
+    else:
+        lines.append(f"  requires: {', '.join(requires) or 'no agent-env requirement declared'} "
+                     f"(installed {report.core_version})")
     if location is not None:
         lines.append(f"  location: {location}")
     if effect is not None:
@@ -302,8 +303,8 @@ def render_show(report: Report, dist: Distribution, effect: Optional[str]) -> st
     lines += [f"  {kind:<{widths[0]}}  {name:<{widths[1]}}  {value:<{widths[2]}}  {outcome}"
               for kind, name, value, outcome in rows]
     for group in dict.fromkeys(c.group for c in dist.contributions):
-        if group in report.inventory.group_errors:
-            lines += ["", f"  (error) nothing in {group} loads: {report.inventory.group_errors[group]}"]
+        if (error := report.inventory.group_errors.get(group)) is not None:
+            lines += ["", _coded(f"  (error) nothing in {group} loads: {error.reason}", error.code)]
     return "\n".join(lines)
 
 
@@ -317,7 +318,7 @@ def _root() -> click.Group:
 
 @click.group()
 def plugin():
-    """Inspect installed plugins."""
+    """Inspect, add and remove installed plugins."""
 
 
 @plugin.command(name="list")
@@ -368,10 +369,8 @@ def check(ctx: click.Context, as_json: bool):
     )
     if as_json:
         click.echo(_json({
+            **_as_dict(report),
             "ok": not reasons,
-            "config_error": error,
-            "discovery_errors": unread,
-            "group_errors": dict(report.inventory.group_errors),
             "problems": [{"package": d.name, "version": d.version, **dataclasses.asdict(c)} for d, c in problems],
         }))
         if reasons:
@@ -380,7 +379,7 @@ def check(ctx: click.Context, as_json: bool):
     for d, c in problems:
         click.echo(f"{d.name} {d.version}: {_KINDS[c.group][0]} {c.name}: {_outcome(c)}")
     if error:
-        click.echo(f"config: {error}")
+        click.echo(_coded(f"config: {error.reason}", error.code))
     for line in _unreadable(report):
         click.echo(line)
     if reasons:
@@ -389,3 +388,51 @@ def check(ctx: click.Context, as_json: bool):
     replaced = sum(c.status == "replaced" for d in report.distributions for c in d.contributions)
     note = f"; {replaced} replaced by config" if replaced else ", all in effect"
     click.echo(f"ok: {len(report.distributions)} plugin package(s), {total} contribution(s){note}")
+
+
+@plugin.command()
+@click.argument("specs", nargs=-1, required=True)
+@click.option("--installer", type=click.Choice(sorted(FORCEABLE)), help="Use this installer, not the detected one.")
+@click.option("--index-url", help="The index the installer resolves from, passed through to it.")
+@click.option("--dry-run", is_flag=True, help="Show what would run, and change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask before changing the environment.")
+@click.option("--keep", is_flag=True, help="Keep the change even when a plugin does not take effect.")
+@click.pass_context
+def add(ctx: click.Context, specs: tuple[str, ...], installer: Optional[str], index_url: Optional[str],
+        dry_run: bool, yes: bool, keep: bool):
+    """Install plugin packages through the installer that owns this environment, then check them.
+
+    SPECS are whatever that installer accepts: names with versions, paths, URLs. If a new plugin
+    does not take effect, the environment is restored as it was, unless --keep.
+    """
+    try:
+        code = _plugin_changes.add(list(specs), installer=installer, index_url=index_url, dry_run=dry_run, yes=yes,
+                                   keep=keep, tools=_plugin_changes.Tools())
+    except InstallerError as exc:
+        raise click.ClickException(str(exc)) from exc
+    ctx.exit(code)
+
+
+@plugin.command()
+@click.argument("packages", nargs=-1, required=True)
+@click.option("--installer", type=click.Choice(sorted(FORCEABLE)), help="Use this installer, not the detected one.")
+@click.option("--dry-run", is_flag=True, help="Show what would run, and change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask before changing the environment.")
+@click.option("--force", is_flag=True, help="Remove even when something still depends on or names the package.")
+@click.option("--check-usage", is_flag=True, help="Also count stored documents in a remote document store.")
+@click.pass_context
+def remove(ctx: click.Context, packages: tuple[str, ...], installer: Optional[str], dry_run: bool, yes: bool,
+           force: bool, check_usage: bool):
+    """Uninstall plugin PACKAGES through the installer that owns this environment.
+
+    A package that `plugin add` installed next to a plugin, such as a pin it needs, can be removed
+    too. Refused, unless --force, while another package requires it, the config file names what it
+    provides, or stored documents use its types (checked for a local store; --check-usage for a
+    remote one).
+    """
+    try:
+        code = _plugin_changes.remove(list(packages), installer=installer, dry_run=dry_run, yes=yes, force=force,
+                                      check_usage=check_usage, tools=_plugin_changes.Tools())
+    except InstallerError as exc:
+        raise click.ClickException(str(exc)) from exc
+    ctx.exit(code)

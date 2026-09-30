@@ -7,12 +7,14 @@ the same fakes for all three.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
 import httpx
+from agentenv_protocol.transfers import HttpPutGrant
 
 from agent_env.a2a_agent import A2AAgent
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 
 BUCKET = "artifact-bucket"
@@ -20,7 +22,7 @@ BUCKET = "artifact-bucket"
 
 def agent_card(
     *,
-    snapshot: bool = True,
+    snapshot: bool | dict = True,
     snapshot_endpoint: Optional[str] = None,
     trajectory: Optional[dict] = None,
 ) -> dict:
@@ -31,7 +33,7 @@ def agent_card(
     """
     extensions: list[dict] = []
     if snapshot:
-        params: dict[str, Any] = {}
+        params: dict[str, Any] = dict(snapshot) if isinstance(snapshot, dict) else {}
         if snapshot_endpoint is not None:
             params["endpoint"] = snapshot_endpoint
         extensions.append({"uri": A2AAgent.EXT_SNAPSHOT, "params": params})
@@ -55,12 +57,41 @@ class _StubUniverse:
 
 
 class _StubObjectStore:
+    supports_transfer_grants = True
+    max_single_upload_bytes = None
+
     def __init__(self):
         self.puts: list[tuple[str, bytes]] = []
         self.signed_posts: list[dict] = []
+        self.write_grants: list[dict] = []
+        self.withheld: set[str] = set()
+
+    def list_at(self, prefix: str) -> list[str]:
+        """What the agent uploaded: every object it was granted, less the ``withheld`` names."""
+        return [
+            grant["object_url"]
+            for grant in self.write_grants
+            if grant["object_url"].startswith(prefix)
+            and grant["object_url"].rsplit("/", 1)[-1] not in self.withheld
+        ]
 
     def object_url(self, key: str) -> str:
         return f"s3://{BUCKET}/{key}"
+
+    def issue_write_grant(self, object_url, *, media_type, max_bytes, expires_in):
+        self.write_grants.append(
+            {
+                "object_url": object_url,
+                "media_type": media_type,
+                "max_bytes": max_bytes,
+                "expires_in": expires_in,
+            }
+        )
+        return HttpPutGrant(
+            kind="http-put",
+            url="https://objects.example.test/write?secret=signed",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
 
     def signed_post(self, url_prefix, *, expires_in=3600, max_bytes=None):
         self.signed_posts.append(
@@ -86,9 +117,11 @@ class CaptureRecorder:
     def __init__(self):
         self.save_requests: list[dict] = []
         self.trajectory_requests: list[dict] = []
+        self.universes: list[str] = []
         self.object_store = _StubObjectStore()
         self.next_version_calls: list[str] = []
         self._version = 2
+        self.key_prefix = ""
         # Overridable per test.
         self.save_status = 200
         self.save_body: Optional[dict] = None
@@ -110,13 +143,17 @@ def install_capture_stubs(monkeypatch) -> CaptureRecorder:
     rec = CaptureRecorder()
 
     class _Cfg:
-        def get_s3_bucket(self):
-            return BUCKET
-
         def get_object_store(self):
             return rec.object_store
 
+        def get_artifact_key_prefix(self):
+            return rec.key_prefix
+
     monkeypatch.setattr(config_mod, "get_config", lambda: _Cfg())
+    monkeypatch.setattr(
+        "agent_env.task_step.snapshot_utils.agent_state_capture.get_config",
+        lambda: _Cfg(),
+    )
     monkeypatch.setattr(artifact_store_mod, "get_artifact_store", lambda: rec)
 
     class _FAU:
@@ -124,6 +161,7 @@ def install_capture_stubs(monkeypatch) -> CaptureRecorder:
         def put_existing(*, id: str, s3_url: str):
             # Mirrors the real one: version is minted by the store, and the
             # bundle url is the prefix that was actually written.
+            rec.universes.append(s3_url)
             return _StubUniverse(id=id, version=rec._version, s3_url=s3_url)
 
     monkeypatch.setattr(fau_mod, "FileArtifactUniverse", _FAU)
@@ -168,7 +206,7 @@ def context(*, agent: Optional[_StubAgent] = None, env_id: Optional[str] = None)
     ctx.deployed_agents = [agent or _StubAgent()]
     if env_id:
         ctx.deployed_envs = [
-            DeployedEnv(
+            DeployedGatewayEnv(
                 env_id=env_id,
                 env_version=1,
                 gateway_url="https://gw",
@@ -178,4 +216,3 @@ def context(*, agent: Optional[_StubAgent] = None, env_id: Optional[str] = None)
             )
         ]
     return ctx
-

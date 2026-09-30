@@ -2,7 +2,7 @@
 
 Declares no ``@environment_card``, so its identity comes purely from the SDK's
 resolution chain. Since the ``SERVICE_NAME`` fallback was dropped, that chain is
-``card name -> ENVIRONMENT_NAME -> class name``, and with no card the only thing standing
+``ENVIRONMENT_NAME -> card name -> class name``, and with no card the only thing standing
 between this server and its class name is the ``ENVIRONMENT_NAME`` the gateway injects.
 
 The class name is deliberately distinctive: if resolution ever regresses, the served card

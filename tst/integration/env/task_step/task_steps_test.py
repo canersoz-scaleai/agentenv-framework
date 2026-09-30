@@ -17,7 +17,7 @@ from mcp.client.streamable_http import streamable_http_client
 # deploys + drives a real sandbox VM.
 pytestmark = [pytest.mark.int_test_slow]
 
-from agent_env.artifact import FileArtifact, EnvironmentArtifact, EnvironmentUniverseArtifact
+from agent_env.artifact import FileArtifact, FileArtifactUniverse, EnvironmentArtifact, EnvironmentUniverseArtifact
 from agent_env.env import Env, GatewayEnv, MCPServerEnv, MultiEnv
 from agent_env.env.envs.service_db import ServiceDBEnv
 from agent_env.config import get_config
@@ -25,6 +25,8 @@ from agent_env.task import Task, TaskStepStatus
 from agent_env.task_step import AddSkillsTaskStep, BuildMcpCliTaskStep, DeployAgentTaskStep, DeployEnvTaskStep, EnvOutcomeVerifierTaskStep, LoadArtifactTaskStep, PromptAgentTaskStep, RubricsVerifierTaskStep, TaskStep, TaskStepContext, VerifyMCPToolSchemaTaskStep
 from agent_env.task_step.task_step import TaskStepDependency
 from agent_env.a2a_agent import A2AAgent, conversation_store
+from agent_env.providers.sandbox_providers.sandbox import VmSandbox
+from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
 
 from tst.task import journal_invariants as journal
 from tst.util.a2a_test_agent import put_test_agent
@@ -178,7 +180,6 @@ def mcp_server_env() -> MCPServerEnv:
         id=_run_id(f"task-step-test-mcp-server-{img.name}"),
         docker_image_artifact=artifact,
         environment_name=img.service_name,
-        service_version=1,
     )
     logger.info(f"Created MCPServerEnv: {env.id} version={env.version}")
     return env
@@ -198,7 +199,6 @@ def slack_mcp_server_env() -> MCPServerEnv:
         id=_run_id(f"task-step-test-mcp-server-{img.name}"),
         docker_image_artifact=artifact,
         environment_name=img.service_name,
-        service_version=1,
     )
     logger.info(f"Created MCPServerEnv: {env.id} version={env.version}")
     return env
@@ -628,7 +628,7 @@ async def test_task_steps_e2e(sandbox_provider, multi_env, email_service_artifac
 
     if agent.sandbox_id:
         try:
-            from agent_env.providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
+            from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
 
             provider = build_sandbox_provider(agent.sandbox_type) if agent.sandbox_type else get_agent_sandbox_provider()
             agent_sandbox = await provider.get_sandbox(agent.sandbox_id)
@@ -684,6 +684,77 @@ async def test_load_universe_on_single_mcp_server_env(sandbox_provider, mcp_serv
         await env.close()
 
 
+async def _agent_sandbox(agent):
+    provider = build_sandbox_provider(agent.sandbox_type) if agent.sandbox_type else get_agent_sandbox_provider()
+    return await provider.get_sandbox(agent.sandbox_id)
+
+
+async def _read_in_agent(sandbox, path):
+    if isinstance(sandbox, VmSandbox):
+        return await sandbox.exec_with_output("docker", "exec", sandbox.container_name, "cat", path)
+    return await sandbox.exec_with_output("cat", path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_load_artifact_stages_files_into_env_and_agent(mcp_server_env, echo_agent, tmp_path):
+    """A single file and a file-artifact universe land at ``<destination>/<name>`` in a deployed env
+    and in a deployed agent, through the real loaders and sandboxes."""
+    suffix = uuid.uuid4().hex[:8]
+    expected = {"note.txt": "a single file\n", "a.txt": "a universe member\n", "sub/b.txt": "a nested member\n"}
+
+    def put_file(name):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(expected[name])
+        return FileArtifact.put(id=_run_id(f"load-files-{path.stem}"), description=name, file_path=str(path))
+
+    note = put_file("note.txt")
+    universe = FileArtifactUniverse.put(
+        id=_run_id("load-files-universe"), file_artifacts={name: put_file(name) for name in ("a.txt", "sub/b.txt")},
+    )
+    refs = [{"id": artifact.id, "version": artifact.version} for artifact in (note, universe)]
+
+    context = await DeployEnvTaskStep(
+        id=f"load-files-env-{suffix}", version=None, env_id=mcp_server_env.id, env_version=mcp_server_env.version,
+    ).execute(TaskStepContext())
+    deployed_env = context.deployed_envs[0]
+    try:
+        await DeployAgentTaskStep(
+            id=f"load-files-agent-{suffix}", version=None, env_ids=[mcp_server_env.id],
+            a2a_agent_id=echo_agent.id, a2a_agent_version=echo_agent.version,
+        ).execute(context)
+        agent = context.deployed_agents[0]
+        await LoadArtifactTaskStep(
+            id=f"load-files-into-env-{suffix}", version=None, env_id=mcp_server_env.id,
+            artifacts=refs, destination_path="/app/loaded",
+        ).execute(context)
+        await LoadArtifactTaskStep(
+            id=f"load-files-into-agent-{suffix}", version=None, agent_name=agent.agent_name, artifacts=refs,
+        ).execute(context)
+
+        env = await type(Env.get(deployed_env.env_id, deployed_env.env_version)).from_deployed_env(deployed_env)
+        agent_sandbox = await _agent_sandbox(agent)
+        for name, text in expected.items():
+            assert await env._sandbox.exec_with_output("cat", f"/app/loaded/{name}") == (0, text, "")
+            assert await _read_in_agent(agent_sandbox, f"/tmp/file_artifacts/{name}") == (0, text, "")
+        loaded = context.metadata["loaded_file_artifact_universes"]
+        assert [(e["artifact_type"], e["env_id"], e["agent_name"], sorted(e["files"])) for e in loaded] == [
+            ("file", mcp_server_env.id, None, ["note.txt"]),
+            ("file_artifact_universe", mcp_server_env.id, None, ["a.txt", "sub/b.txt"]),
+            ("file", None, agent.agent_name, ["note.txt"]),
+            ("file_artifact_universe", None, agent.agent_name, ["a.txt", "sub/b.txt"]),
+        ]
+    finally:
+        if context.deployed_agents:
+            try:
+                await (await _agent_sandbox(context.deployed_agents[0])).terminate()
+            except Exception as e:
+                logger.warning(f"load-files test agent cleanup: {e}")
+        env = await type(Env.get(deployed_env.env_id, deployed_env.env_version)).from_deployed_env(deployed_env)
+        await env.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.integration
 @skip_without_model_endpoint()
@@ -691,7 +762,7 @@ async def test_load_universe_on_single_mcp_server_env(sandbox_provider, mcp_serv
 async def test_cli_install_e2e(sandbox_provider, multi_env, a2a_agent):
     """End-to-end: deploy env + agent, build CliArtifact, install into agent, register skill via cli_artifact_ids."""
     from agent_env.a2a_agent.store import get_a2a_agent_instance_store
-    from agent_env.providers.sandbox_provider import build_sandbox_provider
+    from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider
 
     async def exec_in(sandbox, wrapper_cmd, *cmd):
         # Container mode: the agent IS the sandbox; exec directly. VM mode: docker exec into the named container.
@@ -808,7 +879,7 @@ async def test_prompt_agent_model_params_reaches_agent(sandbox_provider, multi_e
     extension: the echo agent advertises it as a write-only field, so it must arrive and
     read back redacted (never echoing provider secrets)."""
     from agent_env.a2a_agent.store import get_a2a_agent_instance_store
-    from agent_env.providers.sandbox_provider import build_sandbox_provider
+    from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider
 
     suffix = uuid.uuid4().hex[:8]
     deploy_env_step = DeployEnvTaskStep(id=f"mp-env-{suffix}", version=None, env_id=multi_env.id, env_version=multi_env.version)
@@ -1381,7 +1452,7 @@ async def test_task_dag_parallel_e2e(
     for agent in context.deployed_agents:
         if agent.sandbox_id:
             try:
-                from agent_env.providers.sandbox_provider import get_sandbox_provider
+                from agent_env.providers.sandbox_providers.sandbox_provider import get_sandbox_provider
                 sandbox = await get_sandbox_provider().get_sandbox(agent.sandbox_id)
                 await sandbox.terminate()
             except Exception as e:
@@ -1393,13 +1464,13 @@ async def test_task_dag_parallel_e2e(
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_task_external_cancel_marks_failed():
-    """Cancel-path: external cancel of Task.run() (Temporal heartbeat timeout,
+    """Cancel-path: external cancel of Task.run() (a runner's timeout,
     worker SIGTERM, etc.) should:
 
       1. Cancel any in-flight steps.
       2. Mark the Mongo task instance as failed (not stuck `running`).
-      3. Re-raise the original CancelledError so Temporal sees a cancel,
-         not a generic activity failure.
+      3. Re-raise the original CancelledError so the runner sees a cancel,
+         not a generic step failure.
 
     Exercises the try/except (asyncio.CancelledError, Exception) block we
     added around Task.run()'s scheduler. Without that block, in-flight tasks
@@ -1434,7 +1505,7 @@ async def test_task_external_cancel_marks_failed():
     assert instance_id is not None, "instance_id should be set by Task.run() before steps fire"
     logger.info(f"Both blocking steps in-flight; instance_id={instance_id}; cancelling Task.run()...")
 
-    # External cancel — simulates Temporal heartbeat timeout / worker SIGTERM.
+    # External cancel — simulates a runner timeout / worker SIGTERM.
     run_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await run_task

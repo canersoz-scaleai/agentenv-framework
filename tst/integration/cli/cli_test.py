@@ -57,7 +57,7 @@ class TestCliHelp:
         assert '--context' in result.output
         assert '--environment-name' in result.output
         assert '--service-name' not in result.output
-        assert '--service-version' in result.output
+        assert '--service-version' not in result.output
 
     def test_mcp_server_load_environment_artifact_help(self):
         runner = CliRunner()
@@ -123,7 +123,7 @@ class TestCliHelp:
         assert '--frontend-docker-context' in result.output
         assert '--environment-name' in result.output
         assert '--service-name' not in result.output
-        assert '--service-version' in result.output
+        assert '--service-version' not in result.output
 
     def test_website_load_environment_artifact_help(self):
         runner = CliRunner()
@@ -178,10 +178,8 @@ class TestCliIntegration:
             'env', 'mcp-server', 'put',
             '--id', f'cli-test-email-{test_run_id}',
             '--environment-name', 'email',
-            '--service-version', '1',
             '--dockerfile', str(TST_DATA_DIR / 'email_mcp' / 'Dockerfile'),
             '--context', str(TST_DATA_DIR),
-            '--skip-validation',
         )
         assert result.returncode == 0, f"Command failed: {result.stdout}\n{result.stderr}"
         assert 'Created MCPServerEnv' in result.stdout
@@ -191,10 +189,8 @@ class TestCliIntegration:
             'env', 'mcp-server', 'put',
             '--id', f'cli-test-slack-{test_run_id}',
             '--environment-name', 'slack',
-            '--service-version', '1',
             '--dockerfile', str(TST_DATA_DIR / 'slack_mcp' / 'Dockerfile'),
             '--context', str(TST_DATA_DIR),
-            '--skip-validation',
         )
         assert result.returncode == 0, f"Command failed: {result.stdout}\n{result.stderr}"
         assert 'Created MCPServerEnv' in result.stdout

@@ -2,6 +2,7 @@
 
 import datetime
 import json
+from typing import Optional
 
 import click
 
@@ -12,6 +13,8 @@ from agent_env.config.describe import (
     SOURCE_WALK_UP,
     ConfigReport,
     Explained,
+    PluginOwner,
+    PluginsReport,
     SectionsReport,
     as_dict,
     describe_config,
@@ -46,10 +49,24 @@ def _source_prose(report: ConfigReport) -> str:
     return "discovery failed"
 
 
+def _plugin_lines(plugins: PluginsReport) -> list[str]:
+    """Each ``[plugins.<name>]`` table under the distribution it belongs to."""
+    if plugins.error:
+        return [f"(unresolved) {plugins.error}", "from [plugins]"]
+    if not plugins.tables:
+        return ["(none)"]
+    out = []
+    for table in plugins.tables:
+        body = [f"(unresolved) {table.error}"] if table.error else [
+            line for line in section_lines(table.value, seam=False) if line] or ["(empty)"]
+        out += [table.owner.label, *(f"  {line}" for line in body), f"  from {table.where}"]
+    return out
+
+
 def render(report: ConfigReport) -> str:
     """Render a `ConfigReport` as the operator-facing block. Kept separate from the command
     so the format is assertable without a CliRunner."""
-    labels = ["config:"] + [f"{s.name}:" for s in report.sections]
+    labels = ["config:", "plugins:"] + [f"{s.name}:" for s in report.sections]
     width = max(len(label) for label in labels) + 1
     lines = []
     where = report.config_path if report.config_path is not None else "(none)"
@@ -72,7 +89,22 @@ def render(report: ConfigReport) -> str:
                 lines.append(f"{'':<{width}} ; {beaten.where} unreadable: {beaten.error}")
             elif beaten.kind != KIND_DEFAULT:
                 lines.append(f"{'':<{width}} ; {beaten.summary()} in {beaten.where}, shadowed")
+    if report.sections:
+        head, *rest = _plugin_lines(report.plugins)
+        lines.append(f"{'plugins:':<{width}} {head}")
+        lines += [f"{'':<{width}} {extra}" for extra in rest]
     return "\n".join(lines)
+
+
+def _owner_line(owner: PluginOwner) -> str:
+    return f"  ; {owner.note}"
+
+
+def _plugin_json(owner: Optional[PluginOwner]) -> Optional[dict]:
+    if owner is None:
+        return None
+    return {"name": owner.name, "installed": owner.installed is not None, "version": owner.version,
+            "plugin": owner.plugin}
 
 
 @click.group()
@@ -107,12 +139,15 @@ def debug(as_json: bool):
 
 
 def _render_children(report: SectionsReport) -> list[str]:
-    out = [f"  covers {len(report.children)} sections, each resolving on its own:"]
+    what = "plugin tables" if all(c.plugin is not None for c in report.children) else "sections"
+    out = [f"  covers {len(report.children)} {what}, each resolving on its own:"]
     width = max(len(c.path) for c in report.children) + 2
     for child in report.children:
         where = child.winner.where if child.winner is not None else "(none)"
-        summary = f"(unresolved) {child.error}" if child.error else headline(child.value)
-        out.append(f"    {child.path:<{width}}{summary}  from {where}")
+        summary = (f"(unresolved) {child.error}" if child.error
+                   else headline(child.value, seam=child.plugin is None))
+        owner = f"  ({child.plugin.label})" if child.plugin is not None else ""
+        out.append(f"    {child.path:<{width}}{summary}  from {where}{owner}")
     return out
 
 
@@ -125,9 +160,11 @@ def render_explain(report: Explained) -> str:
         lines.append(f"  (unresolved) {report.error}")
     if report.winner is None and not report.error:
         lines.append("  (unset) — no layer supplies this path")
+        if report.plugin is not None:
+            lines.append(_owner_line(report.plugin))
         return "\n".join(lines)
     if not report.error:
-        body = section_lines(report.value)
+        body = section_lines(report.value, seam=report.plugin is None)
         # `(unset)` only when there is nothing else to say: substituting it whenever the
         # first line is blank prints it directly above the table it is denying.
         head = body[0] or ("(unset)" if len(body) == 1 else "")
@@ -142,6 +179,8 @@ def render_explain(report: Explained) -> str:
             lines.append(f"  ; {beaten.summary()} in {beaten.where}, shadowed")
     if report.file_only and report.winner is not None:
         lines.append("  ; read from the file only — no resolver owns this path")
+    if report.plugin is not None:
+        lines.append(_owner_line(report.plugin))
     return "\n".join(lines)
 
 
@@ -167,10 +206,11 @@ def explain(path: str, as_json: bool):
             "shadowed": [],
             "error": None,
             "file_only": False,
+            "plugin": None,
             "children": [
                 {"path": c.path, "section": c.section,
                  "winner": None if c.winner is None else c.winner.where,
-                 "value": c.value, "error": c.error}
+                 "value": c.value, "error": c.error, "plugin": _plugin_json(c.plugin)}
                 for c in report.children
             ],
         }))
@@ -188,6 +228,7 @@ def explain(path: str, as_json: bool):
                          for b in report.shadowed],
             "error": report.error,
             "file_only": report.file_only,
+            "plugin": _plugin_json(report.plugin),
             "children": [],
         }))
         return

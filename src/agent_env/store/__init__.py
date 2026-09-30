@@ -3,8 +3,10 @@
 from agent_env.store.base import (
     ConcurrentModificationError,
     ConfigError,
+    GrantUnavailableError,
     NotFoundError,
     ObjectAlreadyExistsError,
+    ObjectNotFoundError,
 )
 from agent_env.config import (
     Config,
@@ -20,6 +22,7 @@ from agent_env.store.document_store import (
     AbsentOrNull,
     DocumentStore,
     DuplicateKeyError,
+    DynamoDbDocumentStore,
     Eq,
     Exists,
     Filter,
@@ -76,6 +79,8 @@ __all__ = [
     # Exceptions
     "NotFoundError",
     "ObjectAlreadyExistsError",
+    "ObjectNotFoundError",
+    "GrantUnavailableError",
     "ConcurrentModificationError",
     "ConfigError",
     "DuplicateKeyError",
@@ -83,6 +88,7 @@ __all__ = [
     "DocumentStore",
     "MongoDocumentStore",
     "LocalSqliteDocumentStore",
+    "DynamoDbDocumentStore",
     "VersionedEntityStore",
     "compare_and_swap",
     "rev_precondition",

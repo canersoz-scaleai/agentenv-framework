@@ -4,6 +4,7 @@
     "type": "docker_image",
     "version": 3
   },
+  "env_provider_type": "gateway",
   "environment_name": "shop",
   "frontend_docker_image_artifact": {
     "id": "shop-frontend-image",
@@ -15,7 +16,6 @@
     "owner": "env-pod"
   },
   "service_name": "shop",
-  "service_version": 1,
   "type": "website",
   "version": 2
 }

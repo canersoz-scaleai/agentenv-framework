@@ -29,6 +29,7 @@ PUT_COMMANDS = [
             "env", "website", "put", "--id", "x",
             "--backend-dockerfile-github-url", "https://github.com/o/r/tree/main/b/Dockerfile",
             "--frontend-dockerfile-github-url", "https://github.com/o/r/tree/main/f/Dockerfile",
+            "--skip-validation",
         ],
         "agent_env.cli.env.website.WebsiteEnv.put_from_github",
         id="website-put",
@@ -43,11 +44,11 @@ def _invoke(argv, put_target, extra):
 
     async def _fake_put(*args, **kwargs):
         captured.update(kwargs)
-        return MagicMock(id="x", version=1, environment_name=kwargs.get("environment_name"), service_version=1)
+        return MagicMock(id="x", version=1, environment_name=kwargs.get("environment_name"))
 
     with patch(put_target, side_effect=_fake_put), \
             patch(f"{module}.card_name_from_github", return_value=None):
-        result = CliRunner().invoke(cli, argv + extra + ["--skip-validation"])
+        result = CliRunner().invoke(cli, argv + extra)
     return result, captured
 
 
@@ -121,7 +122,7 @@ def test_mcp_put_derives_name_from_card_when_flag_omitted(tmp_path):
             patch("agent_env.cli.env.mcp_server.MCPServerEnv.put", side_effect=_capture):
         result = CliRunner().invoke(cli, [
             "env", "mcp-server", "put", "--id", "x",
-            "--dockerfile", str(dockerfile), "--skip-validation",
+            "--dockerfile", str(dockerfile),
         ])
     assert captured.get("environment_name") == "items", result.output
     derive.assert_called_once()
@@ -160,14 +161,13 @@ def test_github_put_derives_name_from_github_source():
 
     async def _fake_put(*args, **kwargs):
         captured.update(kwargs)
-        return MagicMock(id="x", version=1, environment_name=kwargs.get("environment_name"), service_version=1)
+        return MagicMock(id="x", version=1, environment_name=kwargs.get("environment_name"))
 
     with patch("agent_env.cli.env.mcp_server.MCPServerEnv.put_from_github", side_effect=_fake_put), \
             patch("agent_env.cli.env.mcp_server.card_name_from_github", return_value="email") as derive:
         result = CliRunner().invoke(cli, [
             "env", "mcp-server", "put", "--id", "x",
             "--dockerfile-github-url", "https://github.com/o/r/tree/main/svc/Dockerfile",
-            "--skip-validation",
         ])
     assert captured.get("environment_name") == "email", result.output
     derive.assert_called_once()

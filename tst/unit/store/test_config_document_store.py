@@ -2,13 +2,14 @@
 
 Mongo-free (the tst/unit socket guard forbids network): injection returns a
 fake verbatim, and the ``local`` selector / a custom ``impl`` build real stores
-under a temp cwd.
+under the test's state root.
 """
 
 import pytest
 
 from agent_env.store import ConfigError, Filter, LocalSqliteDocumentStore
 from agent_env.config import Config, configure, get_config, set_document_store
+from agent_env.config.paths import state_root
 from tst.unit.store.fakes import FakeDocumentStore
 
 _FAKE_SECTION = '[stores.document]\nimpl = "tst.unit.store.fakes:FakeDocumentStore"\n'
@@ -47,7 +48,8 @@ def test_env_selector_builds_local_sqlite(monkeypatch, tmp_path):
     assert isinstance(store, LocalSqliteDocumentStore)
     store.insert("coll", {"id": "a", "x": 1})
     assert store.find_one("coll", Filter.of(id="a"))["x"] == 1
-    assert (tmp_path / ".agentenv" / "document_store" / "documents.db").exists()
+    assert (state_root() / "document_store" / "documents.db").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_default_backend_is_local(monkeypatch, tmp_path):
@@ -85,3 +87,48 @@ def test_env_override_beats_config_toml(monkeypatch, tmp_path):
     _write_config(tmp_path, _FAKE_SECTION)
     monkeypatch.setenv("AGENT_ENV_DOCUMENT_STORE", "local")
     assert isinstance(Config().get_document_store(), LocalSqliteDocumentStore)
+
+
+def test_local_in_a_project_config_is_the_per_user_store(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_ENV_DOCUMENT_STORE", raising=False)
+    monkeypatch.delenv("AGENT_ENV_CONFIG", raising=False)
+    first, second = tmp_path / "first", tmp_path / "second"
+    for project in (first, second):
+        project.mkdir()
+        _write_config(project, '[stores]\ndocument = "local"\n')
+    monkeypatch.chdir(first)
+    Config().get_document_store().insert("coll", {"id": "a"})
+    monkeypatch.chdir(second)
+    assert Config().get_document_store().find_one("coll", Filter.of(id="a")) is not None
+    assert (state_root() / "document_store" / "documents.db").exists()
+    assert sorted(p.name for p in (first / ".agentenv").iterdir()) == ["config.toml"]
+
+
+def test_a_configured_path_still_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_ENV_DOCUMENT_STORE", raising=False)
+    monkeypatch.delenv("AGENT_ENV_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "mine" / "documents.db"
+    _write_config(tmp_path, (
+        '[stores.document]\nimpl = "agent_env.store.document_store:LocalSqliteDocumentStore"\n'
+        f'[stores.document.config]\npath = "{path}"\n'
+    ))
+    Config().get_document_store().insert("coll", {"id": "a"})
+    assert path.exists()
+    assert not state_root().exists()
+
+
+@pytest.mark.parametrize("blocked", ["state home", "store directory"])
+def test_a_store_directory_that_cannot_be_created_is_a_config_error(monkeypatch, tmp_path, blocked):
+    monkeypatch.delenv("AGENT_ENV_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    if blocked == "state home":
+        blocker = tmp_path / "a-file"
+        blocker.write_text("")
+        monkeypatch.setenv("XDG_STATE_HOME", str(blocker))
+    else:
+        state_root().mkdir(parents=True)
+        (state_root() / "document_store").write_text("")
+    monkeypatch.setenv("AGENT_ENV_DOCUMENT_STORE", "local")
+    with pytest.raises(ConfigError, match="set XDG_STATE_HOME to a writable directory"):
+        Config().get_document_store().insert("coll", {"id": "a"})

@@ -41,6 +41,16 @@ def test_a_rule_the_caller_broke_prints_one_line(exc, message):
     assert "Traceback" not in result.output
 
 
+def test_the_errors_notes_follow_it():
+    exc = ValueError("tasks/t.json: step 'box': not a known step type")
+    exc.add_note("while preflighting tasks/t.json (@local/~/triage/t)")
+
+    result = CliRunner().invoke(_group_raising(exc), ["boom"])
+
+    assert result.output == (
+        "Error: tasks/t.json: step 'box': not a known step type\nwhile preflighting tasks/t.json (@local/~/triage/t)\n")
+
+
 @pytest.mark.parametrize("exc", [
     TypeError("got an unexpected keyword argument 'agent_id'"),
     DuplicateKeyError("could not assign a version after 5 retries"),

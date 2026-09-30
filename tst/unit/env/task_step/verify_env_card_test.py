@@ -3,7 +3,11 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agent_env.env.env import DeployedEnv
+import httpx
+import pytest
+
+from agent_env.env.env import DeployedGatewayEnv, DeployedSandboxEnv
+from agent_env.env.gateway.constants import WELL_KNOWN_PATH
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.env_card_validator.verify_env_card import VerifyEnvironmentCardStep
 
@@ -31,9 +35,9 @@ def _make_step():
 
 def _make_context():
     ctx = TaskStepContext()
-    ctx.deployed_envs = [DeployedEnv(
+    ctx.deployed_envs = [DeployedGatewayEnv(
         env_id="e1", env_version=3, gateway_url="https://gw", mcp_url="https://gw/mcp",
-        db_web_url=None, sandbox_id="sb",
+        db_web_url=None, sandbox_id="sb", environment_card_url=f"https://gw{WELL_KNOWN_PATH}",
     )]
     return ctx
 
@@ -64,6 +68,16 @@ class TestExecute:
         assert "data_operations" not in v
         assert all(f["present"] for f in v["required_fields"].values())
         assert result_ctx.metadata["verifications"]["environment_card"]["validated_environment_card"] == v
+
+    def test_a_server_record_persists_the_servers_own_card(self):
+        ctx = TaskStepContext()
+        ctx.deployed_envs = [DeployedSandboxEnv(env_id="e1", env_version=3, env_provider_type="server",
+                                                environment_card_url=f"https://srv{WELL_KNOWN_PATH}", sandbox_id="srv")]
+        leaf = {**{k: v for k, v in CARD.items() if k != "children_environments"}, "name": "items"}
+        _, env, get_card = _run(_make_step(), ctx, card=leaf)
+        get_card.assert_awaited_once_with("https://srv")
+        update = env.update_metadata.call_args[0][0]
+        assert update["environment_card"] == leaf and update["validated_environment_card"]["accessible"] is True
 
     def test_extensions_without_uri_are_filtered_out(self):
         card = {**CARD, "capabilities": {"extensions": [
@@ -133,6 +147,29 @@ class TestExecute:
         _, env, _ = _run(_make_step(), _make_context(), card=CARD, env_name=None)
         v = env.update_metadata.call_args[0][0]["validated_environment_card"]
         assert v["name_check"] is None
+
+
+class TestWire:
+    @pytest.mark.parametrize("gateway_url", ["https://gw", "https://gw/", "https://sandbox.example.com/sandbox/sandbox-vm-1-18765"])
+    def test_reads_the_card_at_its_address(self, gateway_url):
+        base = gateway_url.rstrip("/")
+        ctx = TaskStepContext(deployed_envs=[DeployedGatewayEnv(
+            env_id="e1", env_version=3, gateway_url=gateway_url, mcp_url=f"{base}/mcp", db_web_url=None, sandbox_id="sb",
+            environment_card_url=f"{gateway_url}{WELL_KNOWN_PATH}",
+        )])
+        sent = []
+
+        def handle(request):
+            sent.append(request)
+            return httpx.Response(200, json=CARD)
+
+        real = httpx.AsyncClient
+        fake_env = MagicMock(metadata={}, environment_name="items")
+        with patch.object(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle))), \
+             patch("agent_env.env.env.Env.get", return_value=fake_env):
+            asyncio.run(_make_step().execute(ctx))
+        assert [(r.method, str(r.url)) for r in sent] == [("GET", f"{base}{WELL_KNOWN_PATH}")]
+        assert fake_env.update_metadata.call_args[0][0]["validated_environment_card"]["accessible"] is True
 
 
 class TestSerialization:

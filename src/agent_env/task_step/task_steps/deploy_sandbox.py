@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 from typing import ClassVar, Optional
 
-from agent_env.providers.sandbox import NetworkPolicy
+from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy
 from agent_env.task_step.context import DeployedSandbox, TaskStepContext
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
-from agent_env.attribution import attribution_of, metadata_from_legacy_document
+from agent_env.attribution import deploy_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -96,33 +96,36 @@ class DeploySandboxTaskStep(TaskStep):
             env_vars=data.get("env_vars"),
             sandbox_type=data.get("sandbox_type"),
             priority=data.get("priority"),
-            metadata=metadata_from_legacy_document(data),
+            metadata=dict(data.get("metadata") or {}),
             network_policy=data.get("network_policy"),
         )
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        from agent_env.providers.sandbox_provider import build_sandbox_provider, get_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_sandbox_provider
 
         if any(s.sandbox_name == self.sandbox_name for s in context.deployed_sandboxes):
             raise RuntimeError(f"Sandbox '{self.sandbox_name}' is already deployed")
 
+        user_overrides = context.metadata.get("user_overrides") or {}
+        # Moves only deploy_sandbox steps: deploy_env and deploy_agent read env_sandbox and agent_sandbox.
+        resolved_sandbox_type = user_overrides.get("sandbox") or self.sandbox_type
         provider = (
-            build_sandbox_provider(self.sandbox_type)
-            if self.sandbox_type
+            build_sandbox_provider(resolved_sandbox_type)
+            if resolved_sandbox_type
             else get_sandbox_provider()
         )
 
-        _ttl_override = (context.metadata.get("user_overrides") or {}).get("ttl_seconds")
+        _ttl_override = user_overrides.get("ttl_seconds")
         resolved_ttl = _ttl_override if _ttl_override is not None else self.ttl_seconds
-        attribution = attribution_of(self)
+        attribution = deploy_attribution(self, context)
         logger.info(
             f"Deploying sandbox '{self.sandbox_name}' (mode={self.sandbox_mode}, "
             f"image={self.image}, cpu={self.cpu}, memory_mb={self.memory_mb}, "
             f"disk_size_gb={self.disk_size_gb}, ttl_seconds={resolved_ttl}, "
-            f"sandbox_type={self.sandbox_type}, project_id={attribution.get('project_id')})"
+            f"sandbox_type={resolved_sandbox_type}, attribution={attribution})"
         )
 
-        _override = (context.metadata.get("user_overrides") or {}).get("network_policy")
+        _override = user_overrides.get("network_policy")
         _resolved = _override if _override is not None else self.network_policy
         policy = NetworkPolicy.from_dict(_resolved) if _resolved is not None else None
 

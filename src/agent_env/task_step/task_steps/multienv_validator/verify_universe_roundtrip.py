@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from agent_env.env.env_artifact_store import EnvArtifactType, get_env_artifact_store
+from agent_env.artifact.store import artifact_write_lock
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
 from .universe_comparison import classify_issues, compare_dicts, normalize
+
+if TYPE_CHECKING:
+    from agent_env.env.env import DeployedEnv
 
 logger = logging.getLogger(__name__)
 
@@ -98,18 +103,21 @@ class VerifyUniverseLoadExportRoundtripStep(TaskStep):
         originals = {}
         for sa in environment_artifacts:
             try:
-                originals[sa.environment_name] = normalize(json.loads(sa.get_file_artifact().load()))
+                data = await asyncio.to_thread(lambda sa=sa: sa.get_file_artifact().load())
+                originals[sa.environment_name] = normalize(json.loads(data))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 logger.info(f"{sa.environment_name}: non-JSON artifact, will only compare export1 vs export2")
 
         # Phase 3: Export #1
         logger.info("Exporting state (round 1)...")
-        export1_raw = await self._export_all(deployed.gateway_url, environment_names)
+        export1_raw = await self._export_all(deployed, environment_names)
         export1 = {name: normalize(data) for name, data in export1_raw.items()}
 
         # Phase 4: Create artifacts from export #1
         logger.info("Creating artifacts from export #1...")
-        exported_universe = self._create_universe_artifact(environment_artifacts, export1_raw, deployed.env_version, universe.version)
+        exported_universe = await asyncio.to_thread(
+            self._create_universe_artifact, environment_artifacts, export1_raw, deployed.env_version, universe.version
+        )
 
         # Phase 5: Reload from exported artifacts
         logger.info("Reloading from exported artifacts...")
@@ -117,7 +125,7 @@ class VerifyUniverseLoadExportRoundtripStep(TaskStep):
 
         # Phase 6: Export #2
         logger.info("Exporting state (round 2)...")
-        export2_raw = await self._export_all(deployed.gateway_url, environment_names)
+        export2_raw = await self._export_all(deployed, environment_names)
         export2 = {name: normalize(data) for name, data in export2_raw.items()}
 
         # Phase 7: Compare
@@ -140,7 +148,10 @@ class VerifyUniverseLoadExportRoundtripStep(TaskStep):
         # downstream agent-judge can diff them on its filesystem. Additive — does not touch
         # the programmatic verdict above.
         if self.emit_file_artifact_universe:
-            fau = self._create_file_artifact_universe(environment_artifacts, exported_universe, export2_raw, deployed.env_version, universe.version)
+            fau = await asyncio.to_thread(
+                self._create_file_artifact_universe,
+                environment_artifacts, exported_universe, export2_raw, deployed.env_version, universe.version,
+            )
             result["file_artifact_universe_id"] = fau.id
             logger.info(f"Emitted FileArtifactUniverse for agent-judge: {fau.id}")
 
@@ -168,60 +179,63 @@ class VerifyUniverseLoadExportRoundtripStep(TaskStep):
         from agent_env.artifact import FileArtifact, FileArtifactUniverse
 
         prefix = f"validate-{self.env_id}-v{env_version}-{self.universe_artifact_id}-v{universe_version}"
-        file_artifacts: dict[str, Any] = {}
-        for sa in original_environment_artifacts:
-            file_artifacts[f"original/{sa.environment_name}.json"] = sa.get_file_artifact()
-        for sa in exported_universe.get_environment_artifacts():
-            file_artifacts[f"export_1/{sa.environment_name}.json"] = sa.get_file_artifact()
-        for name, data in export2_raw.items():
-            # Cleanup wraps both the dump and the put, so a failure in either can't leak the temp
-            # file; mkstemp yields the path up front so `finally` always has a valid path to unlink.
-            fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix=f"export2-{name}-")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f, default=str, ensure_ascii=False)
-                fa = FileArtifact.put(id=f"{prefix}-export2-{name}", description=f"Export #2 of {name} for universe-judge", file_path=tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            file_artifacts[f"export_2/{name}.json"] = fa
+        with artifact_write_lock(prefix):
+            file_artifacts: dict[str, Any] = {}
+            for sa in original_environment_artifacts:
+                file_artifacts[f"original/{sa.environment_name}.json"] = sa.get_file_artifact()
+            for sa in exported_universe.get_environment_artifacts():
+                file_artifacts[f"export_1/{sa.environment_name}.json"] = sa.get_file_artifact()
+            for name, data in export2_raw.items():
+                # Cleanup wraps both the dump and the put, so a failure in either can't leak the temp
+                # file; mkstemp yields the path up front so `finally` always has a valid path to unlink.
+                fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix=f"export2-{name}-")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(data, f, default=str, ensure_ascii=False)
+                    fa = FileArtifact.put(id=f"{prefix}-export2-{name}", description=f"Export #2 of {name} for universe-judge", file_path=tmp_path)
+                finally:
+                    os.unlink(tmp_path)
+                file_artifacts[f"export_2/{name}.json"] = fa
 
-        return FileArtifactUniverse.put(
-            id=self.file_artifact_universe_id(self.env_id, env_version, self.universe_artifact_id, universe_version),
-            file_artifacts=file_artifacts,
-        )
+            return FileArtifactUniverse.put(
+                id=self.file_artifact_universe_id(self.env_id, env_version, self.universe_artifact_id, universe_version),
+                file_artifacts=file_artifacts,
+            )
 
     @staticmethod
-    async def _export_all(gateway_url: str, environment_names: list[str]) -> dict[str, dict]:
-        """GET /export-state for each service."""
+    async def _export_all(deployed: DeployedEnv, environment_names: list[str]) -> dict[str, dict]:
+        """Export each service: v1 ``data/get`` at the base the env card gives it, else legacy ``GET /export-state``."""
         from agent_env.env import legacy_protocol
+        from agent_env.env.env import gateway_url_of
         from agentenv_protocol import client as protocol_v1
         result = {}
         for name in environment_names:
-            base_url = legacy_protocol.environment_base_url(gateway_url, name, mcp=True)
-            if await protocol_v1.supports_v1(base_url):
+            base_url = await legacy_protocol.v1_base_url(deployed, gateway_url_of(deployed), name)
+            if base_url is not None:
                 resp = await protocol_v1.get_data(base_url)
                 result[name] = resp.parts[0].data if resp.parts else {}
             else:
-                result[name] = await legacy_protocol.export_state(gateway_url, name)
+                result[name] = await legacy_protocol.export_state(gateway_url_of(deployed), name)
         return result
 
     def _create_universe_artifact(self, original_environment_artifacts: list, export_data: dict[str, dict], env_version: int, universe_version: int) -> Any:
         """Create FileArtifact + EnvironmentArtifact per service, bundle into EnvironmentUniverseArtifact."""
         from agent_env.artifact import FileArtifact, EnvironmentArtifact, EnvironmentUniverseArtifact
         prefix = f"validate-{self.env_id}-v{env_version}-{self.universe_artifact_id}-v{universe_version}"
-        export_environment_artifacts = []
-        for sa in original_environment_artifacts:
-            name = sa.environment_name
-            if name not in export_data:
-                continue
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix=f"export1-{name}-") as f:
-                json.dump(export_data[name], f, default=str)
-                tmp_path = f.name
-            try:
-                file_artifact = FileArtifact.put(id=f"{prefix}-export1-{name}", description=f"Export #1 of {name} for universe compat validation", file_path=tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            svc_artifact = EnvironmentArtifact.put(id=f"{prefix}-export1-svc-{name}", environment_name=sa.environment_name, file_artifact=file_artifact)
-            export_environment_artifacts.append(svc_artifact)
+        with artifact_write_lock(prefix):
+            export_environment_artifacts = []
+            for sa in original_environment_artifacts:
+                name = sa.environment_name
+                if name not in export_data:
+                    continue
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix=f"export1-{name}-") as f:
+                    json.dump(export_data[name], f, default=str)
+                    tmp_path = f.name
+                try:
+                    file_artifact = FileArtifact.put(id=f"{prefix}-export1-{name}", description=f"Export #1 of {name} for universe compat validation", file_path=tmp_path)
+                finally:
+                    os.unlink(tmp_path)
+                svc_artifact = EnvironmentArtifact.put(id=f"{prefix}-export1-svc-{name}", environment_name=sa.environment_name, file_artifact=file_artifact)
+                export_environment_artifacts.append(svc_artifact)
 
-        return EnvironmentUniverseArtifact.put(id=f"{prefix}-export1", environment_artifacts=export_environment_artifacts)
+            return EnvironmentUniverseArtifact.put(id=f"{prefix}-export1", environment_artifacts=export_environment_artifacts)

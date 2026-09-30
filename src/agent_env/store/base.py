@@ -16,6 +16,15 @@ class ObjectAlreadyExistsError(Exception):
     pass
 
 
+class ObjectNotFoundError(NotFoundError, FileNotFoundError):
+    """Raised when an object store read addresses no object, on every backend. It is a
+    FileNotFoundError too, so filesystem-style handlers keep catching it."""
+
+
+class GrantUnavailableError(RuntimeError):
+    """Raised when an object store cannot issue a transfer grant for the requested lifetime."""
+
+
 class ConcurrentModificationError(Exception):
     """Raised when an update fails due to a concurrent modification."""
 

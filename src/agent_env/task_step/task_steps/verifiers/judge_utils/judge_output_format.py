@@ -1081,7 +1081,7 @@ def _trajectory_mistakes_rows(
     ``medium`` rather than scoring free.
 
     ``severity``, ``result`` and the ``"[sev] ..."`` justification prefix are unchanged —
-    the CUA harness repo's golden gate greps that marker to compute ``fb_high``.
+    a downstream gate greps that marker out of the justification.
     """
     weights = severity_weights or MISTAKE_SEVERITY_PENALTY
     fallback = weights.get(_DEFAULT_SEVERITY, MISTAKE_SEVERITY_PENALTY[_DEFAULT_SEVERITY])

@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import click
 
 from agent_env.artifact import FileArtifact, FileArtifactUniverse
-from agent_env.store.ids import fs_safe, key_segment
+from agent_env.store.ids import fs_safe
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +70,11 @@ def put(universe_id: str, file_artifact_ids: Tuple[str, ...]):
     "--s3-url",
     "s3_url",
     default=None,
-    help="S3 prefix to upload the bundle under (s3://bucket/key/). Defaults to s3://<configured-bucket>/file_artifact_universe/<id>/.",
+    help="Object-store prefix to upload the bundle under. Defaults to the version's own prefix in the configured "
+    "object store (artifacts/file_artifact_universe/<id>/<version>/).",
 )
 def put_bundled(universe_id: str, file_dir: Path, s3_url: Optional[str]):
     """Upload every file under --file-dir as a single bundled FileArtifactUniverse."""
-    from agent_env.config import get_config
-
     files: dict[str, Path] = {}
     for p in sorted(file_dir.rglob("*")):
         if p.is_file():
@@ -84,11 +83,7 @@ def put_bundled(universe_id: str, file_dir: Path, s3_url: Optional[str]):
         click.echo(f"Error: no files found under {file_dir}", err=True)
         raise SystemExit(1)
 
-    if s3_url is None:
-        bucket = get_config().get_s3_bucket()
-        s3_url = f"s3://{bucket}/file_artifact_universe/{key_segment(universe_id)}/"
-
-    click.echo(f"Uploading {len(files)} file(s) under {s3_url}...")
+    click.echo(f"Uploading {len(files)} file(s)" + (f" under {s3_url}..." if s3_url else "..."))
     for rel in files:
         click.echo(f"  {rel}")
     universe = FileArtifactUniverse.put_bundled(id=universe_id, files=files, s3_url=s3_url)

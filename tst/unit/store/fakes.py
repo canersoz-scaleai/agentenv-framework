@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_env.store.base import ObjectAlreadyExistsError
+from agent_env.store.base import ObjectAlreadyExistsError, ObjectNotFoundError
 from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Eq, Filter
 from agent_env.store.image_store import ImageStore
 from agent_env.store.object_store import DEFAULT_CONTENT_TYPE, ObjectMetadata, ObjectStore
@@ -117,6 +117,8 @@ class FakeObjectStore(ObjectStore):
         return url
 
     def get(self, object_url):
+        if object_url not in self.objects:
+            raise ObjectNotFoundError(f"No object at {object_url}.")
         return self.objects[object_url]
 
     def download_to_file(self, object_url, dest_path):

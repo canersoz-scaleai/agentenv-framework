@@ -5,16 +5,25 @@ from __future__ import annotations
 import json
 
 import pytest
+from agentenv_protocol import FilePart
+from agentenv_protocol import client as protocol_v1
+from agentenv_protocol.client import GetDataResponse
 
-from agent_env.env.env import DeployedEnv
+from agent_env.artifact import EnvironmentUniverseArtifact
+from agent_env.artifact.store import reset_artifact_store
+from agent_env.config import set_object_store
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, DeployedSandboxEnv
+from agent_env.env.gateway.constants import EXT_STATE_URI, GATEWAY_EXTENSIONS, WELL_KNOWN_PATH
+from agent_env.store.object_store import S3ObjectStore
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_steps import snapshot_env as snapshot_mod
 from agent_env.task_step.task_steps.snapshot_env import SnapshotEnvTaskStep
+from tst.unit.store.fakes import FakeObjectStore
 
 
 def _deployed(env_id="env-1", instance_id="env-1-abc123", gateway="https://gw-1"):
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id=env_id,
         env_version=3,
         gateway_url=gateway,
@@ -22,6 +31,8 @@ def _deployed(env_id="env-1", instance_id="env-1-abc123", gateway="https://gw-1"
         db_web_url=None,
         sandbox_id="sb-1",
         instance_id=instance_id,
+        environment_card_url=f"{gateway}{WELL_KNOWN_PATH}",
+        environment_card={"capabilities": {"extensions": GATEWAY_EXTENSIONS}},
     )
 
 
@@ -127,6 +138,13 @@ def test_snapshot_id_falls_back_to_random_without_instance_id():
 
 
 # ── execute wiring ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_refuses_an_env_deployed_without_a_gateway():
+    bare = DeployedSandboxEnv(env_id="env-1", env_version=3, sandbox_id="srv", instance_id="env-1-abc123")
+    with pytest.raises(RuntimeError, match="Deployed env 'env-1' has no gateway_url and no override was provided"):
+        await _step(env_id="env-1").execute(_ctx(bare))
 
 @pytest.mark.asyncio
 async def test_execute_writes_summary_to_context(monkeypatch):
@@ -250,11 +268,15 @@ class _FakeObjectStore:
 
 
 class _FakeStoreConfig:
-    def __init__(self, store):
+    def __init__(self, store, key_prefix=""):
         self._store = store
+        self._key_prefix = key_prefix
 
     def get_object_store(self):
         return self._store
+
+    def get_artifact_key_prefix(self):
+        return self._key_prefix
 
 
 def _wire_fake_snapshot(monkeypatch):
@@ -276,9 +298,9 @@ def _wire_fake_snapshot(monkeypatch):
     )
 
 
-def _wire_fake_capture(monkeypatch, client):
+def _wire_fake_capture(monkeypatch, client, key_prefix=""):
     store = _FakeObjectStore()
-    monkeypatch.setattr(snapshot_mod, "get_config", lambda: _FakeStoreConfig(store))
+    monkeypatch.setattr(snapshot_mod, "get_config", lambda: _FakeStoreConfig(store, key_prefix))
     monkeypatch.setattr(snapshot_mod.httpx, "AsyncClient", client)
     return store
 
@@ -327,6 +349,18 @@ async def test_trajectory_capture_persists_verbatim_and_summarizes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trajectory_capture_is_kept_under_the_fixture_prefix(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    client = _FakeAsyncClient(response=_FakeTrajectoryResponse([b"{}\n"]))
+    store = _wire_fake_capture(monkeypatch, client, key_prefix="fx/")
+
+    await _step(include_env_trajectory=True).execute(_ctx(_deployed()))
+
+    ((key, _),) = store.uploads.items()
+    assert key.startswith("fx/env_trajectory/instance_id=task-x-65717eb66eeec083/env-1-")
+
+
+@pytest.mark.asyncio
 async def test_trajectory_capture_failure_is_fail_open(monkeypatch):
     """A fetch failure records {"error"} and the snapshot still succeeds."""
     _wire_fake_snapshot(monkeypatch)
@@ -372,12 +406,54 @@ async def test_trajectory_survives_a_failing_snapshot_export(monkeypatch):
     assert len(store.uploads) == 1
 
 
+@pytest.mark.asyncio
+async def test_trajectory_capture_records_one_sentence_when_the_card_offers_no_trajectory(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    client = _FakeAsyncClient(response=_FakeTrajectoryResponse([b"{}\n"]))
+    store = _wire_fake_capture(monkeypatch, client)
+    deployed = _deployed()
+    deployed.environment_card = {"capabilities": {"extensions": [e for e in GATEWAY_EXTENSIONS if e["uri"] == EXT_STATE_URI]}}
+
+    ctx = _ctx(deployed)
+    await _step(include_env_trajectory=True).execute(ctx)
+
+    assert ctx.metadata["env_trajectory"]["env-1"]["error"] == (
+        "EnvCapabilityUnsupported: env 'env-1' does not offer 'get' on urn:agentenv:trajectory/v1.")
+    assert client.requests == [] and store.uploads == {}
+
+
+@pytest.mark.asyncio
+async def test_trajectory_capture_streams_from_the_stored_cards_address_and_endpoint(monkeypatch):
+    _wire_fake_snapshot(monkeypatch)
+    client = _FakeAsyncClient(response=_FakeTrajectoryResponse([b"{}\n"]))
+    _wire_fake_capture(monkeypatch, client)
+    deployed = _deployed()
+    deployed.environment_card_url = f"https://sandbox.example/sb-1{WELL_KNOWN_PATH}"
+    deployed.environment_card = {"capabilities": {"extensions": [{
+        "uri": "urn:agentenv:trajectory/v1", "params": {"endpoint": "/env/trajectory", "methods": {"get": {"method": "GET"}}}}]}}
+
+    await _step(include_env_trajectory=True).execute(_ctx(deployed))
+
+    assert [(m, u) for m, u, _ in client.requests] == [("GET", "https://sandbox.example/sb-1/env/trajectory")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deployments", [[], [_deployed()]], ids=["pure-override", "next-to-a-deployment"])
+async def test_trajectory_capture_with_a_gateway_url_override_reads_the_override(monkeypatch, deployments):
+    _wire_fake_snapshot(monkeypatch)
+    client = _FakeAsyncClient(response=_FakeTrajectoryResponse([b"{}\n"]))
+    _wire_fake_capture(monkeypatch, client)
+
+    await _step(env_id="env-1", gateway_url="https://override/", include_env_trajectory=True).execute(_ctx(*deployments))
+
+    assert [(m, u) for m, u, _ in client.requests] == [("GET", "https://override/trajectory")]
+
+
 # ── core: all-or-nothing + streaming guard ───────────────────────────────────
 
 class _FakeServiceEnv:
-    def __init__(self, name, version=1):
+    def __init__(self, name):
         self.environment_name = name
-        self.service_version = version
 
 
 class _FakeMultiEnv:
@@ -390,7 +466,7 @@ class _FakeMultiEnv:
 
 @pytest.mark.asyncio
 async def test_core_all_or_nothing_on_partial_failure(monkeypatch):
-    async def fake_export(gateway_url, name, tmp_path, timeout):
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
         if name == "slack":
             raise ValueError("export-state returned non-JSON body (starts with b'<')")
         with open(tmp_path, "w") as f:
@@ -434,7 +510,7 @@ async def test_core_all_or_nothing_on_partial_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_core_success_creates_universe_with_metadata(monkeypatch):
-    async def fake_export(gateway_url, name, tmp_path, timeout):
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
         with open(tmp_path, "w") as f:
             json.dump({"ok": name}, f)
         return ".json"
@@ -498,7 +574,7 @@ async def test_core_zip_export_creates_zip_filename_artifact(monkeypatch):
     """A FilePart(zip) export flows through as a .zip-suffixed FileArtifact path,
     so FileArtifact.filename (= basename) ends in .zip — the load side routes a
     .zip file:// artifact to reset_data() for a lossless round-trip."""
-    async def fake_export(gateway_url, name, tmp_path, timeout):
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
         # Simulate the lossless-zip case: write zip bytes and report ".zip".
         with open(tmp_path, "wb") as f:
             f.write(b"PK\x03\x04zip-bytes")
@@ -572,7 +648,7 @@ async def test_export_service_to_file_materializes_filepart_zip(monkeypatch, tmp
     async def fake_get_data(base_url, timeout=None):
         return GetDataResponse(parts=[part])
 
-    async def fake_get_card(base_url):
+    async def fake_get_card(base_url, timeout=10):
         return {}  # no s3-credentials extension -> _push_s3_credentials no-ops
 
     from agentenv_protocol import client as protocol_v1
@@ -615,7 +691,7 @@ async def test_export_service_to_file_resolves_relative_uri_and_streams(
     async def fake_get_data(base_url, timeout=None):
         return GetDataResponse(parts=[part])
 
-    async def fake_get_card(base_url):
+    async def fake_get_card(base_url, timeout=10):
         return {}  # no s3-credentials extension -> _push_s3_credentials no-ops
 
     monkeypatch.setattr(protocol_v1, "supports_v1", fake_supports_v1)
@@ -665,6 +741,89 @@ async def test_export_service_to_file_resolves_relative_uri_and_streams(
     assert captured["url"] == f"{expected_base.rstrip('/')}/export-snapshot"
 
 
+def _serve_filepart_uri(monkeypatch, uri):
+    part = FilePart(file={"uri": uri, "name": "gdrive.zip", "mimeType": "application/zip"})
+
+    async def fake_supports_v1(base_url):
+        return True
+
+    async def fake_get_data(base_url, timeout=None):
+        return GetDataResponse(parts=[part])
+
+    async def fake_get_card(base_url, timeout=10):
+        return {}
+
+    def no_http(*a, **k):
+        raise AssertionError("this uri must not be streamed")
+
+    monkeypatch.setattr(protocol_v1, "supports_v1", fake_supports_v1)
+    monkeypatch.setattr(protocol_v1, "get_card", fake_get_card)
+    monkeypatch.setattr(protocol_v1, "get_data", fake_get_data)
+    monkeypatch.setattr(snapshot_mod.httpx, "AsyncClient", no_http)
+
+
+@pytest.mark.asyncio
+async def test_export_service_to_file_returns_an_object_url_as_the_services_upload(monkeypatch, tmp_path):
+    """A FilePart uri with any scheme but http(s) is the service's own upload: handed back as-is,
+    nothing streamed or written."""
+    store = FakeObjectStore()
+    set_object_store(store)
+    uploaded = store.put("snapshots/gdrive.zip", b"PK\x03\x04")
+    _serve_filepart_uri(monkeypatch, uploaded)
+
+    out = tmp_path / "export-tmp"
+    result = await SnapshotEnvTaskStep._export_environment_to_file("https://gw", "gdrive", str(out), 30)
+
+    assert result == uploaded
+    assert not out.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upload_url", ["fake://home/snapshots/gdrive#v2.zip", "fake://shared/snapshots/gdrive#v2.zip"])
+async def test_core_registers_a_service_upload_in_place_and_it_loads_back(local_stores, monkeypatch, tmp_path, upload_url):
+    """Registered where the service put it, in the store's own root or anywhere else the store
+    can read (no re-upload), named by the url's last segment so a '#' survives (urlparse would
+    end the path there), and readable through the store."""
+    store = FakeObjectStore()
+    set_object_store(store)
+    reset_artifact_store()
+    bundle_file = tmp_path / "bundle.zip"
+    bundle_file.write_bytes(b"PK\x03\x04bundle")
+    uploaded = store.put_file_at(upload_url, str(bundle_file))
+
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
+        return uploaded
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "_export_environment_to_file", staticmethod(fake_export))
+
+    result = await SnapshotEnvTaskStep.snapshot_env_state(
+        env=_FakeMultiEnv(["gdrive"]), gateway_url="https://gw", snapshot_id="snap-g",
+    )
+
+    (bundle,) = EnvironmentUniverseArtifact.get(result.environment_universe_artifact_id).get_file_artifacts().values()
+    assert bundle.object_url == uploaded
+    assert bundle.filename == "gdrive#v2.zip"
+    assert bundle.content_type == "application/zip"
+    assert bundle.load() == b"PK\x03\x04bundle"
+    assert list(store.objects) == [uploaded]
+
+
+@pytest.mark.asyncio
+async def test_core_fails_a_service_whose_upload_the_store_cannot_find(local_stores, monkeypatch):
+    set_object_store(FakeObjectStore())
+    reset_artifact_store()
+
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
+        return "fake://shared/snapshots/missing.zip"
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "_export_environment_to_file", staticmethod(fake_export))
+
+    with pytest.raises(RuntimeError, match="failed to register the uploaded bundle"):
+        await SnapshotEnvTaskStep.snapshot_env_state(
+            env=_FakeMultiEnv(["gdrive"]), gateway_url="https://gw", snapshot_id="snap-g",
+        )
+
+
 @pytest.mark.asyncio
 async def test_export_service_to_file_filepart_without_bytes_or_uri_raises_valueerror(
     monkeypatch, tmp_path
@@ -687,7 +846,7 @@ async def test_export_service_to_file_filepart_without_bytes_or_uri_raises_value
     async def fake_get_data(base_url, timeout=None):
         return GetDataResponse(parts=[part])
 
-    async def fake_get_card(base_url):
+    async def fake_get_card(base_url, timeout=10):
         return {}  # no s3-credentials extension -> _push_s3_credentials no-ops
 
     monkeypatch.setattr(protocol_v1, "supports_v1", fake_supports_v1)
@@ -700,8 +859,90 @@ async def test_export_service_to_file_filepart_without_bytes_or_uri_raises_value
         )
 
 
+@pytest.mark.asyncio
+async def test_export_reads_the_child_env_from_the_stored_card(monkeypatch, tmp_path):
+    """A child env on the stored card: S3 creds and data/get go to the card's address, with no card read."""
+    from agent_env.task_step.task_steps import snapshot_env as mod
+
+    s3_ext = {"uri": "urn:agentenv:add-s3-credentials/v1",
+              "params": {"endpoint": "/agentenv/ext/add_s3_credentials", "methods": {"add_s3_credentials": {"method": "POST"}}}}
+    record = _carded(await _card({"mcp-gdrive": [s3_ext]}))
+    sent = _mock_http(monkeypatch, rpc_result={"parts": [{"kind": "file", "file": {"uri": "export-snapshot", "name": "gdrive.zip"}}]},
+                      body=b"PK\x03\x04card-bundle")
+    _fake_aws(monkeypatch)
+
+    out = str(tmp_path / "export-tmp")
+    suffix = await mod.SnapshotEnvTaskStep._export_environment_to_file("https://gw-1", "gdrive", out, 30, record)
+
+    assert suffix == ".zip"
+    assert [(r.method, str(r.url)) for r in sent] == [
+        ("POST", f"{_CARD}/svc/mcp-gdrive/agentenv/ext/add_s3_credentials"),
+        ("POST", f"{_CARD}/svc/mcp-gdrive/agentenv"),
+        ("GET", f"{_CARD}/svc/mcp-gdrive/export-snapshot"),
+    ]
+    assert json.loads(sent[0].content) == {"aws_access_key_id": "AK", "aws_secret_access_key": "SK", "aws_session_token": None,
+                                           "region_name": None, "bucket": "bucket"}
+    assert json.loads(sent[1].content)["method"] == "data/get"
+    with open(out, "rb") as f:
+        assert f.read() == b"PK\x03\x04card-bundle"
+
+
+@pytest.mark.asyncio
+async def test_export_of_a_child_env_missing_from_the_card_streams_legacy_export_state(monkeypatch, tmp_path):
+    from agent_env.task_step.task_steps import snapshot_env as mod
+
+    # gdrive serves no card, so the gateway leaves it out of the composed card.
+    record = _carded(await _card({"mcp-slack": []}))
+    sent = _mock_http(monkeypatch, body=b'{"files": []}')
+
+    out = str(tmp_path / "export-tmp")
+    suffix = await mod.SnapshotEnvTaskStep._export_environment_to_file("https://gw-1", "gdrive", out, 30, record)
+
+    assert suffix == ".json"
+    assert [(r.method, str(r.url)) for r in sent] == [("GET", "https://gw-1/svc/mcp-gdrive/export-state")]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_uses_the_stored_card_only_for_the_deployments_own_gateway(monkeypatch):
+    seen = []
+
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
+        seen.append((gateway_url, deployed))
+        raise ValueError("stop after the export call")
+
+    monkeypatch.setattr(SnapshotEnvTaskStep, "_export_environment_to_file", staticmethod(fake_export))
+    record = _carded({"name": "gw", "children_environments": []})
+    record.gateway_url = "https://gw-1/"
+    for gateway_url in ("https://gw-1/", "https://elsewhere"):
+        with pytest.raises(RuntimeError, match="not exported"):
+            await SnapshotEnvTaskStep.snapshot_env_state(
+                env=_FakeMultiEnv(["slack"]), gateway_url=gateway_url, snapshot_id="snap-x", deployed=record,
+            )
+
+    assert seen == [("https://gw-1", record), ("https://elsewhere", None)]
+
+
+@pytest.mark.asyncio
+async def test_export_with_a_record_that_has_no_stored_card_keeps_the_live_probe(monkeypatch, tmp_path):
+    import dataclasses
+
+    from agent_env.task_step.task_steps import snapshot_env as mod
+
+    record = dataclasses.replace(_carded({}), environment_card=None)
+    sent = _mock_http(monkeypatch, rpc_result={"parts": [{"kind": "data", "data": {"rows": 1}}]}, body=b'{"name": "gdrive", "url": "/agentenv"}')
+
+    suffix = await mod.SnapshotEnvTaskStep._export_environment_to_file("https://gw-1", "gdrive", str(tmp_path / "out"), 30, record)
+
+    assert suffix == ".json"
+    assert [(r.method, str(r.url)) for r in sent] == [
+        ("GET", "https://gw-1/svc/mcp-gdrive/.well-known/agent-env.json"),
+        ("GET", "https://gw-1/svc/mcp-gdrive/.well-known/agent-env.json"),
+        ("POST", "https://gw-1/svc/mcp-gdrive/agentenv"),
+    ]
+
+
 def test_enumerate_services_single_mcp_server_env():
-    env = _FakeServiceEnv("calendar", version=2)
+    env = _FakeServiceEnv("calendar")
     env.id, env.version = "cal-env", 1
     assert SnapshotEnvTaskStep._enumerate_environments(env) == ["calendar"]
 
@@ -758,7 +999,7 @@ def test_resolve_loaded_universe_ref_none_when_instance_never_loaded(monkeypatch
 def _install_core_artifact_fakes(monkeypatch, universe_cls):
     """Wire the export + FileArtifact/EnvironmentArtifact fakes shared by the core
     carry-over tests; the caller supplies the EnvironmentUniverseArtifact fake."""
-    async def fake_export(gateway_url, name, tmp_path, timeout):
+    async def fake_export(gateway_url, name, tmp_path, timeout, deployed=None):
         with open(tmp_path, "w") as f:
             json.dump({"ok": name}, f)
         return ".json"
@@ -925,3 +1166,60 @@ async def test_core_explicit_bad_original_id_fails_fast(monkeypatch):
             snapshot_id="snap-x",
             deployed=_deployed(),
         )
+
+
+# The card's address differs from gateway_url, so an export that reads the card is told apart from one that builds /svc/... itself.
+_CARD = "https://sandbox.example/sandbox/sb-1-18765"
+
+
+async def _card(children: dict[str, list]) -> dict:
+    """The real gateway's composed card, with a v1 backing server behind each key and the given extensions."""
+    from agent_env.env.gateway.gateway import Gateway
+
+    gw = Gateway(host="127.0.0.1", port=0, server_name="env1234", internal_mcp_servers=[],
+                 rest_proxy_urls={key: f"http://{key}:18765" for key in children})
+
+    async def fetch(client, key, base_url):
+        card = {"name": key.removeprefix("mcp-"), "url": "/agentenv", "capabilities": {"extensions": children[key]}}
+        return gw._rewrite_child_card(key, card)
+
+    gw._fetch_child_card = fetch
+    return json.loads((await gw._serve_env_card()).body)
+
+
+def _carded(card: dict) -> DeployedEnv:
+    from agent_env.env.gateway.constants import WELL_KNOWN_PATH
+
+    return DeployedGatewayEnv(
+        env_id="env-1", env_version=3, gateway_url="https://gw-1", mcp_url="https://gw-1/mcp", db_web_url=None,
+        sandbox_id="sb-1", environment_card_url=f"{_CARD}{WELL_KNOWN_PATH}", environment_card=card,
+    )
+
+
+def _mock_http(monkeypatch, *, rpc_result: dict | None = None, body: bytes = b"{}"):
+    """Record every request: JSON-RPC calls get `rpc_result`, extension calls an empty object, anything else `body`."""
+    import httpx
+
+    sent, real = [], httpx.AsyncClient
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.url.path.endswith("/agentenv"):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": rpc_result or {"parts": []}})
+        if "/ext/" in request.url.path:
+            return httpx.Response(200, json={})
+        return httpx.Response(200, content=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle)))
+    return sent
+
+
+class _SharingS3Store(S3ObjectStore):
+    def shared_credentials_env(self) -> dict[str, str]:
+        return {"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "SK"}
+
+
+def _fake_aws(monkeypatch):
+    """An S3 object store that shares AWS creds, so the S3-credentials push actually sends."""
+    store = _SharingS3Store(client=object(), bucket="bucket")
+    monkeypatch.setattr(snapshot_mod, "get_config", lambda: type("Cfg", (), {"get_object_store": lambda self: store})())

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+import httpx
 import pytest
 
 from agent_env.task_step.snapshot_utils import agent_state_capture as mod
@@ -111,7 +113,7 @@ async def test_raises_on_an_http_error(monkeypatch):
     rec = install_capture_stubs(monkeypatch)
     rec.save_status = 500
     rec.save_body = {"detail": "boom"}
-    with pytest.raises(RuntimeError, match="snapshot save failed: 500"):
+    with pytest.raises(httpx.HTTPStatusError, match="snapshot save failed with HTTP 500: .*boom"):
         await _capture()
 
 
@@ -136,6 +138,15 @@ async def test_a_prefix_outside_the_issued_one_is_never_registered(monkeypatch, 
     assert result.bundle_object_url == issued
     assert "someone/elses/run" not in result.bundle_object_url
     assert "echoed a prefix outside the one issued" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_capture_is_issued_under_the_fixture_prefix(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    rec.key_prefix = "fx/"
+    result = await _capture()
+    assert rec.save_requests[0]["json"]["s3_prefix"].startswith(f"s3://{BUCKET}/fx/agent_snapshots/wsp/")
+    assert result.capture_prefix.startswith(f"s3://{BUCKET}/fx/agent_snapshots/wsp/")
 
 
 @pytest.mark.asyncio
@@ -164,10 +175,126 @@ async def test_a_flat_echo_registers_the_issued_prefix_unchanged(monkeypatch, ca
     assert "outside the one issued" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_snapshot_save_prefers_advertised_object_mode(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    rec.save_body = {
+        "context_id": "ctx-1",
+        "objects": {
+            "trajectory": {"size_bytes": 12},
+            "workspace": {"size_bytes": 34},
+        },
+    }
+    card = agent_card(
+        snapshot={
+            "methods": {
+                "save": {
+                    "request": {
+                        "required": ["context_id"],
+                        "oneOf": [
+                            {"required": ["s3_prefix"]},
+                            {"required": ["objects"]},
+                        ],
+                    }
+                }
+            }
+        }
+    )
+
+    result = await _capture(a2a_card=card)
+
+    sent = rec.save_requests[0]["json"]
+    assert set(sent) == {"context_id", "objects"}
+    assert set(sent["objects"]) == {"trajectory", "workspace"}
+    assert not rec.object_store.signed_posts
+    assert {
+        grant["object_url"].rsplit("/", 1)[-1]
+        for grant in rec.object_store.write_grants
+    } == {"trajectory", "workspace"}
+    assert result.bundle_object_url == result.capture_prefix
+
+
+@pytest.mark.asyncio
+async def test_snapshot_save_requires_every_supplied_object(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    rec.object_store.withheld = {"workspace"}
+    rec.save_body = {
+        "context_id": "ctx-1",
+        "objects": {
+            "trajectory": {"size_bytes": 12},
+            "workspace": {"size_bytes": 34},
+        },
+    }
+    card = agent_card(
+        snapshot={
+            "methods": {
+                "save": {
+                    "request": {"required": ["context_id", "objects"]}
+                }
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=r"left \['workspace'\] out of the object store"):
+        await _capture(a2a_card=card)
+    assert not rec.universes
+
+
+def _save_card(*variants: list[str]) -> dict:
+    return agent_card(
+        snapshot={
+            "methods": {
+                "save": {
+                    "request": {
+                        "required": ["context_id"],
+                        "oneOf": [{"required": fields} for fields in variants],
+                    }
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_save_takes_the_legacy_shape_on_a_store_without_grants(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    monkeypatch.setattr(rec.object_store, "supports_transfer_grants", False)
+
+    await _capture(a2a_card=_save_card(["s3_prefix"], ["objects"]))
+
+    assert "s3_prefix" in rec.save_requests[0]["json"]
+    assert rec.object_store.write_grants == []
+
+
+@pytest.mark.asyncio
+async def test_an_objects_only_save_on_a_store_without_grants_is_refused(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    monkeypatch.setattr(rec.object_store, "supports_transfer_grants", False)
+
+    with pytest.raises(RuntimeError, match="no snapshot save form"):
+        await _capture(a2a_card=_save_card(["objects"]))
+
+    assert rec.save_requests == []
+
+
 # ---- read_partial_trajectory ------------------------------------------------
 
+PARTIAL_PREFIX = f"s3://{BUCKET}/partial-trajectories/run-1/"
+CONTEXT_OBJECTS_GET = {
+    "request": {
+        "oneOf": [
+            {"required": ["context_id"]},
+            {"required": ["context_id", "objects"]},
+        ]
+    }
+}
+
+
 async def _read(card, **overrides):
-    kwargs = dict(a2a_url="https://agent", a2a_card=card, context_id="ctx-1", timeout_seconds=30)
+    kwargs = dict(
+        a2a_url="https://agent", a2a_card=card, context_id="ctx-1", timeout_seconds=30,
+        trajectory_output_prefix=PARTIAL_PREFIX,
+    )
     kwargs.update(overrides)
     return await mod.read_partial_trajectory(**kwargs)
 
@@ -183,6 +310,50 @@ async def test_reads_the_trajectory_keyed_on_context_id(monkeypatch):
     assert sent["json"] == {"context_id": "ctx-1"}
     assert result.trajectory == [{"role": "user"}]
     assert result.reason is None
+
+
+@pytest.mark.asyncio
+async def test_context_trajectory_prefers_advertised_object_mode(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    rec.trajectory_body = {
+        "objects": {"trajectory": {"size_bytes": 42}}
+    }
+
+    result = await _read(agent_card(trajectory=CONTEXT_OBJECTS_GET))
+
+    assert result.trajectory is None
+    assert result.reason is None
+    assert result.object_url.startswith(f"{PARTIAL_PREFIX}trajectory-")
+    sent = rec.trajectory_requests[0]["json"]
+    assert sent["context_id"] == "ctx-1"
+    assert sent["objects"]["trajectory"]["write"]["kind"] == "http-put"
+
+
+@pytest.mark.asyncio
+async def test_context_trajectory_is_inline_on_a_store_without_grants(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+    monkeypatch.setattr(rec.object_store, "supports_transfer_grants", False)
+
+    result = await _read(agent_card(trajectory=CONTEXT_OBJECTS_GET))
+
+    assert [r["json"] for r in rec.trajectory_requests] == [{"context_id": "ctx-1"}]
+    assert rec.object_store.write_grants == []
+    assert result.trajectory == [{"role": "user"}]
+
+
+@pytest.mark.asyncio
+async def test_a_grant_that_cannot_be_issued_is_a_reason_not_a_raise(monkeypatch):
+    rec = install_capture_stubs(monkeypatch)
+
+    def refuse(*args, **kwargs):
+        raise ValueError("cannot sign")
+
+    monkeypatch.setattr(rec.object_store, "issue_write_grant", refuse)
+
+    result = await _read(agent_card(trajectory=CONTEXT_OBJECTS_GET))
+
+    assert (result.reason, result.object_url) == ("trajectory_grant_unavailable", None)
+    assert rec.trajectory_requests == []
 
 
 @pytest.mark.parametrize(
@@ -249,7 +420,6 @@ async def test_a_degraded_read_is_a_reason_not_a_raise(monkeypatch, status, body
 @pytest.mark.asyncio
 async def test_a_transport_failure_is_a_reason_not_a_raise(monkeypatch):
     install_capture_stubs(monkeypatch)
-    import httpx
 
     async def boom(self, method, url, **kwargs):
         raise httpx.ConnectError("no route")

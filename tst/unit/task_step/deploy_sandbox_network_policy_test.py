@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent_env.providers.sandbox import NetworkMode, NetworkPolicy
+from agent_env.providers.sandbox_providers.sandbox import NetworkMode, NetworkPolicy
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
 
@@ -52,7 +52,7 @@ async def test_the_policy_reaches_both_create_paths(mode, create_call, extra):
     step = _step(sandbox_mode=mode, image="img", network_policy=ALLOWLIST, **extra)
     provider = AsyncMock()
     getattr(provider, create_call).return_value = _fake_sandbox()
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(TaskStepContext())
     passed = getattr(provider, create_call).await_args.kwargs["network_policy"]
     assert passed == NetworkPolicy(mode=NetworkMode.ALLOWLIST, allow_hosts=("llm-proxy.example.com",))
@@ -64,7 +64,7 @@ async def test_a_per_run_override_wins_over_the_step():
     provider = AsyncMock()
     provider.create_vm.return_value = _fake_sandbox()
     context = TaskStepContext(metadata={"user_overrides": {"network_policy": {"mode": "allowlist", "allow_hosts": ["override.example.com"]}}})
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(context)
     assert provider.create_vm.await_args.kwargs["network_policy"].allow_hosts == ("override.example.com",)
 
@@ -77,6 +77,6 @@ async def test_the_effective_policy_is_recorded_not_the_requested_one():
     provider = AsyncMock()
     provider.create_vm.return_value = _fake_sandbox(applied)
     context = TaskStepContext()
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(context)
     assert context.deployed_sandboxes[0].network_policy == applied.to_dict()

@@ -99,7 +99,6 @@ export type GeminiRecord =
  * Heuristic for "is this a Gemini-CLI trajectory?". Cheap shape check on
  * the first record; precise enough to disambiguate from:
  *   - OTel/OpenInference spans (have `.attributes`, no `.type`)
- *   - CUA trajectories (driven by `envType==='cua'` flag, not shape)
  *   - Claude Code CLI stream-json (`type:'system', subtype:'init'`)
  */
 export function looksLikeGeminiStreamJson(records: unknown[]): boolean {

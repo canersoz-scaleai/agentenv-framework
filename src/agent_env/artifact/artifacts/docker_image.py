@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import logging
 import os
@@ -21,7 +22,7 @@ from urllib.parse import urlparse
 from pydantic import Field
 
 from agent_env.artifact.artifact import Artifact
-from agent_env.store.ids import fs_safe, image_repository
+from agent_env.store.ids import fs_safe, image_repository, is_local_id
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ class DockerImageArtifact(Artifact):
         version = store.next_version(id)
 
         config = get_config()
-        image_store = config.get_image_store()
+        image_store = config.get_image_store_for(id)
         repository = image_repository(id)
         image_ref = image_store.image_ref(repository, f"v{version}")
         image_store.ensure_repository(repository)
@@ -169,7 +170,11 @@ class DockerImageArtifact(Artifact):
         build_context_s3_url: str | None = None,
     ) -> "DockerImageArtifact":
         from agent_env.artifact.store import get_artifact_store
+        from agent_env.config import get_config
 
+        for url in (tar_gz_s3_url, build_context_s3_url):
+            if url:
+                get_config().check_object_url(id, url)
         store = get_artifact_store()
         version = store.next_version(id)
         instance = cls(
@@ -208,6 +213,7 @@ class DockerImageArtifact(Artifact):
         from agent_env.providers import get_sandbox_provider
         from agent_env.config import get_config
 
+        refuse_local_github_build(id)
         log = on_progress or (lambda step, msg, pct: None)
 
         log("validate", "Parsing GitHub URLs...", 5)
@@ -235,9 +241,10 @@ class DockerImageArtifact(Artifact):
         store = get_artifact_store()
         version = store.next_version(id)
         image_store = config.get_image_store()
-        image_ref = image_store.image_ref(id, f"v{version}")
-        image_store.ensure_repository(id)
-        auth = image_store.auth(image_ref)
+        repository = image_repository(id)
+        image_ref = image_store.image_ref(repository, f"v{version}")
+        await asyncio.to_thread(image_store.ensure_repository, repository)
+        auth = await asyncio.to_thread(image_store.auth, image_ref)
 
         log("create_vm", "Creating VM...", 10)
         logger.info(f"put_from_github: cloning {owner}/{repo} ref={ref} dockerfile={dockerfile_repo_path} context={context_repo_path}")
@@ -285,7 +292,7 @@ class DockerImageArtifact(Artifact):
             object_store = config.get_object_store()
 
             def _signed_put(key: str) -> tuple[str, str]:
-                url = object_store.object_url(key)
+                url = object_store.object_url(f"{config.get_artifact_key_prefix()}{key}")
                 put = object_store.signed_put_url(url)
                 if put is None:
                     raise RuntimeError(
@@ -293,7 +300,7 @@ class DockerImageArtifact(Artifact):
                     )
                 return url, put
 
-            tar_gz_s3_url, image_put_url = _signed_put(f"github-builds/{id}/{image_tag}.tar.gz")
+            tar_gz_s3_url, image_put_url = await asyncio.to_thread(_signed_put, f"github-builds/{id}/{image_tag}.tar.gz")
             await sandbox.exec_script(f'curl -fsSL -X PUT --upload-file /tmp/image.tar.gz "{image_put_url}"')
 
             log("upload_context", "Uploading build context...", 80)
@@ -302,7 +309,9 @@ class DockerImageArtifact(Artifact):
             copy_sources = _parse_copy_sources(dockerfile_content, df_rel)
             tar_paths = " ".join(shlex.quote(p) for p in copy_sources)
             await sandbox.exec_script(f"tar czf /tmp/build-context.tar.gz -C {context_abs} {tar_paths}")
-            build_context_s3_url, context_put_url = _signed_put(f"github-builds/{id}/{image_tag}-context.tar.gz")
+            build_context_s3_url, context_put_url = await asyncio.to_thread(
+                _signed_put, f"github-builds/{id}/{image_tag}-context.tar.gz"
+            )
             await sandbox.exec_script(f'curl -fsSL -X PUT --upload-file /tmp/build-context.tar.gz "{context_put_url}"')
         finally:
             log("cleanup", "Terminating build VM...", 85)
@@ -363,6 +372,15 @@ class DockerImageArtifact(Artifact):
         ref = segments[3]
         path = "/".join(segments[4:]) if len(segments) > 4 else None
         return DockerImageArtifact._GitHubURLParts(owner=owner, repo=repo, ref=ref, path=path)
+
+
+def refuse_local_github_build(entity_id: str) -> None:
+    """A GitHub build publishes to the configured registry, so it takes a registry id; an ``@local``
+    image is built from its own Dockerfile."""
+    if is_local_id(entity_id):
+        raise ValueError(
+            f"{entity_id!r} is an @local id, but a GitHub build publishes to the configured registry; give it a registry id"
+        )
 
 
 @dataclass

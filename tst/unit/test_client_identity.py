@@ -54,11 +54,11 @@ def test_resolves_git_user_name_as_github_username(monkeypatch):
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
         assert kwargs["timeout"] == 2
-        return _completed(args, stdout="Alexander Schwartzman\n")
+        return _completed(args, stdout="Jane Doe\n")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_agent_env_client_id() == "agent-env-cli/alexander-schwartzman"
+    assert get_agent_env_client_id() == "agent-env-cli/jane-doe"
 
 
 def test_resolves_git_user_name_with_punctuation(monkeypatch):
@@ -138,8 +138,25 @@ def test_eval_run_single_passes_client_metadata_to_task(monkeypatch):
             self.metadata = metadata or {}
 
     context_module.TaskStepContext = FakeTaskStepContext
+    task_package = types.ModuleType("agent_env.task")
+    task_package.__path__ = []
+    teardown_module = types.ModuleType("agent_env.task.teardown")
+    torn_down = []
+
+    async def teardown_run(context):
+        torn_down.append(context)
+        return teardown_module.TeardownReport()
+
+    teardown_module.TeardownReport = lambda: types.SimpleNamespace(terminated=(), failed=(), left=())
+    teardown_module.teardown_run = teardown_run
+    teardown_module.kind = lambda sandbox: sandbox.sandbox_type
+    interrupts_module = types.ModuleType("agent_env.task.interrupts")
+    interrupts_module.Interrupts = object
     monkeypatch.setitem(sys.modules, "agent_env.task_step", task_step_package)
     monkeypatch.setitem(sys.modules, "agent_env.task_step.context", context_module)
+    monkeypatch.setitem(sys.modules, "agent_env.task", task_package)
+    monkeypatch.setitem(sys.modules, "agent_env.task.teardown", teardown_module)
+    monkeypatch.setitem(sys.modules, "agent_env.task.interrupts", interrupts_module)
     eval_run_module = _load_cli_run_module(
         monkeypatch,
         "src/agent_env/cli/eval/run.py",
@@ -178,3 +195,4 @@ def test_eval_run_single_passes_client_metadata_to_task(monkeypatch):
     assert context.metadata == {
         "agent_env_hub": {"caller": "agent-env-cli/alex-dev"}
     }
+    assert torn_down == [context]

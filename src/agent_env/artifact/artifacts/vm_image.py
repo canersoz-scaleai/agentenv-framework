@@ -13,23 +13,23 @@ class VMImageArtifact(Artifact):
     """A VM image artifact that references a pre-built VM image.
 
     Supports ECR containerdisk images (Ubuntu/Windows) and non-ECR images
-    (e.g. Orka images for macOS). At least one of ecr_url or image_name
+    (e.g. macOS). At least one of ecr_url or image_name
     must be provided.
 
     Unlike DockerImageArtifact, this does not upload anything to S3.
 
     Examples:
         # ECR-based (Ubuntu/Windows)
-        VMImageArtifact.put(id="cua-ubuntu", description="...", ecr_url="<account>.dkr.ecr.<region>.amazonaws.com/cua-ubuntu:1.0.4")
+        VMImageArtifact.put(id="ubuntu-vm", description="...", ecr_url="<account>.dkr.ecr.<region>.amazonaws.com/ubuntu-vm:1.0.4")
 
-        # Non-ECR (macOS Orka)
-        VMImageArtifact.put(id="cua-macos", description="...", image_name="tahoe-cua", os="macos")
+        # Non-ECR (macOS)
+        VMImageArtifact.put(id="macos-vm", description="...", image_name="macos-base", os="macos")
     """
 
     type: Literal["vm_image"] = "vm_image"
     description: str = Field(description="Human-readable description of the VM image")
     ecr_url: Optional[str] = Field(default=None, description="Full ECR URL for the containerdisk image")
-    image_name: Optional[str] = Field(default=None, description="Image name for non-ECR registries (e.g. Orka)")
+    image_name: Optional[str] = Field(default=None, description="Image name for non-ECR registries")
     os: Optional[str] = Field(default=None, description="OS identifier (e.g. 'macos') — only needed when the sandbox API requires it")
     disk_size_gb: Optional[float] = Field(
         default=None,

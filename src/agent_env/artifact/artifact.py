@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent_env.entity_refs import EntityRef
+
 if TYPE_CHECKING:
+    from agent_env.bundle.authoring import AuthoringContext
     from agent_env.artifact.ref import ArtifactRef
     from agent_env.artifact.store import ArtifactQuery
 
@@ -17,6 +20,8 @@ class Artifact(BaseModel):
     id: str = Field(description="Unique artifact identifier")
     version: int = Field(default=0, description="Artifact version (auto-calculated on put)")
     type: str = Field(description="The type of Artifact")
+
+    toml_refs: ClassVar[tuple[EntityRef, ...]] = ()
 
     @field_validator("type", mode="before")
     @classmethod
@@ -38,16 +43,29 @@ class Artifact(BaseModel):
 
     @classmethod
     def get(cls, id: str, version: Optional[int] = None) -> Self:
+        """The artifact stored under ``id``, which must be a ``cls``: the store builds the class
+        its stored type names, so ``FileArtifact.get`` refuses an id that holds another type."""
         from agent_env.artifact.store import get_artifact_store
 
-        return get_artifact_store().get(id, version)
+        artifact = get_artifact_store().get(id, version)
+        if not isinstance(artifact, cls):
+            raise TypeError(f"artifact {id!r} is a {artifact.type!r} artifact, not a {cls.__name__}")
+        return artifact
 
     @classmethod
-    def put(cls, **kwargs) -> Self:
+    def put(cls, **kwargs: Any) -> Self:
         from agent_env.artifact.store import get_artifact_store
 
         instance = cls(**kwargs)
         return get_artifact_store().put_document(instance)
+
+    @classmethod
+    def from_toml(cls, data: dict[str, Any], ctx: AuthoringContext) -> Self:
+        """Write the artifact authored as ``data`` (its toml, with the keys ``toml_refs`` declares
+        resolved to ids) under ``ctx.id`` and return it. The default suits a type that is only a
+        document; one whose ``put`` uploads files or images overrides this."""
+        fields = {key: value for key, value in data.items() if key not in ("id", "type", "version")}
+        return cls.put(id=ctx.id, **fields)
 
     @classmethod
     def query(cls) -> "ArtifactQuery":

@@ -8,6 +8,8 @@ currently spread across the individual ``*/store.py`` modules.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Optional
 
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -104,6 +106,16 @@ def _to_mongo_update(update: UpdateSpec) -> dict:
     return mongo
 
 
+@contextmanager
+def _unique_violations() -> Iterator[None]:
+    """pymongo's duplicate-key error, as the store's own. An upsert can raise it as well as an
+    insert: two concurrent upserts both miss, and the second one's insert collides."""
+    try:
+        yield
+    except PyMongoDuplicateKeyError as e:
+        raise DuplicateKeyError(str(e)) from e
+
+
 def _strip_id(doc: Optional[dict]) -> Optional[dict]:
     if doc is not None:
         doc.pop("_id", None)
@@ -178,17 +190,16 @@ class MongoDocumentStore(DocumentStore):
         return self._c(collection).count_documents(_to_mongo_filter(filter))
 
     def insert(self, collection: str, doc: dict) -> None:
-        try:
+        with _unique_violations():
             self._c(collection).insert_one(dict(doc))
-        except PyMongoDuplicateKeyError as e:
-            raise DuplicateKeyError(str(e)) from e
 
     def update(
         self, collection: str, filter: Filter, update: UpdateSpec, upsert: bool = False
     ) -> int:
-        result = self._c(collection).update_one(
-            _to_mongo_filter(filter), _to_mongo_update(update), upsert=upsert
-        )
+        with _unique_violations():
+            result = self._c(collection).update_one(
+                _to_mongo_filter(filter), _to_mongo_update(update), upsert=upsert
+            )
         if result.upserted_id is not None:
             return 1
         return result.matched_count
@@ -201,20 +212,22 @@ class MongoDocumentStore(DocumentStore):
         return_after: bool = True,
         upsert: bool = False,
     ) -> Optional[dict]:
-        doc = self._c(collection).find_one_and_update(
-            _to_mongo_filter(filter),
-            _to_mongo_update(update),
-            return_document=ReturnDocument.AFTER if return_after else ReturnDocument.BEFORE,
-            upsert=upsert,
-        )
+        with _unique_violations():
+            doc = self._c(collection).find_one_and_update(
+                _to_mongo_filter(filter),
+                _to_mongo_update(update),
+                return_document=ReturnDocument.AFTER if return_after else ReturnDocument.BEFORE,
+                upsert=upsert,
+            )
         return _strip_id(doc)
 
     def replace(
         self, collection: str, filter: Filter, doc: dict, upsert: bool = False
     ) -> int:
-        result = self._c(collection).replace_one(
-            _to_mongo_filter(filter), dict(doc), upsert=upsert
-        )
+        with _unique_violations():
+            result = self._c(collection).replace_one(
+                _to_mongo_filter(filter), dict(doc), upsert=upsert
+            )
         if result.upserted_id is not None:
             return 1
         return result.matched_count

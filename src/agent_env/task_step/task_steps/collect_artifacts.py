@@ -8,7 +8,7 @@ File-access modes:
     agent's container on a VM-mode sandbox.
   - VM host (`sandbox_name` alone): read straight off the VM, for a host-mode agent.
   - CUA (`env_id` set): read files via the CUA controller's `cua_get_file`
-    over the deployed env's gateway_url (the same path cua_evaluate uses).
+    over the gateway's step/v1, as the deployed env's stored card declares it.
     Required for CUA tasks, where deliverables live on the desktop VM (e.g.
     /home/docker/Desktop) which is NOT mounted into the a2a `agent-api`
     container — so the docker-exec path reports "File not found".
@@ -67,6 +67,7 @@ base directory is assumed):
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import json
@@ -76,9 +77,11 @@ import tempfile
 import time
 from typing import ClassVar, Optional
 
+from agent_env.env.gateway.constants import EXT_STEP_URI
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
+from agent_env.task_step.thread_work import finish_on_thread
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +141,7 @@ def _sanitize_artifact_id(value: str) -> str:
 
 def _exec_args(sandbox, container: Optional[str], cmd: tuple) -> tuple:
     """Wrap a command for where it has to run: inside the container, on the VM host as root, or as-is."""
-    from agent_env.providers.sandbox_provider import SANDBOX_MODE_VM
+    from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_VM
     if sandbox.mode != SANDBOX_MODE_VM:
         return cmd  # container-mode sandboxes are the runtime and already root
     if container is not None:
@@ -167,6 +170,30 @@ def _cua_bash_stdout(text: str) -> str:
     if not isinstance(payload, dict) or "output" not in payload:
         return text
     return payload.get("output") or ""
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _write_and_upload(store, content: bytes, artifact_id: str, version: int, object_name: str, content_type: str) -> str:
+    """Stage ``content`` in a temp file, upload it as a collected artifact and remove the file."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"-{object_name.replace('/', '_')}") as tmp:
+        tmp.write(content)
+    try:
+        return store.put_object_file(
+            artifact_type="collected_artifacts",
+            id=artifact_id,
+            version=version,
+            object_name=object_name,
+            file_path=tmp.name,
+            content_type=content_type,
+        )
+    finally:
+        _remove(tmp.name)
 
 
 class CollectArtifactsTaskStep(TaskStep):
@@ -444,6 +471,7 @@ class CollectArtifactsTaskStep(TaskStep):
         args = _exec_args(sandbox, container, ("bash", "-c", bash_cmd))
 
         local_path = None
+        handed_off = False
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=f"-{object_name.replace('/', '_')}") as tmp:
                 local_path = tmp.name
@@ -486,30 +514,35 @@ class CollectArtifactsTaskStep(TaskStep):
                     f"source is {src_size} (exec-channel truncation) — refusing to upload a corrupt artifact"
                 )
 
-            return store.put_object_file(
-                artifact_type="collected_artifacts",
-                id=artifact_id,
-                version=version,
-                object_name=object_name,
-                file_path=local_path,
-                content_type=content_type,
+            path = local_path
+
+            def upload() -> str:
+                try:
+                    return store.put_object_file(
+                        artifact_type="collected_artifacts",
+                        id=artifact_id,
+                        version=version,
+                        object_name=object_name,
+                        file_path=path,
+                        content_type=content_type,
+                    )
+                finally:
+                    _remove(path)
+
+            # The upload owns the file from here: a cancel must not remove it under the upload.
+            handed_off = True
+            return await finish_on_thread(
+                upload, f"Uploading collected {source_path}", if_never_run=lambda: _remove(path)
             )
         finally:
-            if local_path and os.path.exists(local_path):
-                os.unlink(local_path)
+            if local_path and not handed_off:
+                _remove(local_path)
 
-    async def _controller_call(self, gateway_url: str, tool_name: str, arguments: dict) -> str:
-        """Call a CUA MCP tool via the gateway /step API. Returns the text content."""
-        import httpx
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{gateway_url}/step",
-                json={"action": "call_tool", "tool_name": tool_name, "arguments": arguments},
-                timeout=600,
-            )
-            response.raise_for_status()
-            data = response.json()
+    async def _controller_call(self, deployed_env, tool_name: str, arguments: dict) -> str:
+        """Call a CUA MCP tool through the gateway's step/v1, as the env card declares it. Returns the text content."""
+        data = await deployed_env.invoke(
+            EXT_STEP_URI, "step", {"action": "call_tool", "tool_name": tool_name, "arguments": arguments}, timeout=600,
+        )
         if data.get("isError"):
             raise RuntimeError(f"{tool_name} failed: {data}")
         content = data.get("content")
@@ -517,20 +550,20 @@ class CollectArtifactsTaskStep(TaskStep):
             raise RuntimeError(f"{tool_name} returned no content: {data}")
         return content[0].get("text", "")
 
-    async def _controller_get_file(self, gateway_url: str, path: str) -> bytes:
+    async def _controller_get_file(self, deployed_env, path: str) -> bytes:
         """Fetch a file from the CUA VM as raw bytes (controller returns base64)."""
         import base64
 
-        b64 = await self._controller_call(gateway_url, "cua_get_file", {"path": path})
+        b64 = await self._controller_call(deployed_env, "cua_get_file", {"path": path})
         return base64.b64decode(b64)
 
-    async def _controller_list_dir(self, gateway_url: str) -> list[str]:
+    async def _controller_list_dir(self, deployed_env) -> list[str]:
         """Recursively enumerate regular files under base_path via cua_bash.
         Returns paths relative to base_path. Fallback when no explicit list
         was configured."""
         script = f"find {shlex.quote(self.base_path)} -type f -printf '%P\\n'"
         try:
-            out = await self._controller_call(gateway_url, "cua_bash", {"script": script})
+            out = await self._controller_call(deployed_env, "cua_bash", {"script": script})
         except Exception as e:
             logger.warning(f"Failed to enumerate {self.base_path} via controller: {e}")
             return []
@@ -555,6 +588,8 @@ class CollectArtifactsTaskStep(TaskStep):
                 f"cua_* controller calls against a non-CUA gateway. collect_artifacts with `env_id` "
                 f"set is only valid for CUA envs; omit `env_id` to use the agent-container path."
             )
+        # Up front: enumeration swallows errors into [], so a missing step/v1 would become a silent empty collect.
+        deployed_env.require(EXT_STEP_URI, "step")
         return deployed_env
 
     def _resolve_paths(self, entry: str) -> tuple[str, str]:
@@ -571,11 +606,10 @@ class CollectArtifactsTaskStep(TaskStep):
 
         deployed_env = self._resolve_cua_env(context)
         # Read files via the CUA MCP server (cua_get_file / cua_bash) over the
-        # gateway's /step. These are MCP tools registered on the gateway on both
+        # gateway's step/v1. These are MCP tools registered on the gateway on both
         # Ubuntu and macOS — NOT endpoints on the macOS controller sidecar, whose
         # /step only accepts a ScaleCuaAction and 500s on a call_tool payload.
-        gateway_url = deployed_env.gateway_url
-        logger.info(f"Collecting artifacts via CUA MCP server (env_id={self.env_id}, gateway={gateway_url})")
+        logger.info(f"Collecting artifacts via CUA MCP server (env_id={self.env_id}, gateway={deployed_env.environment_url})")
 
         items = self._resolve_items(context)
         if not items:
@@ -587,7 +621,7 @@ class CollectArtifactsTaskStep(TaskStep):
             if self._configured_entries(context):
                 logger.info(f"collect '{self.id}': every configured entry is a URL; nothing to read from the VM")
                 return {}, {}
-            enumerated = self._drop_excluded(await self._controller_list_dir(gateway_url))
+            enumerated = self._drop_excluded(await self._controller_list_dir(deployed_env))
             if not enumerated:
                 logger.warning(
                     f"No artifact filenames resolved and {self.base_path} is empty — nothing to collect"
@@ -605,7 +639,7 @@ class CollectArtifactsTaskStep(TaskStep):
         file_artifacts: dict[str, FileArtifact] = {}
         for key, source_path, object_name in items:
             try:
-                content = await self._controller_get_file(gateway_url, source_path)
+                content = await self._controller_get_file(deployed_env, source_path)
             except Exception as e:
                 logger.warning(f"Failed to read {source_path} via controller: {e}")
                 continue
@@ -614,23 +648,12 @@ class CollectArtifactsTaskStep(TaskStep):
             content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
 
             try:
-                local_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"-{object_name.replace('/', '_')}") as tmp:
-                        local_path = tmp.name
-                    with open(local_path, "wb") as fh:
-                        fh.write(content)
-                    s3_url = store.put_object_file(
-                        artifact_type="collected_artifacts",
-                        id=artifact_id,
-                        version=version,
-                        object_name=object_name,
-                        file_path=local_path,
-                        content_type=content_type,
-                    )
-                finally:
-                    if local_path and os.path.exists(local_path):
-                        os.unlink(local_path)
+                s3_url = await finish_on_thread(
+                    functools.partial(
+                        _write_and_upload, store, content, artifact_id, version, object_name, content_type,
+                    ),
+                    f"Uploading collected {source_path}",
+                )
 
                 collected[key] = s3_url
                 self._register_file_artifact(
@@ -644,7 +667,7 @@ class CollectArtifactsTaskStep(TaskStep):
         return collected, file_artifacts
 
     async def _collect_via_agent_container(self, context, store, artifact_id, version):
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
             build_sandbox_provider,
             get_agent_sandbox_provider,
@@ -681,7 +704,7 @@ class CollectArtifactsTaskStep(TaskStep):
 
     async def _collect_via_vm_host(self, context, store, artifact_id, version):
         """Collect off the VM's own filesystem — host-mode agents leave no container to exec into."""
-        from agent_env.providers.sandbox_provider import build_sandbox_provider, get_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_sandbox_provider
 
         ds = next(
             (sb for sb in context.deployed_sandboxes if sb.sandbox_name == self.sandbox_name), None
@@ -714,7 +737,7 @@ class CollectArtifactsTaskStep(TaskStep):
         image had no way to get its files out. Here the (sandbox, container) pair is named
         explicitly and resolved exactly as ``load_artifact`` resolves it.
         """
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             build_sandbox_provider,
             get_sandbox_provider,
         )

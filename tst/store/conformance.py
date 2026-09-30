@@ -6,6 +6,10 @@ Each function takes ``(store, coll)`` and exercises one behavior of the
 is the concrete "the abstraction generalizes" guarantee.
 """
 
+import contextvars
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from agent_env.store import (
@@ -19,7 +23,11 @@ from agent_env.store import (
     Sort,
     UpdateSpec,
     VersionedEntityStore,
+    compare_and_swap,
 )
+
+# Enough concurrent writers on one document that some of them race.
+_RACERS = 8
 
 
 def insert_find_one_strips_id(store, coll):
@@ -34,6 +42,19 @@ def ensure_index_unique_rejects_duplicate(store, coll):
     store.insert(coll, {"id": "a", "version": 1})
     with pytest.raises(DuplicateKeyError):
         store.insert(coll, {"id": "a", "version": 1})
+
+
+def ensure_index_unique_on_other_fields_rejects_duplicate(store, coll):
+    store.ensure_index(coll, ["instance_id", "step_id"], unique=True)
+    store.insert(coll, {"instance_id": "i", "step_id": "a"})
+    store.insert(coll, {"instance_id": "i", "step_id": "b"})
+    with pytest.raises(DuplicateKeyError):
+        store.insert(coll, {"instance_id": "i", "step_id": "a", "seq": 2})
+    assert store.update(coll, Filter.of(instance_id="i", step_id="b"), UpdateSpec(set={"seq": 1})) == 1
+    assert store.query(coll, Filter.of(instance_id="i"), sort=Sort.by("step_id", descending=False)) == [
+        {"instance_id": "i", "step_id": "a"},
+        {"instance_id": "i", "step_id": "b", "seq": 1},
+    ]
 
 
 def ensure_index_non_unique_allows_duplicate(store, coll):
@@ -179,6 +200,21 @@ def update_upsert_synthesizes_from_filter(store, coll):
     assert store.find_one(coll, Filter.of(id="c", version=1)) == {"id": "c", "version": 1, "w": 1}
 
 
+def upsert_colliding_with_a_unique_index_raises_duplicate_key(store, coll):
+    """What losing a concurrent upsert race looks like: the filter misses, and the document the
+    upsert then inserts collides with one another writer already inserted."""
+    store.ensure_index(coll, ["id", "version"], unique=True)
+    store.insert(coll, {"id": "a", "version": 1, "state": "held"})
+    missing = Filter.of(id="a", version=1, state="free")
+    with pytest.raises(DuplicateKeyError):
+        store.update(coll, missing, UpdateSpec(set={"owner": "x"}), upsert=True)
+    with pytest.raises(DuplicateKeyError):
+        store.update_one_and_get(coll, missing, UpdateSpec(set={"owner": "x"}), upsert=True)
+    with pytest.raises(DuplicateKeyError):
+        store.replace(coll, missing, {"id": "a", "version": 1, "state": "free"}, upsert=True)
+    assert store.find_one(coll, Filter.of(id="a", version=1)) == {"id": "a", "version": 1, "state": "held"}
+
+
 def delete(store, coll):
     store.insert(coll, {"id": "a", "version": 1})
     assert store.delete(coll, Filter.of(id="a", version=1)) == 1
@@ -318,9 +354,80 @@ def latest_per_id_honours_custom_fields(store, coll):
     assert store.count_distinct(coll, Filter(), id_field="eid") == 2
 
 
+def _race(work):
+    """Run ``work(racer)`` for every racer at once, each in a copy of the caller's context (so a
+    run scope set around the case still applies), and return the results in racer order."""
+    start = threading.Barrier(_RACERS)
+
+    def run(racer):
+        start.wait()
+        return work(racer)
+
+    with ThreadPoolExecutor(max_workers=_RACERS) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, run, racer) for racer in range(_RACERS)]
+        return [f.result() for f in futures]
+
+
+_UNCLAIMED = Filter.of(id="x").where("owner", AbsentOrNull())
+
+
+def racing_guarded_updates_have_exactly_one_winner(store, coll):
+    """Writers race to claim one document; each is told whether its own write landed."""
+    store.insert(coll, {"id": "x"})
+    won = _race(lambda racer: store.update(coll, _UNCLAIMED, UpdateSpec(set={"owner": racer})))
+    assert sorted(won) == [0] * (_RACERS - 1) + [1]
+    assert store.find_one(coll, Filter.of(id="x")) == {"id": "x", "owner": won.index(1)}
+
+
+def racing_guarded_replaces_have_exactly_one_winner(store, coll):
+    store.insert(coll, {"id": "x"})
+    won = _race(lambda racer: store.replace(coll, _UNCLAIMED, {"id": "x", "owner": racer}))
+    assert sorted(won) == [0] * (_RACERS - 1) + [1]
+    assert store.find_one(coll, Filter.of(id="x")) == {"id": "x", "owner": won.index(1)}
+
+
+def racing_update_one_and_get_returns_only_its_own_write(store, coll):
+    store.insert(coll, {"id": "x"})
+    got = _race(lambda racer: store.update_one_and_get(coll, _UNCLAIMED, UpdateSpec(set={"owner": racer})))
+    winners = [(racer, doc) for racer, doc in enumerate(got) if doc is not None]
+    assert len(winners) == 1
+    racer, doc = winners[0]
+    assert doc == {"id": "x", "owner": racer} == store.find_one(coll, Filter.of(id="x"))
+
+
+def racing_pre_image_updates_have_exactly_one_winner(store, coll):
+    store.insert(coll, {"id": "x"})
+    got = _race(
+        lambda racer: store.update_one_and_get(coll, _UNCLAIMED, UpdateSpec(set={"owner": racer}), return_after=False)
+    )
+    winners = [racer for racer, doc in enumerate(got) if doc is not None]
+    assert len(winners) == 1 and got[winners[0]] == {"id": "x"}
+    assert store.find_one(coll, Filter.of(id="x")) == {"id": "x", "owner": winners[0]}
+
+
+def concurrent_compare_and_swap_loses_no_update(store, coll):
+    """Each writer's mutation depends on what it read, so a write applied under a stale guard
+    drops another writer's step."""
+    store.insert(coll, {"id": "x", "steps": []})
+    _race(lambda racer: compare_and_swap(
+        store, coll, Filter.of(id="x"), lambda doc: UpdateSpec(set={"steps": doc["steps"] + [racer]}), counter_field="rev"
+    ))
+    doc = store.find_one(coll, Filter.of(id="x"))
+    assert sorted(doc["steps"]) == list(range(_RACERS)) and doc["rev"] == _RACERS
+
+
+def update_one_and_get_upsert_inserts_on_a_miss(store, coll):
+    after = store.update_one_and_get(coll, Filter.of(id="a"), UpdateSpec(set={"n": 1}), upsert=True)
+    assert after == {"id": "a", "n": 1}
+    before = store.update_one_and_get(coll, Filter.of(id="b"), UpdateSpec(set={"n": 2}), return_after=False, upsert=True)
+    assert before is None
+    assert store.find_one(coll, Filter.of(id="b")) == {"id": "b", "n": 2}
+
+
 CASES = [
     insert_find_one_strips_id,
     ensure_index_unique_rejects_duplicate,
+    ensure_index_unique_on_other_fields_rejects_duplicate,
     ensure_index_non_unique_allows_duplicate,
     absent_or_null_precondition,
     ne_requires_present_field,
@@ -335,6 +442,7 @@ CASES = [
     update_one_and_get_before_after_and_miss,
     replace_and_upsert,
     update_upsert_synthesizes_from_filter,
+    upsert_colliding_with_a_unique_index_raises_duplicate_key,
     delete,
     eq_and_in_array_containment,
     dotted_array_traversal,
@@ -346,4 +454,10 @@ CASES = [
     latest_per_id_skips_docs_without_identity,
     latest_per_id_missing_version_sorts_lowest,
     latest_per_id_honours_custom_fields,
+    update_one_and_get_upsert_inserts_on_a_miss,
+    racing_guarded_updates_have_exactly_one_winner,
+    racing_guarded_replaces_have_exactly_one_winner,
+    racing_update_one_and_get_returns_only_its_own_write,
+    racing_pre_image_updates_have_exactly_one_winner,
+    concurrent_compare_and_swap_loses_no_update,
 ]

@@ -1,11 +1,10 @@
 """Snapshot a deployed A2A agent's conversation state to a FileArtifactUniverse."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import ClassVar, Optional
-
-import boto3
 
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef, RefRole
@@ -31,10 +30,9 @@ class SnapshotAgentStateTaskStep(TaskStep):
     state by hitting ``{gateway_url}/svc/mcp-{service}/export-state`` on the
     deployed env, uploads each as JSON alongside the workspace tarball, and
     writes a JSON-stringified ``{service: s3_url}`` (unsigned ``s3://`` object
-    references) to ``context.metadata['snapshot_json_url']``. Downstream
-    verifiers (e.g. ``run_openclaw_unit_test``) re-sign each value fresh before
-    embedding it into Sphere's ``snapshot_json_url.txt`` so the verifier script
-    can fetch each service's state and assert against it. Without this, only the
+    references) to ``context.metadata['snapshot_json_url']``. A downstream
+    verifier re-signs each value before handing the map to its test script, so
+    the script can fetch each service's state and assert against it. Without this, only the
     agent's *workspace files* are visible to the verifier — not per-MCP-service
     DB state.
     """
@@ -135,9 +133,8 @@ class SnapshotAgentStateTaskStep(TaskStep):
         # pattern in `multienv_validator/verify_universe_roundtrip.py:_export_all`.
         # Result lands in `context.metadata['snapshot_json_url']` as a
         # JSON-stringified `{service: s3_url}` (unsigned `s3://` references).
-        # Downstream verifiers (run_openclaw_unit_test) re-sign each value fresh
-        # and then stage it into Sphere's `snapshot_json_url.txt`; the runner
-        # script there parses either a single URL or this map.
+        # A downstream verifier re-signs each value and hands the map to its test
+        # script, which accepts either a single URL or this map.
         if self.env_id and self.universe_artifact_id:
             await self._capture_universe_state(context, workspace.capture_prefix)
 
@@ -147,7 +144,6 @@ class SnapshotAgentStateTaskStep(TaskStep):
         self, context: TaskStepContext, capture_prefix: str
     ) -> None:
         """GET /svc/mcp-<name>/export-state for each service, upload, publish `s3://` refs."""
-        from urllib.parse import urlparse
         from agent_env.artifact import EnvironmentUniverseArtifact
         from agent_env.config import get_config
 
@@ -175,30 +171,25 @@ class SnapshotAgentStateTaskStep(TaskStep):
 
         # Reuse the workspace capture's S3 prefix — services land in a
         # `services/` subdir alongside the workspace tarball.
-        parsed = urlparse(capture_prefix)
-        bucket = parsed.netloc
-        key_prefix = parsed.path.lstrip("/")
-        if not key_prefix.endswith("/"):
-            key_prefix += "/"
+        store = get_config().get_object_store()
+        key_prefix = store.get_object_key(capture_prefix).rstrip("/") + "/"
 
-        s3 = boto3.client("s3", region_name=get_config().get_s3_region())
         from agent_env.env import legacy_protocol
+        from agent_env.env.env import gateway_url_of
         from agentenv_protocol import client as protocol_v1
         urls: dict[str, str] = {}
         for name in environment_names:
-            key = f"{key_prefix}services/{name}.json"
             try:
-                base_url = legacy_protocol.environment_base_url(deployed_env.gateway_url, name, mcp=True)
-                if await protocol_v1.supports_v1(base_url):
+                base_url = await legacy_protocol.v1_base_url(deployed_env, gateway_url_of(deployed_env), name, mcp=True)
+                if base_url is not None:
                     resp = await protocol_v1.get_data(base_url)
                     state = resp.parts[0].data if resp.parts else {}
                 else:
-                    state = await legacy_protocol.export_state(deployed_env.gateway_url, name)
-                s3.put_object(
-                    Bucket=bucket, Key=key, Body=json.dumps(state).encode(),
-                    ContentType="application/json",
+                    state = await legacy_protocol.export_state(gateway_url_of(deployed_env), name)
+                urls[name] = await asyncio.to_thread(
+                    store.put, f"{key_prefix}services/{name}.json", json.dumps(state).encode(),
+                    content_type="application/json", allow_overwrite=True,
                 )
-                urls[name] = f"s3://{bucket}/{key}"
             except Exception as exc:
                 logger.warning(
                     "snapshot_agent_state: capturing %s state failed: %s — skipping",

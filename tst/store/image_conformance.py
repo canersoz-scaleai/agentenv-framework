@@ -11,6 +11,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from agent_env.store import ImageStore
+
 
 def image_ref_contains_repository_and_tag(store, repository):
     ref = store.image_ref(repository, "v1")
@@ -25,6 +27,12 @@ def ensure_repository_is_idempotent(store, repository):
 
 def auth_is_none_for_a_foreign_ref(store, repository):
     assert store.auth("foreign-registry.example/library/alpine:latest") is None
+
+
+def owns_its_own_refs_and_no_foreign_one(store, repository):
+    assert not store.owns("foreign-registry.example/library/alpine:latest")
+    if type(store).owns is not ImageStore.owns:
+        assert store.owns(store.image_ref(repository, "v1"))
 
 
 def push_pull_roundtrip(store, repository):
@@ -47,6 +55,7 @@ CASES = [
     image_ref_contains_repository_and_tag,
     ensure_repository_is_idempotent,
     auth_is_none_for_a_foreign_ref,
+    owns_its_own_refs_and_no_foreign_one,
     push_pull_roundtrip,
 ]
 

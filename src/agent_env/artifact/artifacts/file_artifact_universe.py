@@ -5,18 +5,20 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, ClassVar, Literal, Optional
 
 from pydantic import Field
 
 from agent_env.artifact.ref import ArtifactRef
 from agent_env.artifact.universe import Universe
+from agent_env.config import get_config
 from agent_env.store.ids import derive_id
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent_env.artifact.artifacts.file import FileArtifact
+    from agent_env.bundle.authoring import AuthoringContext
 
 
 class FileArtifactUniverse(Universe):
@@ -29,6 +31,7 @@ class FileArtifactUniverse(Universe):
     load every ``FileArtifact`` document.
     """
 
+    toml_keys: ClassVar[dict[str, type]] = {}  # what an artifact.toml may set
     type: Literal["file_artifact_universe"] = "file_artifact_universe"
     file_artifact_refs: Optional[dict[str, ArtifactRef]] = Field(
         default=None,
@@ -72,6 +75,8 @@ class FileArtifactUniverse(Universe):
 
         if not file_artifacts:
             raise ValueError("file_artifacts must be non-empty")
+        if bundle_s3_url:
+            get_config().check_object_url(id, bundle_s3_url)
 
         store = get_artifact_store()
         version = store.next_version(id)
@@ -122,12 +127,17 @@ class FileArtifactUniverse(Universe):
         id: str,
         *,
         files: dict[str, Path],
-        s3_url: str,
+        s3_url: str | None = None,
     ) -> "FileArtifactUniverse":
+        """Upload ``files`` (bundle key -> local path) under ``s3_url`` and register them as one universe.
+        Without ``s3_url``, each call writes under a prefix of its own (``ArtifactStore.attempt_prefix``)."""
         from agent_env.artifact.artifacts.file import FileArtifact
+        from agent_env.artifact.store import get_artifact_store
 
         if not files:
             raise ValueError("files must be non-empty")
+        if s3_url is None:
+            s3_url = get_artifact_store().attempt_prefix(cls.model_fields["type"].default, id)
         if not s3_url.endswith("/"):
             s3_url += "/"
 
@@ -143,10 +153,17 @@ class FileArtifactUniverse(Universe):
                 description=f"Bundled file '{rel_path}' of FileArtifactUniverse '{id}'",
                 file_path=str(local_path),
                 object_url=s3_url + rel_path,
+                filename=rel_path.rsplit("/", 1)[-1],
             )
             file_artifacts[rel_path] = fa
 
         return cls.put(id=id, file_artifacts=file_artifacts, bundle_s3_url=s3_url)
+
+    @classmethod
+    def from_toml(cls, data: dict, ctx: AuthoringContext) -> "FileArtifactUniverse":
+        """Write the folder's files, each a file artifact keyed by its path in the folder."""
+        ctx.accept(data, **cls.toml_keys)
+        return cls.put_bundled(ctx.id, files=ctx.files())
 
     @classmethod
     def put_existing(
@@ -164,12 +181,11 @@ class FileArtifactUniverse(Universe):
         agent's snapshot extension) has already written the files.
         """
         from agent_env.artifact.artifacts.file import FileArtifact
-        from agent_env.config import get_config
 
         if not s3_url.endswith("/"):
             s3_url += "/"
 
-        store = get_config().get_object_store()
+        store = get_config().get_object_store_at(s3_url)
 
         file_artifacts: dict[str, FileArtifact] = {}
         for object_url in store.list_at(s3_url):

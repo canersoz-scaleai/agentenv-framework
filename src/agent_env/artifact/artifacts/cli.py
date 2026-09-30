@@ -61,7 +61,8 @@ class CliArtifact(Artifact):
 
         store = get_artifact_store()
         version = store.next_version(id)
-        cli_s3_url = get_config().get_object_store().object_url(f"artifacts/cli/{key_segment(id)}/{version}/")
+        key = f"{get_config().get_artifact_key_prefix()}artifacts/cli/{key_segment(id)}/{version}/"
+        cli_s3_url = get_config().get_object_store_for(id).object_url(key)
 
         universe = FileArtifactUniverse.put_bundled(id=derive_id(id, "files"), files=files, s3_url=cli_s3_url)
 

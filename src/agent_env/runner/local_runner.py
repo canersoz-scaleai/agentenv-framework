@@ -5,7 +5,7 @@ persisted queue or lease, so the run's asyncio task lives only in this process.
 Consequence: a run does not survive a hub restart. ``start()`` fails any run a previous
 process left non-terminal (it can't still be executing), and ``stop()`` cancels the ones in
 flight. A durable, lease-based runner that resurrects a run across a restart — and supports
-multiple worker processes — is a follow-up; use the Temporal runner where that matters.
+multiple worker processes — is a follow-up; configure an external durable ``[runner]`` where that matters.
 """
 
 from __future__ import annotations

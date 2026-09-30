@@ -35,7 +35,7 @@ def _expected_block(b64: str) -> dict:
     """The litellm image block the verifier should produce for a raw base64 frame."""
     return _image_url_block(ImageFrame(media_type_for_b64(b64), b64))
 
-# A real 1x1 PNG (magic bytes -> base64 starts "iVBORw0KGgo"). claude_cua encodes
+# A real 1x1 PNG (magic bytes -> base64 starts "iVBORw0KGgo"). Harnesses may encode
 # screenshots as PNG, so the media type must be inferred, not hardcoded to jpeg.
 _PNG_1x1 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
@@ -49,13 +49,12 @@ _frames = final_frames_from_raw
 
 
 def _shot_span(screenshot: str, *, completion_as_dict: bool = False) -> dict:
-    """A raw execute_tool span shaped like the iOS CUA bridge emits."""
     comp = {"result": "ok", "screenshot": screenshot}
     return {
-        "name": "ios_screenshot",
+        "name": "gui_screenshot",
         "attributes": {
             "gen_ai.operation.name": "execute_tool",
-            "gen_ai.prompt": json.dumps({"tool": "ios_screenshot", "input": {}}),
+            "gen_ai.prompt": json.dumps({"tool": "gui_screenshot", "input": {}}),
             "gen_ai.completion": comp if completion_as_dict else json.dumps(comp),
         },
         "start_time": "1",

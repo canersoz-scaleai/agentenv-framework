@@ -1,7 +1,13 @@
 """EnvOutcomeVerifierTaskStep constructor accepts the JSON's raw aggregator string (the `task create` path)."""
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
+from agent_env.artifact import FileArtifact
+from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.verifiers.env_outcome_verifier import EnvOutcomeVerifierTaskStep, ScoreAggregator
+from tst.unit.event_loop_probe import on_event_loop
 
 
 def test_string_aggregator_is_coerced_and_round_trips():
@@ -59,3 +65,20 @@ def test_put_with_a_script_path_uploads_then_stores(monkeypatch, tmp_path):
     step = EnvOutcomeVerifierTaskStep.put(id="g", env_id="e", verify_script_file_path=str(script))
     assert uploads["id"] == "g-verifier-script" and uploads["file_path"] == str(script)
     assert step.file_artifact_id == "g-verifier-script" and step.file_artifact_version == 3
+
+
+def test_the_verifier_script_is_read_off_the_event_loop(monkeypatch):
+    on_loop: list[bool] = []
+
+    def load():
+        on_loop.append(on_event_loop())
+        return b"async def verify(url):\n    return [{'id': 'c', 'score': 1.0}]\n"
+
+    monkeypatch.setattr(FileArtifact, "get", staticmethod(lambda id, version=None: SimpleNamespace(load=load)))
+    step = EnvOutcomeVerifierTaskStep(id="outcome", version=None, env_id="e", file_artifact_id="script", verifier_id="v")
+    ctx = TaskStepContext()
+    ctx.deployed_envs.append(SimpleNamespace(env_id="e", mcp_url="http://mcp"))
+
+    asyncio.run(step.execute(ctx))
+
+    assert on_loop == [False] and ctx.metadata["verifications"]["v"]["results"] == [{"id": "c", "score": 1.0}]

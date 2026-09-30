@@ -1,4 +1,4 @@
-"""The env-level put_from_github classmethods forward github_token to every image build."""
+"""The env-level put_from_github classmethods forward github_token to every image build; MCPServerEnv's also puts its env provider type."""
 
 from types import SimpleNamespace
 
@@ -44,6 +44,13 @@ async def test_mcp_server_env_forwards_the_token(recorded_builds):
 async def test_mcp_server_env_defaults_to_no_token(recorded_builds):
     await MCPServerEnv.put_from_github(id="e", dockerfile_github_url="https://github.com/o/r/blob/main/svc/Dockerfile")
     assert [c["github_token"] for c in recorded_builds] == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("given, put_with", [({"env_provider_type": "server"}, "server"), ({}, "gateway")], ids=["server", "default"])
+async def test_mcp_server_env_puts_its_env_provider_type(recorded_builds, given, put_with):
+    put = await MCPServerEnv.put_from_github(id="e", dockerfile_github_url="https://github.com/o/r/blob/main/svc/Dockerfile", **given)
+    assert put["env_provider_type"] == put_with
 
 
 @pytest.mark.asyncio

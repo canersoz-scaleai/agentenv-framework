@@ -8,17 +8,25 @@ registry).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import py_compile
 import subprocess
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
+from agent_env.artifact.store import ArtifactStore
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step import AddSkillsTaskStep, BuildMcpCliTaskStep, LoadArtifactTaskStep
+from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.registry import get_task_step_registry
 from agent_env.task_step.task_steps.add_skills import _build_skill_for_installed_cli
-from agent_env.task_step.task_steps.mcp_cli_builder import generate_cli_script
+from agent_env.task_step.task_steps.mcp_cli_builder import build_mcp_cli, generate_cli_script
+from tst.unit.event_loop_probe import on_event_loop
 
 
 def test_codegen_compiles_and_renders_help():
@@ -94,6 +102,18 @@ def test_build_mcp_cli_step_dict_roundtrip():
     assert restored.cli_artifact_id == "cli-slack-mcp"
     assert restored.to_dict() == payload
 
+
+
+@pytest.mark.asyncio
+async def test_build_mcp_cli_needs_a_gateway():
+    """The CLI it generates talks to the gateway's /step and /state, so an env deployed without one is refused up front."""
+    from agent_env.env.env import DeployedSandboxEnv, EnvNeedsGateway
+    from agent_env.task_step.context import TaskStepContext
+
+    step = BuildMcpCliTaskStep(id="s1", version=None, env_id="slack-bare", command_name="slack")
+    record = DeployedSandboxEnv(env_id="slack-bare", env_version=1, sandbox_id="srv")
+    with pytest.raises(EnvNeedsGateway, match="build_mcp_cli needs a gateway; env 'slack-bare' was deployed without one"):
+        await step.execute(TaskStepContext(deployed_envs=[record]))
 
 def test_add_skills_step_roundtrip_with_cli_artifact_ids():
     step = AddSkillsTaskStep(id="s1", version=None, skills=[], cli_artifact_ids=["cli-foo", "cli-bar"], agent_name="my-agent")
@@ -171,3 +191,84 @@ def test_load_artifact_step_constructor_validation():
                               artifacts=[{"id": "a", "version": None}], artifact_id="a")
     with pytest.raises(ValueError, match="Must pass at least one"):
         LoadArtifactTaskStep(id="s", version=None, env_id="e")
+
+
+@pytest.mark.asyncio
+async def test_build_mcp_cli_uploads_the_bundle_off_the_event_loop(monkeypatch):
+    on_loop: list[bool] = []
+
+    async def no_manifest(gateway_url, environment_name):
+        return None
+
+    def put(**kw):
+        on_loop.append(on_event_loop())
+        return SimpleNamespace(id=kw["id"], version=1, type="cli", command_name=kw["command_name"])
+
+    monkeypatch.setattr(build_mcp_cli.Env, "get", staticmethod(lambda id, version=None: SimpleNamespace(environment_name="slack")))
+    monkeypatch.setattr(build_mcp_cli, "fetch_interface_manifest", no_manifest)
+    monkeypatch.setattr(build_mcp_cli.CliArtifact, "put", staticmethod(put))
+    record = DeployedGatewayEnv(env_id="slack-mcp", env_version=1, gateway_url="http://gw", mcp_url="http://gw/mcp", db_web_url=None, sandbox_id="sb")
+
+    await BuildMcpCliTaskStep(id="s1", version=None, env_id="slack-mcp", command_name="slack").execute(
+        TaskStepContext(deployed_envs=[record])
+    )
+
+    assert on_loop == [False]
+
+
+def _gateway_record(env_id: str = "slack-mcp") -> DeployedGatewayEnv:
+    return DeployedGatewayEnv(env_id=env_id, env_version=1, gateway_url="http://gw", mcp_url="http://gw/mcp", db_web_url=None, sandbox_id="sb")
+
+
+def _no_gateway(monkeypatch) -> None:
+    async def no_manifest(gateway_url, environment_name):
+        return None
+
+    monkeypatch.setattr(build_mcp_cli.Env, "get", staticmethod(lambda id, version=None: SimpleNamespace(environment_name="slack")))
+    monkeypatch.setattr(build_mcp_cli, "fetch_interface_manifest", no_manifest)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_mid_upload_leaves_the_bundle_to_the_upload(monkeypatch, caplog):
+    _no_gateway(monkeypatch)
+    uploading, release, dirs = threading.Event(), threading.Event(), []
+
+    def put(**kw):
+        dirs.append(kw["cli_dir"])
+        uploading.set()
+        release.wait(5)
+        assert (kw["cli_dir"] / "bin" / kw["command_name"]).is_file()
+        return SimpleNamespace(id=kw["id"], version=1, type="cli", command_name=kw["command_name"])
+
+    monkeypatch.setattr(build_mcp_cli.CliArtifact, "put", staticmethod(put))
+    step = BuildMcpCliTaskStep(id="s1", version=None, env_id="slack-mcp", command_name="slack")
+    build = asyncio.create_task(step.execute(TaskStepContext(deployed_envs=[_gateway_record()])))
+    await asyncio.to_thread(uploading.wait, 5)
+    build.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await build
+    with caplog.at_level("INFO", logger="agent_env.task_step.thread_work"):
+        release.set()
+        for _ in range(100):
+            if "finished after its caller was cancelled" in caplog.text:
+                break
+            await asyncio.sleep(0.02)
+    assert "Uploading CLI cli-slack-mcp finished after its caller was cancelled" in caplog.text
+    assert not dirs[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_builds_of_one_cli_each_get_their_own_version(local_stores, monkeypatch):
+    _no_gateway(monkeypatch)
+    next_version = ArtifactStore.next_version
+
+    def slow_next_version(self, id):
+        version = next_version(self, id)
+        time.sleep(0.05)  # widen the window between taking a version and writing at it
+        return version
+
+    monkeypatch.setattr(ArtifactStore, "next_version", slow_next_version)
+    step = BuildMcpCliTaskStep(id="s1", version=None, env_id="slack-mcp", command_name="slack", cli_artifact_id="cli-shared")
+    contexts = await asyncio.gather(*(step.execute(TaskStepContext(deployed_envs=[_gateway_record()])) for _ in range(4)))
+
+    assert sorted(c.metadata["cli_artifact"]["version"] for c in contexts) == [1, 2, 3, 4]

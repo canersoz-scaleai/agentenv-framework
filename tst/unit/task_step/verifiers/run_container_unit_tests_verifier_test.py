@@ -3,12 +3,19 @@ RunContainerUnitTestsVerifierTaskStep."""
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
-from agent_env.task_step.context import TaskStepContext
+import agent_env.providers.sandbox_providers.sandbox_provider as sandbox_provider
+from agent_env.config import configure, get_config
+from agent_env.task_step.context import DeployedSandbox, TaskStepContext
+from agent_env.task_step.task_steps.verifiers import run_container_unit_tests_verifier as verifier_module
 from agent_env.task_step.task_steps.verifiers.run_container_unit_tests_verifier import (
     RunContainerUnitTestsVerifierTaskStep as Step,
 )
+from tst.unit.event_loop_probe import on_event_loop
 
 
 def _step(command="python -m convscrape --url \"$URL\"", **kw):
@@ -197,3 +204,86 @@ def test_posix_override_and_stored_env_keys_are_accepted():
     _, extra_env = step._resolve_command(_ctx(step_params={"env_vars": {"_URL2": "x"}}))
     assert step.env_vars == {"STORED": "1"}
     assert extra_env == {"_URL2": "x"}
+
+
+class _Sandbox:
+    async def exec_script(self, script: str) -> str:
+        return ""
+
+    async def exec_with_output(self, *args) -> tuple[int, str, str]:
+        return 0, "ok", ""
+
+
+def test_stdout_and_stderr_are_kept_under_the_fixture_prefix(local_stores, monkeypatch):
+    monkeypatch.setenv("AGENT_ENV_FIXTURE_PREFIX", "fx")
+    configure()
+    provider = SimpleNamespace(get_sandbox=lambda sandbox_id: asyncio.sleep(0, result=_Sandbox()))
+    monkeypatch.setattr(sandbox_provider, "get_sandbox_provider", lambda: provider)
+    uploaded: list[str] = []
+
+    def record(text, artifact_id, description, s3_url):
+        uploaded.append(s3_url)
+        return SimpleNamespace(id=artifact_id, version=1, object_url=s3_url)
+
+    monkeypatch.setattr(Step, "_upload_text_artifact", staticmethod(record))
+    ctx = TaskStepContext()
+    ctx.metadata["deployed_docker_containers"] = [{"container_name": "c", "sandbox_name": "h"}]
+    ctx.deployed_sandboxes.append(DeployedSandbox(sandbox_name="h", sandbox_id="sb-1", sandbox_mode="vm"))
+
+    asyncio.run(_step(command="true").execute(ctx))
+
+    outputs = get_config().get_object_store().object_url("fx/verifier-outputs/scrape/")
+    assert [url.rsplit("/", 1)[-1] for url in uploaded] == ["stdout.txt", "stderr.txt"]
+    assert all(url.startswith(outputs) for url in uploaded)
+
+
+def test_stdout_and_stderr_upload_off_the_event_loop(local_stores, monkeypatch):
+    configure()
+    provider = SimpleNamespace(get_sandbox=lambda sandbox_id: asyncio.sleep(0, result=_Sandbox()))
+    monkeypatch.setattr(sandbox_provider, "get_sandbox_provider", lambda: provider)
+    on_loop: list[bool] = []
+
+    def record(text, artifact_id, description, s3_url):
+        on_loop.append(on_event_loop())
+        return SimpleNamespace(id=artifact_id, version=1, object_url=s3_url)
+
+    monkeypatch.setattr(Step, "_upload_text_artifact", staticmethod(record))
+    ctx = TaskStepContext()
+    ctx.metadata["deployed_docker_containers"] = [{"container_name": "c", "sandbox_name": "h"}]
+    ctx.deployed_sandboxes.append(DeployedSandbox(sandbox_name="h", sandbox_id="sb-1", sandbox_mode="vm"))
+
+    asyncio.run(_step(command="true").execute(ctx))
+
+    assert on_loop == [False, False]
+
+
+@pytest.mark.parametrize(
+    "instance_ids", [("i-1", "i-2"), ("i-1", "i-1"), (None, None)], ids=["instance-ids", "retried-attempt", "no-instance-id"]
+)
+def test_runs_and_retries_in_one_second_keep_their_outputs_apart(local_stores, monkeypatch, instance_ids):
+    """A retried step keeps its run's instance id, so the key must also be new for each execution."""
+    configure()
+    provider = SimpleNamespace(get_sandbox=lambda sandbox_id: asyncio.sleep(0, result=_Sandbox()))
+    monkeypatch.setattr(sandbox_provider, "get_sandbox_provider", lambda: provider)
+    monkeypatch.setattr(verifier_module.time, "time", lambda: 1_790_000_000.0)
+    uploads: list[tuple[str, str]] = []
+
+    def record(text, artifact_id, description, s3_url):
+        uploads.append((artifact_id, s3_url))
+        return SimpleNamespace(id=artifact_id, version=1, object_url=s3_url)
+
+    monkeypatch.setattr(Step, "_upload_text_artifact", staticmethod(record))
+
+    def ctx(instance_id):
+        c = TaskStepContext(instance_id=instance_id)
+        c.metadata["deployed_docker_containers"] = [{"container_name": "c", "sandbox_name": "h"}]
+        c.deployed_sandboxes.append(DeployedSandbox(sandbox_name="h", sandbox_id="sb-1", sandbox_mode="vm"))
+        return c
+
+    async def both():
+        step = _step(command="true")
+        await asyncio.gather(*(step.execute(ctx(i)) for i in instance_ids))
+
+    asyncio.run(both())
+
+    assert len({artifact_id for artifact_id, _ in uploads}) == len({url for _, url in uploads}) == 4

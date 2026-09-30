@@ -4,8 +4,8 @@ Mongo key stays service_name and from_dict still dual-reads (the additive wire c
 
 The dual-read section at the bottom covers the reader half of both env classes (MCPServerEnv
 + WebsiteEnv, whose from_dict behaves identically): only the NAME is dual-read, and to_dict
-is frozen on the legacy service_* keys. service_version has no dual-read on purpose — it is
-deprecated rather than renamed, so it has no new spelling to read; absence now defaults to 1."""
+is frozen on the legacy service_name key. service_version was deleted rather than renamed, so
+neither spelling is read or written; stored documents that still carry it load and drop it."""
 
 from types import SimpleNamespace
 
@@ -21,7 +21,7 @@ def _art():
 
 
 def test_environment_name_is_the_only_accessor():
-    e = MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), environment_name="email", service_version=1)
+    e = MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), environment_name="email")
     assert e.environment_name == "email"
     with pytest.raises(AttributeError):
         _ = e.service_name
@@ -29,28 +29,27 @@ def test_environment_name_is_the_only_accessor():
 
 def test_service_name_kwarg_is_rejected():
     with pytest.raises(TypeError):
-        MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), service_name="email", service_version=1)
+        MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), service_name="email")
 
 
 def test_missing_name_raises():
     with pytest.raises(ValueError):
-        MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), service_version=1)
+        MCPServerEnv(id="e", version=1, docker_image_artifact=_art())
 
 
 def test_to_dict_writes_both_name_keys():
-    e = MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), environment_name="email", service_version=2)
+    e = MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), environment_name="email")
     d = e.to_dict()
     assert d["service_name"] == "email"
     assert d["environment_name"] == "email"  # dual-write
-    assert d["service_version"] == 2
 
 
 def test_from_dict_dual_reads_both_keys(monkeypatch):
     monkeypatch.setattr(Artifact, "get", classmethod(lambda cls, id, version=None: _art()))
     ref = {"id": "img", "version": 1, "type": "docker_image"}
-    legacy = MCPServerEnv.from_dict({"id": "e", "version": 1, "docker_image_artifact": ref, "service_name": "email", "service_version": 1, "metadata": {}})
+    legacy = MCPServerEnv.from_dict({"id": "e", "version": 1, "docker_image_artifact": ref, "service_name": "email", "metadata": {}})
     assert legacy.environment_name == "email"
-    new = MCPServerEnv.from_dict({"id": "e", "version": 1, "docker_image_artifact": ref, "environment_name": "slack", "service_version": 1, "metadata": {}})
+    new = MCPServerEnv.from_dict({"id": "e", "version": 1, "docker_image_artifact": ref, "environment_name": "slack", "metadata": {}})
     assert new.environment_name == "slack"
 
 
@@ -78,18 +77,17 @@ async def test_put_from_github_forwards_environment_name_no_service_name(monkeyp
 
     result = await MCPServerEnv.put_from_github(
         id="e", dockerfile_github_url="https://github.com/o/r/tree/main/Dockerfile",
-        environment_name="email", service_version=1,
+        environment_name="email",
     )
     assert result == "ENV"
     assert captured["environment_name"] == "email"
     assert "service_name" not in captured
 
 
-# --- from_dict dual-reads environment_name; to_dict is frozen on the legacy keys ---
+# --- from_dict dual-reads environment_name; to_dict is frozen on the legacy name key ---
 #
-# There is deliberately NO environment_version dual-read. service_version is slated for
-# deprecation rather than rename, so nothing will ever write environment_version — a reader
-# for it would be dead on arrival. Its absence defaults to 1 rather than raising.
+# service_version was deleted, not renamed, so nothing reads or writes it under either
+# spelling. The store is append-only: documents written before the deletion keep the key.
 
 
 def _ref():
@@ -115,54 +113,33 @@ def stub_artifact_get(monkeypatch):
 
 @pytest.mark.parametrize("cls,doc", _READERS)
 def test_from_dict_reads_legacy_service_keys(cls, doc, stub_artifact_get):
-    """The dominant case: every env document in Mongo today spells both keys service_*."""
+    """The dominant case: most stored env documents spell both keys service_*."""
     e = cls.from_dict(doc(service_name="email", service_version=3))
-    assert (e.environment_name, e.service_version) == ("email", 3)
+    assert e.environment_name == "email"
 
 
 @pytest.mark.parametrize("cls,doc", _READERS)
 def test_from_dict_reads_environment_name(cls, doc, stub_artifact_get):
     """A document spelling the name environment_name loads to the same object as the legacy one."""
     legacy = cls.from_dict(doc(service_name="email", service_version=3))
-    new = cls.from_dict(doc(environment_name="email", service_version=3))
-    assert (new.environment_name, new.service_version) == ("email", 3)
+    new = cls.from_dict(doc(environment_name="email"))
+    assert new.environment_name == "email"
     assert new.to_dict() == legacy.to_dict()
 
 
 @pytest.mark.parametrize("cls,doc", _READERS)
 def test_from_dict_prefers_environment_name_when_both_present(cls, doc, stub_artifact_get):
-    e = cls.from_dict(doc(service_name="email", environment_name="slack", service_version=1))
-    assert (e.environment_name, e.service_version) == ("slack", 1)
-
-
-@pytest.mark.parametrize("cls,doc", _READERS)
-def test_from_dict_ignores_environment_version(cls, doc, stub_artifact_get):
-    """service_version has no dual-read: environment_version is not consulted. Pins that nobody
-    adds a reader for a key no writer will ever produce."""
-    e = cls.from_dict(doc(environment_name="email", service_version=3, environment_version=99))
-    assert e.service_version == 3
-
-
-@pytest.mark.parametrize("cls,doc", _READERS)
-def test_from_dict_defaults_missing_service_version(cls, doc, stub_artifact_get):
-    """Absence is no longer fatal: 224 dev mcp_server docs predate the key, and the 84 that are
-    otherwise well-formed go from KeyError to loading cleanly."""
-    e = cls.from_dict(doc(environment_name="email", environment_version=99))
-    assert e.service_version == 1
-
-    explicit_null = cls.from_dict(doc(environment_name="email", service_version=None))
-    assert explicit_null.service_version == 1
-    assert explicit_null.to_dict()["service_version"] == 1
-    assert e.to_dict()["service_version"] == 1
+    e = cls.from_dict(doc(service_name="email", environment_name="slack"))
+    assert e.environment_name == "slack"
 
 
 @pytest.mark.parametrize("cls,doc", _READERS)
 def test_from_dict_missing_both_name_spellings_raises(cls, doc, stub_artifact_get):
     with pytest.raises(KeyError, match="service_name"):
-        cls.from_dict(doc(service_version=1))
+        cls.from_dict(doc())
 
 
-@pytest.mark.parametrize("keys", [{"service_name": "email", "service_version": 3}, {"environment_name": "email", "service_version": 3}], ids=["legacy_doc", "environment_name_doc"])
+@pytest.mark.parametrize("keys", [{"service_name": "email"}, {"environment_name": "email"}], ids=["legacy_doc", "environment_name_doc"])
 @pytest.mark.parametrize("cls,doc", _READERS)
 def test_to_dict_writes_both_name_keys_whichever_spelling_was_read(cls, doc, keys, stub_artifact_get):
     """The legacy key is written no matter which spelling came in — that is what
@@ -172,5 +149,58 @@ def test_to_dict_writes_both_name_keys_whichever_spelling_was_read(cls, doc, key
     d = cls.from_dict(doc(**keys)).to_dict()
     assert d["service_name"] == "email"
     assert d["environment_name"] == "email"
-    assert d["service_version"] == 3
     assert "environment_version" not in d
+
+
+@pytest.mark.parametrize("cls,doc", _READERS)
+def test_loads_a_legacy_doc_still_carrying_service_version(cls, doc, stub_artifact_get):
+    e = cls.from_dict(doc(environment_name="email", service_version=9))
+    assert e.environment_name == "email"
+    assert not hasattr(e, "service_version")
+
+
+@pytest.mark.parametrize("cls,doc", _READERS)
+def test_service_version_is_not_written_back(cls, doc, stub_artifact_get):
+    """A doc read with the stale key must not re-emit it, or reading and re-putting would
+    resurrect the field one document at a time. No environment_version replaces it."""
+    d = cls.from_dict(doc(service_name="email", service_version=9)).to_dict()
+    assert "service_version" not in d
+    assert "environment_version" not in d
+
+
+_GITHUB = "https://github.com/o/r/tree/main/Dockerfile"
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda: MCPServerEnv(id="e", version=1, docker_image_artifact=_art(), environment_name="email", service_version=1), id="mcp_server"),
+    pytest.param(lambda: MCPServerEnv.put(id="e", docker_image_artifact=_art(), environment_name="email", service_version=1), id="mcp_server_put"),
+    pytest.param(lambda: MCPServerEnv.put_from_github(id="e", dockerfile_github_url=_GITHUB, environment_name="email", service_version=1),
+                 id="mcp_server_put_from_github"),
+    pytest.param(lambda: WebsiteEnv(id="w", version=1, backend_docker_image_artifact=_art(), frontend_docker_image_artifact=_art(),
+                                    environment_name="email", service_version=1), id="website"),
+    pytest.param(lambda: WebsiteEnv.put(id="w", backend_docker_image_artifact=_art(), frontend_docker_image_artifact=_art(),
+                                        environment_name="email", service_version=1), id="website_put"),
+    pytest.param(lambda: WebsiteEnv.put_from_github(id="w", backend_dockerfile_github_url=_GITHUB, frontend_dockerfile_github_url=_GITHUB,
+                                                    environment_name="email", service_version=1), id="website_put_from_github"),
+])
+def test_service_version_kwarg_is_rejected(call):
+    with pytest.raises(TypeError, match="service_version"):
+        call()
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda: MCPServerEnv("e", 1, _art(), "email", 1, {}), id="mcp_server"),
+    pytest.param(lambda: MCPServerEnv.put_from_github("e", _GITHUB, None, "email", 1, {}), id="mcp_server_put_from_github"),
+    pytest.param(lambda: WebsiteEnv("w", 1, _art(), _art(), "email", 1, {}), id="website"),
+    pytest.param(lambda: WebsiteEnv.put_from_github("w", _GITHUB, None, _GITHUB, None, "email", 1, {}), id="website_put_from_github"),
+])
+def test_a_positional_call_that_passed_service_version_raises(call):
+    """Everything after the name is keyword-only, so a positional caller written against the old
+    signature fails instead of shifting its version into metadata."""
+    with pytest.raises(TypeError, match="positional"):
+        call()
+
+
+def test_positional_arguments_up_to_the_name_still_bind():
+    assert MCPServerEnv("e", 1, _art(), "email").environment_name == "email"
+    assert WebsiteEnv("w", 1, _art(), _art(), "email").environment_name == "email"

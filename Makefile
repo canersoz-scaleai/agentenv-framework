@@ -1,4 +1,4 @@
-.PHONY: help install unit-test int-test int-test-fast int-test-slow test clean
+.PHONY: help install unit-test int-test int-test-fast int-test-slow installer-test clean-install-test test clean
 
 VENV := .venv
 VENV_BIN := $(abspath $(VENV))/bin
@@ -14,7 +14,7 @@ export PATH := $(VENV_BIN):$(PATH)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 install: ## Create .venv and install the package with dev dependencies
 	$(SYSTEM_PYTHON) -m venv $(VENV)
@@ -52,6 +52,18 @@ int-test-fast: ## Run only the fast integration tests (skip @int_test_slow)
 
 int-test-slow: ## Run only the @int_test_slow integration tests (serial to avoid docker / sandbox contention)
 	$(PYTHON) -m pytest tst/integration/ -m 'int_test_slow' $(INT_PYTEST_ARGS_SLOW) $(PYTEST_ARGS)
+
+# The installer tier runs the real pip, uv and pipx. It builds agentenv-framework from the checkout
+# and installs offline; only the first run for a uv.lock downloads the dependencies, into .cache/.
+installer-test: ## Run plugin add/remove through the real pip, uv and pipx, and the container journey (needs uv, pipx, Docker)
+	$(PYTHON) -m pytest tst/installer -n auto --timeout=900 $(PYTEST_ARGS)
+
+# The clean-install gate CI runs, on the same Python. The script gives every step an allowlisted
+# environment, so nothing in this shell reaches the install it checks. A failed run keeps its folder.
+clean-install-test: ## Build both distributions, install them clean from public PyPI and run hello twice (needs python3.11, uv, git)
+	@work=$$(mktemp -d); \
+	if $(SYSTEM_PYTHON) .github/scripts/clean_install.py --work "$$work"; then rm -rf "$$work"; \
+	else status=$$?; echo "kept $$work to inspect"; exit $$status; fi
 
 test: ## Run the full test suite (includes integration; requires Docker/Mongo/AWS)
 	$(PYTHON) -m pytest tst/ -v

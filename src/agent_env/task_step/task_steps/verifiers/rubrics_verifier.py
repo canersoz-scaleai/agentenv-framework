@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -9,8 +10,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional
 
-import httpx
-
+from agent_env.a2a_agent.object_transfer import (
+    TrajectoryUpload,
+    fetch_trajectory,
+    trajectory_mode,
+)
 from agent_env.config import get_config
 from agent_env.config.model import ModelParam
 from agent_env.task_step.context import TaskStepContext
@@ -24,11 +28,17 @@ from agent_env.task_step.task_steps.verifiers.judge_utils.judge_output_format im
     per_criterion_grounding,
     trajectory_mistakes_rows_from_evidence,
 )
-from agent_env.task_step.snapshot_utils.agent_state_capture import upload_trajectory
+from agent_env.task_step.snapshot_utils.agent_state_capture import (
+    store_trajectory,
+    trajectory_object_url,
+)
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 from agent_env.task_step.task_steps.verifiers.scoring import ScoreAggregator, aggregate_score
-from agent_env.task_step.task_steps.sandbox_utils.sandbox_utils import fetch_container_logs
+from agent_env.task_step.task_steps.sandbox_utils.sandbox_utils import (
+    agent_error_text,
+    fetch_container_logs,
+)
 from agent_env.task_step.task_steps.verifiers.judge_utils.frame_selection import (
     LabeledFrame,
     Transcript,
@@ -500,10 +510,13 @@ class RubricsVerifierTaskStep(TaskStep):
         # judge sandbox — a shorter run would otherwise leave stale later-turn files behind.
         multiturn_dir = f"{self.TRAJECTORY_CONTAINER_DIR}/{uuid.uuid4().hex[:12]}" if multiturn else None
 
-        # Single-file compaction is only needed off the multi-turn path.
-        compacted = _CompactedTrajectory.empty() if multiturn else self._compact_trajectory(
-            prompt_response, filter_to_apply, criteria=criteria,
+        # Single-file compaction is only needed off the multi-turn path. It reads the trajectory,
+        # and for the DEFAULT filter writes a compacted copy back, so it runs on a thread.
+        compacted = _CompactedTrajectory.empty() if multiturn else await asyncio.to_thread(
+            self._compact_trajectory, prompt_response, filter_to_apply, criteria=criteria,
             label_ids={real: short for short, real in real_by_short.items()})
+        if not use_agent_judge:
+            compacted.tool_result_files = []  # only an agent judge's container reads them; they can be large
         if self._spec().cites_evidence and not compacted.per_criterion:
             fmt = self.output_format.value
             if per_criterion_filter:
@@ -586,7 +599,7 @@ class RubricsVerifierTaskStep(TaskStep):
                 judge_agent = auto_deployed_judge
                 logger.info(f"Auto-deployed judge A2A agent '{resolved_judge_id}' at {judge_a2a_url}")
             if self.use_trajectory:
-                from agent_env.providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
+                from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
                 judge_sandbox_type = auto_deployed_judge.sandbox_type if auto_deployed_judge else (agent.sandbox_type if self.agent_name else None)
                 provider = build_sandbox_provider(judge_sandbox_type) if judge_sandbox_type else get_agent_sandbox_provider()
                 sandbox = await provider.get_sandbox(judge_sandbox_id)
@@ -596,6 +609,7 @@ class RubricsVerifierTaskStep(TaskStep):
                     await sandbox.write_file_from_s3(compacted.container_s3_uri, self.TRAJECTORY_CONTAINER_PATH)
                     if compacted.tool_result_files:
                         await self._load_tool_result_files(sandbox, compacted.tool_result_files)
+                        compacted.tool_result_files = []
 
         try:
             model = overrides.get("judge_model") or self.default_model
@@ -642,11 +656,11 @@ class RubricsVerifierTaskStep(TaskStep):
                 image_blocks = compacted.image_blocks
                 # Direct judge embeds the trajectory inline; DEFAULT has no pre-rendered text.
                 if multiturn:
-                    trajectory_inline = self._merge_per_turn_text(per_turn_uris, filter_to_apply)
+                    trajectory_inline = await asyncio.to_thread(self._merge_per_turn_text, per_turn_uris, filter_to_apply)
                 else:
                     trajectory_inline = compacted.inline_text
                     if trajectory_inline is None and compacted.container_s3_uri:
-                        trajectory_inline = self._read_trajectory_text(compacted.container_s3_uri)
+                        trajectory_inline = await asyncio.to_thread(self._read_trajectory_text, compacted.container_s3_uri)
                 eval_prompt = self._build_eval_prompt(
                     agent_prompt=agent_prompt_text,
                     agent_response=prompt_response.response,
@@ -685,9 +699,11 @@ class RubricsVerifierTaskStep(TaskStep):
                 _restore_frame_labels(verification_results.checks, real_by_short)
         finally:
             if auto_deployed_judge is not None:
-                from agent_env.providers.sandbox_provider import get_agent_sandbox_provider
+                from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_agent_sandbox_provider
                 try:
-                    sandbox = await get_agent_sandbox_provider().get_sandbox(auto_deployed_judge.sandbox_id)
+                    judge_type = auto_deployed_judge.sandbox_type
+                    provider = build_sandbox_provider(judge_type) if judge_type else get_agent_sandbox_provider()
+                    sandbox = await provider.get_sandbox(auto_deployed_judge.sandbox_id)
                     await sandbox.terminate()
                     logger.info(f"Terminated auto-deployed judge sandbox {auto_deployed_judge.sandbox_id}")
                 except Exception as e:
@@ -819,10 +835,11 @@ class RubricsVerifierTaskStep(TaskStep):
         """
         from agent_env.config import get_config
 
-        object_store = get_config().get_object_store()
+        config = get_config()
+        object_store = config.get_object_store()
         spans = json.loads(object_store.get(s3_uri))
         filtered, tool_result_files = compact_otel_trajectory(spans, trajectory_filter)
-        compact_key = f"compacted-trajectories/{uuid.uuid4().hex}.json"
+        compact_key = f"{config.get_artifact_key_prefix()}compacted-trajectories/{uuid.uuid4().hex}.json"
         object_url = object_store.put(compact_key, json.dumps(filtered).encode(), content_type="application/json")
         return object_url, tool_result_files
 
@@ -834,7 +851,7 @@ class RubricsVerifierTaskStep(TaskStep):
 
     async def _load_trajectory_into_container(self, sandbox_id: str, s3_uri: str) -> None:
         """Load trajectory from S3 into an existing agent's container."""
-        from agent_env.providers.sandbox_provider import get_agent_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox_provider import get_agent_sandbox_provider
         sandbox = await get_agent_sandbox_provider().get_sandbox(sandbox_id)
         await sandbox.write_file_from_s3(s3_uri, self.TRAJECTORY_CONTAINER_PATH)
 
@@ -857,7 +874,9 @@ class RubricsVerifierTaskStep(TaskStep):
         for i, uri in enumerate(per_turn_uris, start=1):
             dest = f"{container_dir}/turn_{i:02d}.json"
             if trajectory_filter is not None:
-                content, turn_files = self._filter_trajectory_content(uri, trajectory_filter, f"turn_{i:02d}_")
+                content, turn_files = await asyncio.to_thread(
+                    self._filter_trajectory_content, uri, trajectory_filter, f"turn_{i:02d}_"
+                )
                 await sandbox.write_file_from_text(content, dest)
                 tool_result_files.extend(turn_files)
             else:
@@ -1045,7 +1064,7 @@ class RubricsVerifierTaskStep(TaskStep):
                 f"task_id={task_id}",
                 f"judge_sandbox={sandbox_id}" if sandbox_id else None,
             ]))
-            body = (tr.error_message or tr.response_text or "")[:500]
+            body = agent_error_text(tr.error_message, tr.response_text)
             # Fetched here, inside execute()'s try, so it runs before the finally
             # terminates an auto-deployed judge sandbox.
             container_logs = await fetch_container_logs(judge_agent)
@@ -1079,8 +1098,7 @@ class RubricsVerifierTaskStep(TaskStep):
         traj_ext = A2AAgent.find_extension(judge_agent_card, A2AAgent.EXT_TRAJECTORY)
         if not traj_ext:
             return None
-        endpoint_path = (traj_ext.get("params") or {}).get("endpoint")
-        if not endpoint_path:
+        if not (traj_ext.get("params") or {}).get("endpoint"):
             # Don't guess a path — the extension is self-describing precisely so callers
             # never have to assume where it lives (it may differ by judge/version).
             logger.warning(
@@ -1088,23 +1106,36 @@ class RubricsVerifierTaskStep(TaskStep):
                 "skipping trajectory capture", self.verifier_id,
             )
             return None
-        endpoint = judge_a2a_url + endpoint_path
+        get_method, get_path = A2AAgent.operation(traj_ext, "get")
+        config = get_config()
+        store = config.get_object_store()
+        prefix = store.object_url(f"{config.get_artifact_key_prefix()}judge_trajectories/verifier_id={self.verifier_id}/")
+        mode = trajectory_mode(get_method, store, by="task_id")
+        if mode is None:
+            logger.warning(
+                "Verifier '%s': judge advertises no trajectory get form this object store "
+                "can serve — skipping trajectory capture", self.verifier_id,
+            )
+            return None
+        # Named per call rather than by the judge's own task id, which a judge could reuse
+        # to overwrite another run's trajectory.
+        upload = None
+        if mode == "objects":
+            try:
+                upload = await asyncio.to_thread(TrajectoryUpload.to, store, trajectory_object_url(prefix, store=store))
+            except Exception as exc:
+                logger.warning(
+                    "Verifier '%s': judge trajectory grant unavailable (continuing without it): %s",
+                    self.verifier_id, exc,
+                )
+                return None
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.DEFAULT_MAX_RETRIES + 1):
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(endpoint, json={"task_id": a2a_server_task_id}, timeout=120)
-                    resp.raise_for_status()
-                    data = resp.json()
-
-                store = get_config().get_object_store()
-                if "trajectory_s3_prefix" in data:
-                    files = store.list_at(data["trajectory_s3_prefix"])
-                    return files[0] if files else None
-                if "trajectory" in data:
-                    prefix = store.object_url(f"judge_trajectories/verifier_id={self.verifier_id}/")
-                    return upload_trajectory(data["trajectory"], prefix, name=a2a_server_task_id)
-                return None
+                fetched = await fetch_trajectory(
+                    judge_a2a_url + get_path, {"task_id": a2a_server_task_id}, upload=upload
+                )
+                return await asyncio.to_thread(store_trajectory, fetched, prefix)
             except Exception as exc:
                 last_exc = exc
                 if attempt < self.DEFAULT_MAX_RETRIES:

@@ -25,13 +25,16 @@ def _get_path(doc: dict, dotted: str):
     return cur
 
 
-def _union(existing: list, items: list, *, move_to_end: bool = False) -> list:
-    """Union by value, order-stable. ``move_to_end`` is the re-record case: that step's
+def _union(existing: list, items: list, *, move_to_end: bool = False, path: str = "") -> list:
+    """Union by value (deployed envs by instance), order-stable. ``move_to_end`` is the re-record case: that step's
     completion moves to the end of the replay order, so its items must move with it."""
-    fresh = [x for i, x in enumerate(items) if x not in items[:i]]
+    key = _item_key(path)
+    fresh = [x for i, x in enumerate(items) if key(x) not in [key(y) for y in items[:i]]]
+    fresh_keys = [key(x) for x in fresh]
     if move_to_end:
-        return [x for x in existing if x not in fresh] + fresh
-    return list(existing) + [x for x in fresh if x not in existing]
+        return [x for x in existing if key(x) not in fresh_keys] + fresh
+    existing_keys = [key(x) for x in existing]
+    return list(existing) + [x for x, k in zip(fresh, fresh_keys) if k not in existing_keys]
 
 
 def _set_path(doc: dict, dotted: str, value) -> None:
@@ -63,7 +66,7 @@ def _apply_forward(doc: dict, ops: ContextUpdateOps, *, move_to_end: bool = Fals
     for path in ops.unsets:
         _unset_path(doc, path)
     for path, items in ops.add_to_sets.items():
-        _set_path(doc, path, _union(_get_path(doc, path) or [], items, move_to_end=move_to_end))
+        _set_path(doc, path, _union(_get_path(doc, path) or [], items, move_to_end=move_to_end, path=path))
 
 
 def commit_ordered(entries: list[dict], completed_steps: list[dict]) -> list[dict]:
@@ -87,3 +90,10 @@ def replay_context(entries: list[dict], rerecorded_steps: Iterable[str]) -> dict
         ops = ContextUpdateOps.from_journal_dict(e["ops"])
         _apply_forward(doc, ops, move_to_end=e["step_id"] in flagged)
     return doc["context"]
+
+
+def _item_key(path: str):
+    """How a context list's items are told apart: a deployed env by its instance, so two kernels' copies stay one entry."""
+    if path == "context.deployed_envs":
+        return lambda item: (item.get("instance_id") if isinstance(item, dict) else None) or item
+    return lambda item: item

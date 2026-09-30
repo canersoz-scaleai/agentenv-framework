@@ -43,7 +43,7 @@ export function classifyVerifier(v: unknown): VerifierKind {
   if (typeof t === 'string' && SANDBOX_CRITERION_TYPES.has(t)) {
     return 'sandbox';
   }
-  // 'passed' at top level = CUA/MCP validation entries (<MCPEnvValidationEntry>).
+  // 'passed' at top level = MCP validation entries (<MCPEnvValidationEntry>).
   if ('passed' in obj) return 'other';
   return 'rubric';
 }

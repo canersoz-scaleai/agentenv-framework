@@ -7,7 +7,14 @@ url-addressed _at ops reach any root the url names.
 
 import pytest
 
+from tst.store import object_conformance
 from tst.unit.store.fakes import FakeObjectStore
+
+
+@pytest.mark.parametrize("case", object_conformance.CASES, ids=lambda c: c.__name__)
+def test_conformance(case):
+    """Tests use this fake as the backend that is neither S3 nor the local filesystem."""
+    case(FakeObjectStore(), "")
 
 
 def test_at_ops_address_by_url_root(tmp_path):

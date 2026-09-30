@@ -15,9 +15,10 @@ agent-env is a Python SDK and CLI for building, deploying and running agentic en
 9. [Run tasks: locally, then at scale](#run-tasks-locally-then-at-scale)
 10. [Read results, evaluate and iterate](#read-results-evaluate-and-iterate)
 11. [Configuration reference](#configuration-reference)
-12. [CLI reference](#cli-reference)
-13. [Extend agent-env](#extend-agent-env)
-14. [Contribute, release, license](#contribute-release-license)
+12. [Run on Google Cloud](#run-on-google-cloud)
+13. [CLI reference](#cli-reference)
+14. [Extend agent-env](#extend-agent-env)
+15. [Contribute, release, license](#contribute-release-license)
 
 ## What agent-env is
 
@@ -25,7 +26,7 @@ agent-env gives you five primitives: an **environment** an agent acts in, an **a
 
 ### The environment model
 
-- **Environment card.** Every environment server publishes `GET /.well-known/agent-env.json`: its `name`, `protocolVersion` (`1.0`), the JSON-RPC data-plane URL, its `capabilities` (`tools`, `operations`, `extensions`) and any `children_environments`. The name comes from `@environment_card(name=...)`, then the `ENVIRONMENT_NAME` variable, then the class name.
+- **Environment card.** Every environment server publishes `GET /.well-known/agent-env.json`: its `name`, `protocolVersion` (`1.0`), the JSON-RPC data-plane URL, its `capabilities` (`tools`, `operations`, `extensions`) and any `children_environments`. The name comes from the `ENVIRONMENT_NAME` variable (agent-env sets it to the env's registered name), then `@environment_card(name=...)`, then the class name.
 - **MCP tools.** `@tool` methods become real MCP tools served over streamable HTTP at `/mcp`. Tools are what the agent calls.
 - **Data plane.** `POST /agentenv` is a JSON-RPC endpoint with three operations: `data/reset`, `data/add` and `data/get`. Seeding, loading and exporting world state go through it, so a run can start from a known state and end with an exportable one. This replaces a gym-style `reset()`/`step()` API: the agent acts through tools, and the harness controls state through the data plane.
 - **Universe data.** Seed files are registered as versioned artifacts (`EnvironmentArtifact`, bundled into an `EnvironmentUniverseArtifact`) and loaded into a running instance with a reset followed by an add.
@@ -53,7 +54,7 @@ Every backend in `agent-env` is a seam: a TOML table naming `impl = "module.path
 - **uv** for the one-command install below. `pip` works too; see the alternative in [Install the packages](#install-the-packages).
 - **Docker** with a running daemon, needed at the point of use: the `local` sandbox, every `put` that builds an image, and the first-run bootstrap of `agent-env up`. The unit tests need neither Docker nor network.
 - **A model endpoint** for anything that prompts or judges an agent: any OpenAI-compatible base URL and key, or provider-prefixed model names routed natively. See [Point at a model](#point-at-a-model).
-- **Trust model.** The `local` sandbox runs environments and agents as ordinary containers on your Docker daemon, one compose stack per deploy, with host ports published on the machine. Treat it as a development convenience, not a security boundary. The explorer served by `agent-env up` binds `127.0.0.1` only, has no `host` setting, and rejects foreign `Host` headers with HTTP 421. Configuration values hold references (`env:NAME`, `secret:KEY`), not secrets; the run context written to disk strips API keys. Every HTTP client agent-env makes verifies TLS; there is no setting or variable that turns that off.
+- **Trust model.** The `local` sandbox runs environments and agents as ordinary containers on your Docker daemon, one compose stack per deploy, with host ports published on the machine. Treat it as a development convenience, not a security boundary. The explorer served by `agent-env up` binds `127.0.0.1` only, has no `host` setting, and rejects foreign `Host` headers with HTTP 421. Configuration values hold references (`env:NAME`, `secret:KEY`), not secrets; the run context written to disk strips API keys. agent-env does not copy your AWS credentials into agent or environment containers unless the S3 object store opts in with `share_credentials` (see [Stores and secrets](#stores-and-secrets)). Every HTTP client agent-env makes verifies TLS; there is no setting or variable that turns that off.
 
 ### Install the packages
 
@@ -78,15 +79,29 @@ python3.11 -m venv .venv
 
 `make install` runs those two installs (about 50 s, 410 MB); it is what [CONTRIBUTING.md](CONTRIBUTING.md) and CI use.
 
+### Install the command on its own
+
+To use `agent-env` rather than develop it, install it as a uv tool from an index that has both packages, then add plugins to it with `agent-env plugin add` (see [Manage plugins](#manage-plugins)):
+
+```bash
+uv tool install agentenv-framework
+agent-env --version
+```
+
+Upgrade it with `uv tool upgrade agentenv-framework`, which keeps the plugins. Running `uv tool install agentenv-framework` again replaces the tool with what that one command names and drops them. An exact `==` pin leaves `uv tool upgrade` nothing to move to, so pin only when you mean to stay.
+
 ### Optional extras and bundled cloud SDKs
 
 | Extra | Contents | Needed for |
 |---|---|---|
 | `agentenv-framework[explorer]` | `fastapi`, `uvicorn` | `agent-env up` (refuses to start without it) |
-| `agentenv-framework[dev]` | `explorer` plus `moto`, `psycopg2-binary`, `pytest` and its plugins (`pytest-asyncio`, `pytest-dependency`, `pytest-socket`, `pytest-timeout`, `pytest-xdist`) | running the test suite |
-| `agentenv-protocol[agent]` | `a2a-sdk[http-server]`, `uvicorn`, `boto3`, `regex` | authoring and serving your own A2A agent |
+| `agentenv-framework[gcp]` | `google-api-core`, `google-auth`, `google-cloud-secret-manager`, `google-cloud-storage`, `requests` | `GcsObjectStore`, `GcpSecretManagerSecretStore`, `FirestoreMongoDocumentStore`, `GoogleAccessTokenCredentials` |
+| `agentenv-framework[dev]` | `explorer` and `gcp` plus `moto`, `psycopg2-binary`, `pytest` and its plugins (`pytest-asyncio`, `pytest-dependency`, `pytest-socket`, `pytest-timeout`, `pytest-xdist`) | running the test suite |
+| `agentenv-protocol[agent]` | `a2a-sdk[http-server]`, `uvicorn`, `regex` | authoring and serving your own A2A agent |
 
-The runtime dependencies of `agentenv-framework` are `agentenv-protocol`, `boto3`, `click`, `httpx`, `litellm` (the 1.96 line), `mcp` (below 2.0), `a2a-sdk` (pinned to 0.3.26), `pydantic`, `pymongo`, `pyyaml`, `modal` and `e2b` (the 2.46 line). The cloud SDKs install every time and stay inert until a config table or a `--sandbox` flag selects them; the default sandbox and stores are local. There is no `asyncpg`; `psycopg2-binary` comes only with the `dev` extra.
+The runtime dependencies of `agentenv-framework` are `agentenv-protocol`, `boto3`, `click`, `httpx`, `litellm` (the 1.96 line), `mcp` (below 2.0), `a2a-sdk` (pinned to 0.3.26), `pydantic`, `pymongo`, `pyyaml`, `modal` and `e2b` (the 2.46 line). The cloud SDKs install every time and stay inert until a config table or a `--sandbox` flag selects them; the default sandbox and stores are local. `google-cloud-storage` and `google-cloud-secret-manager`, and what they pull in, come only with the `gcp` extra; the extra also names `google-api-core`, `google-auth` and `requests`, which core already installs, because the stores import them.
+
+An extra belongs to `agentenv-framework` itself, so `agent-env plugin add` does not install one: name it where you install agent-env, as in `uv tool install 'agentenv-framework[gcp]'`, `pipx install 'agentenv-framework[gcp]'` or `pip install 'agentenv-framework[gcp]'`. Re-running `uv tool install` drops the plugins it does not name. A store impl whose extra is missing fails to load with an error that names the extra. There is no `asyncpg`; `psycopg2-binary` comes only with the `dev` extra.
 
 ### Verify and platform notes
 
@@ -106,18 +121,32 @@ Commands:
   config     Inspect the resolved agent-env configuration.
   env        Environment commands.
   eval       Eval commands.
-  plugin     Inspect installed plugins.
+  plugin     Inspect, add and remove installed plugins.
+  run        Run a bundle's tasks and evals, or list the installed bundles.
   task       Task commands.
   up         Start the local agent-env stack (stores, runner, explorer)...
 ```
 
-Installed plugins can add groups and root options; they appear in this listing. There is no `--version` flag (`agent-env --version` answers `No such option '--version'. Did you mean '--verbose'?`). To read the installed version:
+Installed plugins can add groups and root options; they appear in this listing. `agent-env --version` prints the installed version.
+
+The second check is `agent-env config show`: it prints which config file won, or `(none)`, and what every section resolved to (see [Inspect the resolved configuration](#inspect-the-resolved-configuration)). Running `--help`, `config show`, `config explain`, `config sources`, `config debug`, `plugin list`, `plugin show` or `plugin check` writes nothing to disk, though a plugin's own import code may. The first command that writes a local store (for example `task create` or `run hello`) creates your per-user state root, `~/.local/state/agent-env/` (see [Config discovery and precedence](#config-discovery-and-precedence)).
+
+The third check runs `hello`, the bundle agent-env ships. It needs `bash` and the usual shell tools, and no Docker, model or configuration.
 
 ```bash
-python -c "import importlib.metadata as m; print(m.version('agentenv-framework'))"
+agent-env run          # lists the installed bundles and their folders; hello is agent-env's own
+agent-env run hello
 ```
 
-The second check is `agent-env config show`: it prints which config file won, or `(none)`, and what every section resolved to (see [Inspect the resolved configuration](#inspect-the-resolved-configuration)). Running `--help`, `config show`, `config explain`, `config sources`, `config debug`, `plugin list`, `plugin show` or `plugin check` writes nothing to disk, though a plugin's own import code may. The first command that resolves a store (for example `task get`) creates `.agentenv/` in the working directory (or next to the discovered config file) with an auto-managed `.gitignore`.
+```
+artifacts/greeting: v1 (new)
+tasks/hello.json: v1 (new)
+...
+Tasks:
+  tasks/hello.json v1: passed (hello: 1), 0.1s, instance @local/agentenv-framework/hello/hello-5aii6zzz
+```
+
+It writes to the per-user local stores, and removes the sandbox it deployed, a work folder under `~/.agent-env-sandboxes/`, when the run ends; [Run a bundle folder](#run-a-bundle-folder) says what it does and how to run an edited copy.
 
 **Apple Silicon.** Every image-building `put` (`env mcp-server|gateway|service-db|website|website-browser put` and `a2a-agent put`) builds for `linux/amd64` by default, which is the right target for remote VM sandboxes but runs emulated under the `local` sandbox. Pass `--platform linux/arm64` on every `put` you intend to deploy locally, including the two bootstrap environments and the agent image. `agent-env up` has no platform flag and builds its bootstrap images for `linux/amd64`; register those two environments by hand instead (see [Start the local stack](#start-the-local-stack)). Local sandbox work directories live under `~/.agent-env-sandboxes/`; if you override that with `AGENT_ENV_LOCAL_SANDBOX_DIR`, pick a path your Docker Desktop file sharing includes.
 
@@ -148,14 +177,14 @@ agent-env config show
 
 The first two lines name the file that won and how it was found (`discovered by walking up from the working directory`). Each block after that names a section, its resolved backend and the layer that supplied it: `document: LocalSqliteDocumentStore ... from [stores.document]`, `agents: default_a2a_agent_id=a2a-default from [agents]`, `explorer: port=8234 from [explorer]`. The file is optional: without it every command falls back to the same local defaults and `config show` reports `config: (none)` with every store `from built-in default`. `agent-env config debug` lists the paths discovery checked. Both commands are read-only and create nothing; see [Inspect the resolved configuration](#inspect-the-resolved-configuration).
 
-Every local deploy resolves two bootstrap environments by id: the service database `default-db` and the gateway `default`. Register them once per project directory; the first `service-db` build takes minutes:
+Every local deploy resolves two bootstrap environments by id: the service database `default-db` and the gateway `default`. Register them once: every project you run from shares one local store. The first `service-db` build takes minutes:
 
 ```bash
 agent-env env service-db put --id default-db --platform linux/arm64
 agent-env env gateway put --id default --platform linux/arm64
 ```
 
-The first `put` is the first store write: it creates `.agentenv/document_store/documents.db`, `.agentenv/object_store/` and `.agentenv/.gitignore`. Images push to a local OCI registry on `127.0.0.1:5000`. The first push starts the `agentenv-registry` container (`registry:2`, `--restart unless-stopped`) that hosts it; nothing is started if a registry already answers there.
+The first `put` is the first store write: it creates `document_store/documents.db` and `object_store/` under `~/.local/state/agent-env/`, your per-user state root (see [Config discovery and precedence](#config-discovery-and-precedence)), and writes nothing into the project. Images push to a local OCI registry on `127.0.0.1:5000`. The first push starts the `agentenv-registry` container (`registry:2`, `--restart unless-stopped`) that hosts it; nothing is started if a registry already answers there.
 
 Optional: `agent-env up` registers the same two environments (as `linux/amd64` images; it has no platform flag) and serves the explorer API at `http://127.0.0.1:8234`. It needs the `explorer` extra and the config file copied above, and it runs in the foreground until Ctrl-C, so start it in a second terminal:
 
@@ -194,17 +223,19 @@ The repository ships an example server at `tst/data/agentenv_mcp/` (`server.py`,
 mkdir items_env
 cp -R <repo>/packages/agentenv-protocol/src/agentenv_protocol items_env/
 cp <repo>/tst/data/agentenv_mcp/{server.py,Dockerfile,seed.json} items_env/
-agent-env env mcp-server put --id <env-id> --dockerfile items_env/Dockerfile --context items_env --platform linux/arm64 --skip-validation
+agent-env env mcp-server put --id <env-id> --dockerfile items_env/Dockerfile --context items_env --platform linux/arm64
 ```
 
 ```
 Derived environment_name='items' from the environment card.
 Building MCP server Docker image...
+Creating DockerImageArtifact...
 Created artifact: id=mcp-server-<env-id> version=1
-Created MCPServerEnv: id=<env-id> version=1 environment_name=items service_version=1
+Creating MCPServerEnv...
+Created MCPServerEnv: id=<env-id> version=1 environment_name=items env_provider_type=gateway
 ```
 
-Passing `--context <repo>/tst/data/agentenv_mcp` directly fails at `COPY agentenv_protocol`; that directory is not a self-contained build context. `--skip-validation` skips the release gate, which needs a registered `a2a-default` agent and a model endpoint; see [Build, register and the release gate](#build-register-and-the-release-gate). Repeating `put` on the same id appends a new version. The image lands in the local registry as `localhost:5000/mcp-server-<env-id>:v1`; a `registry:2` container named `agentenv-registry` is started on first push if none is listening.
+Passing `--context <repo>/tst/data/agentenv_mcp` directly fails at `COPY agentenv_protocol`; that directory is not a self-contained build context. `put` only registers the environment; `--validate` also runs the release gate, which needs a registered `a2a-default` agent and a model endpoint; see [Build, register and the release gate](#build-register-and-the-release-gate). Repeating `put` on the same id appends a new version. The image lands in the local registry as `localhost:5000/mcp-server-<env-id>:v1`; a `registry:2` container named `agentenv-registry` is started on first push if none is listening.
 
 ### Deploy it and call a tool
 
@@ -246,15 +277,14 @@ IDE MCP clients take the same URL in their config (`{"mcpServers": {"agent-env":
 
 ### Create, run and read the example task (gated)
 
-The repository does not yet ship an example task file, so write this one as `task.json`, substituting your environment id and the absolute path of your project directory:
+The repository does not yet ship an example task file, so write this one as `task.json`, substituting your environment id:
 
 ```json
 [
   {"id": "deploy-env", "type": "deploy_env", "env_id": "<env-id>", "ttl_seconds": 1800},
   {"id": "deploy-agent", "type": "deploy_agent", "env_ids": ["<env-id>"], "a2a_agent_id": "a2a-default", "ttl_seconds": 1800},
   {"id": "prompt", "type": "prompt_agent", "prompt_id": "p1", "timeout_seconds": 600,
-   "prompt": "Using the tools available to you, add one item named 'readme' to the item store, then list all stored items and reply with the exact list of items returned by the tool.",
-   "trajectory_output_prefix": "file:///<absolute-path-to-project>/.agentenv/object_store/prompt_agent_trajectories/p1/"},
+   "prompt": "Using the tools available to you, add one item named 'readme' to the item store, then list all stored items and reply with the exact list of items returned by the tool."},
   {"id": "verify", "type": "rubrics_verifier", "prompt_id": "p1", "verifier_id": "rubric", "use_agent_judge": false,
    "output_format": "rubric_binary", "score_aggregator": "all_pass",
    "criteria": [{"id": "item_added_and_listed", "weight": 1,
@@ -263,7 +293,7 @@ The repository does not yet ship an example task file, so write this one as `tas
 ]
 ```
 
-Two lines are workarounds, which is why this step is gated. `trajectory_output_prefix` must be a `file://` URL inside `.agentenv/object_store/`; the reason is in [What every run needs](#what-every-run-needs). `use_agent_judge: false` grades with a direct model call instead of deploying a third sandbox for a judge agent; that judge call is the only model call in this chain. Then create and run:
+One line is a workaround, which is why this step is gated: `use_agent_judge: false` grades with a direct model call instead of deploying a third sandbox for a judge agent, which here would be the echo agent registered as `a2a-default`; that judge call is the only model call in this chain. The trajectory needs no field: `prompt_agent` stores it below `prompt_agent_trajectories/prompt_id=<prompt-id>/` in the configured object store. Then create and run:
 
 ```bash
 agent-env task create task.json --id <task-id> --project-id <label>
@@ -344,7 +374,7 @@ if __name__ == "__main__":
     ItemsEnv().serve()
 ```
 
-`GET /.well-known/agent-env.json` serves the card: `name`, `protocolVersion` `1.0`, `url` `/agentenv`, and `capabilities.{tools,extensions,operations}`. The name resolves from `@environment_card(name=...)`, then the `ENVIRONMENT_NAME` variable, then the class name; `{environment_name}` in a tool name resolves to it at mount. Each `@tool` method becomes a real MCP tool with an `inputSchema` derived from the signature. Only `@tool` methods appear on the card; tools registered through `self.mcp.tool(...)` are served by MCP `tools/list` but not advertised.
+`GET /.well-known/agent-env.json` serves the card: `name`, `protocolVersion` `1.0`, `url` `/agentenv`, and `capabilities.{tools,extensions,operations}`. The name resolves from the `ENVIRONMENT_NAME` variable, then `@environment_card(name=...)`, then the class name; `{environment_name}` in a tool name resolves to it at mount. Each `@tool` method becomes a real MCP tool with an `inputSchema` derived from the signature. Only `@tool` methods appear on the card; tools registered through `self.mcp.tool(...)` are served by MCP `tools/list` but not advertised.
 
 ### Data plane: reset, add, get
 
@@ -407,10 +437,10 @@ The Dockerfile expects `agentenv_protocol/` in the build context, and `tst/data/
 
 | Kind | Register with | Fits when | Limits |
 |---|---|---|---|
-| `mcp_server` | `agent-env env mcp-server put --id <env-id> --dockerfile <Dockerfile> --context <dir>` (or `--dockerfile-github-url`) | One protocol-conformant server image | Seed loads need the data plane implemented |
-| `multi` | `agent-env env multi put --id <env-id> --mcp-server <id>[:version] --mcp-server <id>[:version] [--website <id>[:version]] [--name <label>]` | Several servers behind one gateway and one service database; universes and snapshots | Refs pin the latest version at put time; only `mcp_server` and `website` ids. `--name` fixes the name agents see the MCP server under (`mcp__<label>__<tool>`); without it each deploy draws `env` plus four random digits, so declare one when rubric text or tooling needs a stable prefix |
-| `website` | `agent-env env website put --id <env-id> --backend-dockerfile <f> --frontend-dockerfile <f>` | A browsable web app proxied at `<gateway>/website/<name>/` | Register `agent-env env website-browser put` once first (not exercised for this guide) |
-| live endpoint (custom) | a custom `Env` subclass whose documents carry an http(s) `mcp_url` attribute, registered through `[envs] impls` and saved with `put` from Python; no CLI | An MCP server that already runs elsewhere | Never deployed: a `deploy_agent` step that lists the id in `env_ids` reads `mcp_url` from the env document; no seed, reset or snapshot; a bearer token is passed per run with `task run --remote-token <env-id>=<token>` (see [Custom envs, task steps, artifacts](#custom-envs-task-steps-artifacts)) |
+| `mcp_server` | `agent-env env mcp-server put --id <env-id> --dockerfile <Dockerfile> --context <dir>` (or `--dockerfile-github-url`) `[--env-provider-type <type>] [--validate]` | One protocol-conformant server image | Seed loads need the data plane implemented |
+| `multi` | `agent-env env multi put --id <env-id> --mcp-server <id>[:version] --mcp-server <id>[:version] [--website <id>[:version]] [--name <label>] [--env-provider-type <type>] [--validate]` | Several servers behind one gateway and one service database; universes and snapshots | Refs pin the latest version at put time; only `mcp_server` and `website` ids. `--name` fixes the name agents see the MCP server under (`mcp__<label>__<tool>`); without it each deploy draws `env` plus four random digits, so declare one when rubric text or tooling needs a stable prefix |
+| `website` | `agent-env env website put --id <env-id> --backend-dockerfile <f> --frontend-dockerfile <f> [--env-provider-type <type>]` | A browsable web app proxied at `<gateway>/website/<name>/` | Register `agent-env env website-browser put` once first (not exercised for this guide) |
+| live endpoint (custom) | a custom `Env` subclass whose documents carry an http(s) `mcp_url` attribute, registered through `[envs] impls` and saved with `put` from Python; no CLI | An MCP server that already runs elsewhere | Never deployed: a `deploy_agent` step that lists the id in `env_ids` reads `mcp_url` from the env document; no seed, reset or snapshot; no bearer token is sent, so the endpoint must accept requests without one (see [Custom envs, task steps, artifacts](#custom-envs-task-steps-artifacts)) |
 | custom | `.agentenv/config.toml`: `[envs] impls = ["mypkg.envs:MyEnv"]` (subclass `Env`, set `type`) | A runtime the built-ins do not cover | No CLI `put` unless your plugin adds one |
 
 ### Author seed data as artifacts
@@ -422,7 +452,7 @@ agent-env artifact environment put --id <artifact-id> --description 'items seed'
 agent-env artifact environment-universe put --id <universe-id> --environment-artifact <artifact-id>:1
 ```
 
-`--environment-name` is required here (the CLI does not derive it from a card for artifacts) and must equal the environment's card name. The seed-schema version lives on the environment (`env mcp-server put --service-version`, default `1`), not on the artifact. Files land in `.agentenv/object_store/artifacts/file/<artifact-id>-file/<version>/`. Loading needs a deployed instance; see [Load universe data, snapshot and export](#load-universe-data-snapshot-and-export).
+`--environment-name` is required here (the CLI does not derive it from a card for artifacts) and must equal the environment's card name. Files land in `~/.local/state/agent-env/object_store/artifacts/file/<artifact-id>-file/<version>/`. Loading needs a deployed instance; see [Load universe data, snapshot and export](#load-universe-data-snapshot-and-export).
 
 ## Register, deploy, connect and load an environment
 
@@ -430,7 +460,7 @@ Registering turns an image into a versioned environment document; deploying prov
 
 ### Bootstrap prerequisites
 
-Deploy resolves the gateway environment `default` and the service-db environment `default-db` by id. Register them once per project with the two `put` commands in [Start the local stack](#start-the-local-stack). `agent-env up` runs the same two puts when missing, always for `linux/amd64` (see [Verify and platform notes](#verify-and-platform-notes)). The first `service-db` build compiles a Postgres MCP sidecar from source and takes minutes. Images push to `localhost:5000/<artifact-id>:v<version>` (the `agentenv-registry` container starts on first push) plus a tarball in `.agentenv/object_store/`; documents go to `.agentenv/document_store/documents.db`. Website environments also need `agent-env env website-browser put`.
+Deploy resolves the gateway environment `default` and the service-db environment `default-db` by id. Register them once with the two `put` commands in [Start the local stack](#start-the-local-stack). `agent-env up` runs the same two puts when missing, always for `linux/amd64` (see [Verify and platform notes](#verify-and-platform-notes)). The first `service-db` build compiles a Postgres MCP sidecar from source and takes minutes. Images push to `localhost:5000/<artifact-id>:v<version>` (the `agentenv-registry` container starts on first push) plus a tarball in the local object store; documents go to the local document store. Website environments also need `agent-env env website-browser put`.
 
 ### Build, register and the release gate
 
@@ -438,7 +468,9 @@ The build-and-register command is shown in [Build and register the example envir
 
 **GitHub-sourced builds.** `env mcp-server put --dockerfile-github-url https://github.com/<owner>/<repo>/tree/<ref>/<path>/Dockerfile` (optionally `--docker-context-github-url` for a context directory other than the Dockerfile's parent, same repository and ref) and `env website put --backend-dockerfile-github-url ... --frontend-dockerfile-github-url ...` clone the repository instead of reading a local build context. The Python equivalents are `MCPServerEnv.put_from_github(...)` and `WebsiteEnv.put_from_github(...)`; the resulting image artifact and environment are the same as from a local build. Public repositories need no credentials. For a private one, pass `github_token=` (any token GitHub accepts as the password for `git clone`); the CLI reads it from `GITHUB_TOKEN`. The clone, `docker build`, `docker push` and `docker save` run through the `[sandbox] default` provider's VM path; on the `local` provider that is your host shell as the invoking user (no VM, no container; `sudo` is stripped), starting with `apt-get install git`, so it needs a Debian-like Linux host with root, Docker, and push access to the configured image registry (on macOS or without root it fails earlier with `Script failed (exit 127)`). The image is always built for `linux/amd64` (`--platform` is ignored with a warning) and then uploaded through a presigned URL, which the local filesystem object store cannot issue (`GitHub image builds need a signable object store`), so the all-local stack cannot complete a GitHub build. Use a local Dockerfile there, or configure a VM-capable sandbox provider plus an object store that can presign uploads (the bundled S3 store does). Described from the code; not exercised for this guide.
 
-Without `--skip-validation`, `put` runs the release gate: a nine-step validation task (deploy, card, core protocol, tool schema and conformance checks, then an agent probe and assessment). The environment is registered before the gate. The gate needs the default agent (`[agents] default_a2a_agent_id`, `a2a-default` when unset; see [Agents](#agents)) to be registered, and a model endpoint; on a fresh store with the default config it aborts at `deploy_agent` with `A2AAgent a2a-default not found`, stamps no verdict, and leaves the validation deploy's containers running. Use `--skip-validation` until the agent exists. `--override` publishes despite a failed gate and records the override, but still needs the agent.
+`put` registers the environment and stops there. `--validate` then runs the release gate: a nine-step validation task (deploy, card, core protocol, tool schema and conformance checks, then an agent probe and assessment) that exits non-zero when the environment fails it. The gate needs the default agent (`[agents] default_a2a_agent_id`, `a2a-default` when unset; see [Agents](#agents)) to be registered, and a model endpoint; on a fresh store with the default config it aborts at `deploy_agent` with `A2AAgent a2a-default not found`, stamps no verdict, and leaves the validation deploy's containers running. `--override` runs the gate and publishes despite a failure, recording the override; it implies `--validate` and still needs the agent. `env mcp-server validate <env-id>` runs the same validation on an environment that is already registered and prints the results without a release decision; for a multi-server environment use `env multi put --validate` or `env multi validate --id <env-id>`.
+
+**Without a gateway.** `--env-provider-type server` (default `gateway`) registers an env that deploys as its server alone, with no gateway or service database, on whatever sandbox provider is configured. The release gate deploys it as declared on `[sandbox].default`, so the card it records in `metadata.environment_card` is the server's own. A `deploy_env` step on such an env can't take `gateway_mode = "consistent"` or `env_state_*`, and `task create` refuses them at save. Composed into a `multi` env, it is deployed behind that env's gateway like any other child.
 
 There is no `env get` or `env list`. Read back in Python: `Env.get("<env-id>")` (latest), `Env.get("<env-id>", 1)`, or `Env.query().type("mcp_server").latest().execute()` from `agent_env.env`.
 
@@ -459,7 +491,7 @@ The deploy command and the record it prints are shown in [Deploy it and call a t
 
 ### Choose compute, network policy and state
 
-Environments and agents have separate sandbox slots, `[sandbox].default` and `[sandbox].agent_default`, overridden per command by `env deploy --sandbox`, `a2a-agent deploy --sandbox` and `task run --env-sandbox` / `--agent-sandbox`. Built-ins are `local`, `modal`, `modal_vm` and `e2b`; custom providers register under `[sandbox.providers.<name>]`, and any slot takes a comma-separated chain that falls through on failure (see [Configuration reference](#configuration-reference)). The `local` provider runs on the host Docker daemon with no isolation; remote providers need an object store and remote registry and return the same record over HTTPS (TTL enforcement: [Reattach, look up a known instance, tear down](#reattach-look-up-a-known-instance-tear-down)). Sandbox mode comes from how the sandbox is started: `modal` deploys an environment as separate containers (container-mode); `modal_vm` and `e2b` give a VM; `local` runs an environment as a Compose stack on the host daemon (VM-mode) but starts an agent, or a `deploy_sandbox` sandbox, as a single container (container-mode). `env snapshot` refuses container-mode sandboxes, so it excludes `modal`, not `local`; on any provider it also needs an object store that can presign uploads (S3-compatible), which the bundled filesystem store cannot, so the zero-config local setup fails at the upload step. Egress allowlists and template rules for `e2b` are in [`docs/e2b-sandbox-provider.md`](docs/e2b-sandbox-provider.md).
+Environments and agents have separate sandbox slots, `[sandbox].default` and `[sandbox].agent_default`, overridden per command by `env deploy --sandbox`, `a2a-agent deploy --sandbox` and `task run --env-sandbox` / `--agent-sandbox`. Built-ins are `local`, `modal`, `modal_vm` and `e2b`; custom providers register under `[sandbox.providers.<name>]`, and any slot takes a comma-separated chain that falls through on failure (see [Configuration reference](#configuration-reference)). The `local` provider runs on the host Docker daemon with no isolation; remote providers need an object store and remote registry and return the same record over HTTPS (TTL enforcement: [Reattach, look up a known instance, tear down](#reattach-look-up-a-known-instance-tear-down)). Sandbox mode comes from how the sandbox is started: `modal` deploys an environment as separate containers (container-mode); `modal_vm` and `e2b` give a VM; `local` runs an environment as a Compose stack on the host daemon (VM-mode) but starts an agent, or a `deploy_sandbox` sandbox, as a single container (container-mode). `env snapshot` refuses container-mode sandboxes, so it excludes `modal`, not `local`; on any provider it also needs an object store that signs upload URLs (`signed_put_url`), as `S3ObjectStore` does and `GcsObjectStore` does with a signer; the bundled filesystem store signs none, so the zero-config local setup fails at the upload step.
 
 `local_postgres` is the only built-in state provider; every deploy creates an `esi-...` state record. Extra backends register under `[state.providers.<name>]`. `agent-env env init-env-state` pre-creates a store for external providers only (`local_postgres` exits with `cannot be pre-initialized out-of-band`); reuse one with `--env-state-instance-id`.
 
@@ -513,7 +545,7 @@ The loader copies the file to `/data/<filename>` in the server container, then c
 agent-env env multi load-environment-universe-artifact --env-instance-id <instance-id> --environment-universe-artifact-id <universe-id>
 ```
 
-Against a single-server instance the data loads but the command exits 1 on a `snapshot_baked` attribute error; use the per-artifact loader there. `agent-env env snapshot --instance-id <instance-id>` bakes the loaded database into an `env-snapshot-<env>` image for clean resets; it supports `multi` environments only, after a universe load, not on a container-mode sandbox, with `local_postgres` and a presign-capable object store (the filesystem store is not), and `--snapshot-after-load` on the universe load bakes right after ingest. The `snapshot_env` task step exports a run's end state as an `EnvironmentUniverseArtifact`; see [Run tasks: locally, then at scale](#run-tasks-locally-then-at-scale). `env multi validate-universe-compatibility` and `artifact environment-universe compatible-envs` exist; not exercised for this guide.
+Against a single-server instance the data loads but the command exits 1 on a `snapshot_baked` attribute error; use the per-artifact loader there. `agent-env env snapshot --instance-id <instance-id>` bakes the loaded database into an `env-snapshot-<env>` image for clean resets; it supports `multi` environments only, after a universe load, not on a container-mode sandbox, with `local_postgres` and an object store that signs upload URLs (the filesystem store does not), and `--snapshot-after-load` on the universe load bakes right after ingest. The `snapshot_env` task step exports a run's end state as an `EnvironmentUniverseArtifact`; see [Run tasks: locally, then at scale](#run-tasks-locally-then-at-scale). `env multi validate-universe-compatibility` and `artifact environment-universe compatible-envs` exist; not exercised for this guide.
 
 ### Reattach, look up a known instance, tear down
 
@@ -530,14 +562,14 @@ async def main():
 asyncio.run(main())
 ```
 
-`close()` runs `docker compose down -v --remove-orphans` for the local sandbox and terminates the VM for remote providers (the gateway then answers 404); the same command in the work directory is equivalent locally.
+`close()` runs `docker compose down -v --remove-orphans` for the local sandbox and terminates the VM for remote providers (the gateway then answers 404); the same command in the work directory is equivalent locally. An env a plugin's environment provider deployed can't be closed this way; see [Custom sandbox, state, environment and runner providers](#custom-sandbox-state-environment-and-runner-providers).
 
 For an agent deployed by a task run, take `deployed_agents[0].instance_id` from the context JSON and terminate its sandbox through the provider:
 
 ```python
 import asyncio
 from agent_env.a2a_agent.store import get_a2a_agent_instance_store
-from agent_env.providers.sandbox_provider import build_sandbox_provider
+from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider
 
 async def main():
     dep = get_a2a_agent_instance_store().get("<agent-instance-id>")
@@ -549,7 +581,22 @@ asyncio.run(main())
 
 With the `sandbox_id` from the run output's `deployed-agent:` block (or `deployed_agents[0].sandbox_id` in the context JSON) the store lookup can be skipped: `await (await build_sandbox_provider("local").get_sandbox("<sandbox-id>")).terminate()`. To find instances you did not keep ids for, query the document store: `from agent_env.store import Filter, Sort`, then `get_config().get_document_store().query("env_instances", Filter.of(env_id="<env-id>"), sort=Sort.by("created_at_utc", descending=True))` (and `a2a_agent_instances` with `Filter.of(agent_id=...)`). Closed instances stay listed with no status flag, so keep the ids from the run output when you can.
 
-`task run` leaves its environment and agent running (see [What every run needs](#what-every-run-needs)). Left behind: the instance record (no status field), the `esi-...` state record, the work directory, images in the registry and daemon, and `.agentenv/` documents and tarballs. `agent-env env teardown-env-state --instance-id <esi-id>` retires a state record by stamping its expiry. Reset means re-seeding through the loader or restoring a snapshot; there is no reset command.
+Every sandbox a task run recorded goes at once through `teardown_run`, given the run's context: `agent-env run` and `eval run` call it after each run. From a context JSON that `--output-dir` wrote:
+
+```python
+import asyncio
+import json
+from agent_env.task.teardown import teardown_run
+from agent_env.task_step.context import TaskStepContext
+
+context = TaskStepContext.from_dict(json.load(open("<context>.json")))
+report = asyncio.run(teardown_run(context))
+print(len(report.terminated), report.still_up)
+```
+
+It terminates each sandbox within 120 seconds, removes a local sandbox's work folder once it is down, and reports a failure rather than raising it.
+
+`task run` leaves its environment and agent running (see [What every run needs](#what-every-run-needs)). Left behind: the instance record (no status field), the `esi-...` state record, the work directory, images in the registry and daemon, and documents and tarballs in the local stores. `agent-env env teardown-env-state --instance-id <esi-id>` retires a state record by stamping its expiry. Reset means re-seeding through the loader or restoring a snapshot; there is no reset command.
 
 ## Define a task
 
@@ -580,11 +627,13 @@ Each step is also stored as a versioned document keyed by its `id` in a collecti
 
 The quickstart task in [Create, run and read the example task](#create-run-and-read-the-example-task-gated) ran end to end on the local Docker sandbox. Steps join through context keys, not through return values: `deploy_env` appends to `deployed_envs`; `deploy_agent` takes `env_ids` (or `env_step_id`), pushes each environment's MCP URL to the agent together with the name the agent should file its tools under (a `multi` environment's `--name`, otherwise `env` plus four random digits drawn at deploy; agents that accept a name expose the tools as `mcp__<name>__<tool>`), and appends to `deployed_agents` (an id in `env_ids` that no `deploy_env` step deployed must be an environment with a live http(s) `mcp_url`; see [Custom envs, task steps, artifacts](#custom-envs-task-steps-artifacts)); `prompt_agent` targets `agent_name` (default `default-agent`) and appends a `prompt_responses` entry keyed by `prompt_id`; the verifier reads that `prompt_id` and writes `metadata.verifications[<verifier_id>]`; `snapshot_env` exports the environment and records the universe artifact id under `metadata.env_snapshotted_universes[<step_id>]`.
 
-On the default local object store the `prompt_agent` step also needs a `trajectory_output_prefix`; the reason and the exact field are in [What every run needs](#what-every-run-needs). A configured object store needs no such field.
+`prompt_agent` stores each trajectory below `prompt_agent_trajectories/prompt_id=<prompt-id>/` in the configured object store, after the `AGENT_ENV_FIXTURE_PREFIX` prefix when one is set. Set `trajectory_output_prefix` on the step to store it elsewhere; it must be a URL of that store, since a prefix the store does not accept fails the upload rather than writing somewhere else.
 
 ### Tasks without an environment server
 
-Coding-style tasks need a machine and a container, not an MCP server. Three steps cover that: `deploy_sandbox` provisions a bare sandbox (`sandbox_name`, `image`, `cpu`, `memory_mb`, `disk_size_gb`, `ttl_seconds`, `exposed_ports`); `run_docker_container` builds an image from a docker-context artifact or URL and starts it on that sandbox (`container_name` defaults to `task-container`, with `ports`, `env_vars`, `build_args`, `command_override`, `ready_command`, `volumes`); `deploy_agent` with the same `sandbox_name` places the agent on that machine. Reward comes from `run_container_unit_tests_verifier` (a command's exit code plus optional reward and result files) or from `run_code`, which runs a script artifact against an environment or agent and stores its output under `metadata.script_results[<result_id>]`. Described from their definitions; not exercised for this guide.
+Coding-style tasks need a machine and a container, not an MCP server. Three steps cover that: `deploy_sandbox` provisions a bare sandbox (`sandbox_name`, `image`, `cpu`, `memory_mb`, `disk_size_gb`, `ttl_seconds`, `exposed_ports`); `run_docker_container` builds an image from a docker-context artifact or URL and starts it on that sandbox (`container_name` defaults to `task-container`, with `ports`, `env_vars`, `build_args`, `command_override`, `ready_command`, `volumes`); `deploy_agent` with the same `sandbox_name` places the agent on that machine. Reward comes from `run_container_unit_tests_verifier` (a command's exit code plus optional reward and result files), from `verify_sandbox` with the same `sandbox_name` (file and shell probes on the machine itself), or from `run_code`, which runs a script artifact against an environment or agent and stores its output under `metadata.script_results[<result_id>]`. Described from their definitions; not exercised for this guide.
+
+A long pipeline keeps every sandbox until the run ends or its TTL expires. `teardown_sandboxes` terminates the sandboxes behind named targets mid-run (`agent_names`, `env_ids` — every sandbox of the env — and `sandbox_names`); give it a `depends_on` on the last step that uses them. It is strictly best-effort: an already-gone sandbox or a failed terminate is logged and the run continues, and `fail_task_on_error` must stay `false`. Terminated ids are appended to `metadata.torn_down_sandbox_ids`, and a re-run of the step skips them.
 
 ### Step catalogue by family
 
@@ -596,7 +645,7 @@ python -c "from agent_env.task_step.registry import get_task_step_registry as g;
 
 | Family | Step types | Needs a model |
 |---|---|---|
-| Deploy and provision | `deploy_env`, `deploy_sandbox`, `run_docker_container`, `deploy_agent`, `install_agent`, `reset_env`, `sync_env_clock`, `apply_server_config`, `modify_env_tool_access`, `register_env_triggers`, `register_agent_triggers`, `peer_agents`, `add_skills`, `build_mcp_cli` | no |
+| Deploy and provision | `deploy_env`, `deploy_sandbox`, `run_docker_container`, `deploy_agent`, `install_agent`, `reset_env`, `sync_env_clock`, `apply_server_config`, `modify_env_tool_access`, `register_env_triggers`, `register_agent_triggers`, `peer_agents`, `add_skills`, `build_mcp_cli`, `teardown_sandboxes` | no |
 | Load, snapshot, collect | `load_artifact`, `snapshot_env`, `snapshot_agent_state`, `collect_artifacts` | no |
 | Agent interaction | `prompt_agent` | only if the agent calls one; the bundled echo agent does not |
 | Scripts | `run_code` | no |
@@ -648,7 +697,7 @@ The sandboxes the rolled-back span deployed are not terminated by the rollback. 
 agent-env task validate --id <task-id>
 ```
 
-`validate` runs each step's `preflight()` and exits non-zero on a problem. Only steps that implement a preflight are checked: `run_code` verifies that its script artifact resolves to the right type, and custom steps may add their own. It does not resolve environment or agent ids, so a missing `a2a-default` surfaces at run time, not here. `task create` runs the same checks and refuses to save a failing task unless `--skip-validation` is passed. For partial runs, `task run --start-step <n> --context-json <saved-context>` resumes from a persisted context (see [Resume and partial runs](#resume-and-partial-runs)); the Python `Task.run()` also accepts `end_step`, which the CLI does not expose.
+`validate` runs each step's `preflight()` and exits non-zero on a problem. Only steps that implement a preflight are checked: `run_code` verifies that its script artifact resolves to the right type, `deploy_env` that its `gateway_mode` is valid and its env loads and takes the step's options (a `server` env refuses `gateway_mode = "consistent"` and `env_state_*`), and custom steps may add their own. It does not resolve agent ids, so a missing `a2a-default` surfaces at run time, not here. `task create` runs the same checks and refuses to save a failing task unless `--skip-validation` is passed. For partial runs, `task run --start-step <n> --context-json <saved-context>` resumes from a persisted context (see [Resume and partial runs](#resume-and-partial-runs)); the Python `Task.run()` also accepts `end_step`, which the CLI does not expose.
 
 ## Agents
 
@@ -795,9 +844,9 @@ These steps need no model and produce the same `verifications` entry.
 | Step | Where it looks | Criteria or inputs |
 |---|---|---|
 | `agent_prompt_response_verifier` | the response text for `prompt_id` | `{"type": "response_contains", "needles": [...]}` or `{"type": "response_regex_present", "pattern": "...", "flags": "..."}` |
-| `verify_sandbox` | the agent's live sandbox (`agent_name`, `base_dir`) | `probe_file_exists`, `probe_dir_exists`, `probe_file_contains`, `bash_cmd_succeeds` (with `shell_timeout_seconds`); unknown types are kept as rows flagged `skipped: true` and excluded from the score |
+| `verify_sandbox` | under `base_dir` in a deployed agent's sandbox (`agent_name`, inside its container on a VM) or in a `deploy_sandbox` sandbox (`sandbox_name`, directly on it) | `probe_file_exists`, `probe_dir_exists`, `probe_file_contains`, `bash_cmd_succeeds` (with `shell_timeout_seconds`); unknown types are kept as rows flagged `skipped: true` and excluded from the score. On the `local` sandbox, every `/app` in a `bash_cmd`, even inside quotes, is pointed at the sandbox's work directory, so write paths relative to `base_dir` (the command's working directory) |
 | `env_outcome_verifier` | the deployed environment's MCP URL for `env_id` | a Python file artifact (`file_artifact_id`) exposing `async def verify(mcp_url)` that runs in the agent-env process and returns the result rows, stored unchanged; the Python `put(verify_script_file_path=...)` helper uploads it as `<id>-verifier-script` |
-| `run_container_unit_tests_verifier` | a container started by `run_docker_container` (`sandbox_name`, `container_name`) | `command`, `setup_commands`, `user` (default `root`), `timeout_sec` (default 300), `env_vars`; records `command`, `exit_code`, `timed_out`, `stdout_head`, `stderr_head`, `extracted_files` from `result_paths`, and one row (`id` `reward` when `reward_path` is set and graded from that file, else `exit_code` from the exit status). It uploads stdout and stderr as file artifacts by `s3://` URL, so it needs an S3-backed `[stores.object]`; on the local object store it fails with `ConfigError: This caller needs an S3 object store` |
+| `run_container_unit_tests_verifier` | a container started by `run_docker_container` (`sandbox_name`, `container_name`) | `command`, `setup_commands`, `user` (default `root`), `timeout_sec` (default 300), `env_vars`; records `command`, `exit_code`, `timed_out`, `stdout_head`, `stderr_head`, `extracted_files` from `result_paths`, and one row (`id` `reward` when `reward_path` is set and graded from that file, else `exit_code` from the exit status). It stores stdout and stderr as file artifacts below `verifier-outputs/` in the configured object store. |
 
 Each accepts `score_aggregator` and `verifier_id`, and every row copies the criterion you wrote (`agent_prompt_response_verifier`, `verify_sandbox`) or your script's output (`env_outcome_verifier`). Described from their step definitions; not exercised for this guide.
 
@@ -809,7 +858,7 @@ Scores stay per run; `eval run` reports completion per task run, not a score (se
 
 ## Run tasks: locally, then at scale
 
-One primitive executes a task: `Task.run()`. The CLI wraps it three ways: `task run` for one task, `task run-batch` for one task over many seed rows, and `eval run` for a task set. Each writes one context JSON per run and leaves the deployed sandboxes running; remote providers reclaim them at the TTL, the local sandbox does not (see [Tear down](#tear-down)).
+One primitive executes a task: `Task.run()`. The CLI wraps it four ways: `task run` for one task, `task run-batch` for one task over many seed rows, `eval run` for a task set, and `run` for the tasks and evals of a bundle folder. The first three write one context JSON per run. `task run` and `task run-batch` leave the deployed sandboxes running, where remote providers reclaim them at the TTL and the local sandbox does not (see [Tear down](#tear-down)); `eval run` and `run` tear down each run's sandboxes as it ends.
 
 ### Run from the CLI
 
@@ -828,7 +877,6 @@ On the local sandbox this needs the prerequisites in [What every run needs](#wha
 | `--env-sandbox`, `--agent-sandbox` | Sandbox slot per deploy family: a built-in name, a `[sandbox.providers]` name, or a comma-separated fallback chain. |
 | `--gateway-env-id`, `--service-db-env-id` | Bootstrap environments to use instead of `default` and `default-db`. |
 | `--env-state-type`, `--env-state-instance-id` | State backend for a fresh store, or attach to an existing one. |
-| `--remote-token ENV_ID=TOKEN` | Bearer token carried to an environment referenced by its live `mcp_url` without a `deploy_env` step. |
 | `--litellm-api-key`, `--judge-litellm-api-key` | Per-run model keys for agent and judge. |
 | `--apply-trajectory-filter` / `--no-trajectory-filter` | Force trajectory compaction on or off for every `rubrics_verifier` in the run. |
 | `--start-step`, `--context-json` | Resume; see [Resume and partial runs](#resume-and-partial-runs). |
@@ -848,6 +896,80 @@ agent-env task run-batch --id <task-id> --seeds seeds.csv --concurrency 2 --env-
 ```
 
 Each seed writes `<task-id>-seed<N>_<8hex>.json` with `metadata.seed` (the row) and `metadata.universe_id` (the `name` column); all seeds share one `run_group_id`. Running a task set under several agents or models is the job of [Evals](#evals-run-a-task-set-under-different-agents-and-models).
+
+### Run a bundle folder
+
+A bundle is a folder holding tasks and what they need, which `agent-env run` writes and runs without registering anything first. In this release it can hold:
+- `artifacts/<name>/`, whose files become a file artifact, or a file-artifact universe when there are several;
+- `agents/<name>/agent.toml`, an A2A agent whose `image` names a `docker_image` artifact in a store;
+- `tasks/<name>.json`, a list of steps that refer to the bundle's entities by name;
+- `evals/<name>.toml`, with `tasks = [...]` naming the bundle's tasks.
+
+An `agent.toml` takes `image`, a store id or `{ artifact = "<id>", version = <n> }` to pin one, and optionally `default_env_vars` (string values) and a `[metadata]` table of `default_model` and `min_disk_size_gb`. The agent's card isn't authored: the image serves it when the agent deploys.
+
+```toml
+# agents/solver/agent.toml
+image = { artifact = "solver-image", version = 3 }
+default_env_vars = { LOG_LEVEL = "debug" }
+
+[metadata]
+default_model = "claude-sonnet-4-6"
+```
+
+A task naming `solver`, in a `deploy_agent`'s `a2a_agent_id` or a `rubrics_verifier`'s `judge_a2a_agent_id`, deploys this agent, so its image is the one pinned here.
+
+A run that needs anything else written, such as an environment, or an image built from an agent folder's Dockerfile, is refused before any write.
+
+agent-env ships one bundle, `hello`. Its task deploys a local sandbox (a work folder on this machine), loads the two files of `artifacts/greeting/` into it, and checks them with `verify_sandbox`: a file probe, and `bash check.sh`. It needs `bash` and the usual shell tools, and no Docker, model or configuration.
+
+```bash
+agent-env run hello
+```
+
+```
+artifacts/greeting: v1 (new)
+tasks/hello.json: v1 (new)
+[tasks/hello.json] step 1/3 box (deploy_sandbox)
+...
+Tasks:
+  tasks/hello.json v1: passed (hello: 1), 0.1s, instance @local/agentenv-framework/hello/hello-5aii6zzz
+```
+
+A second run writes nothing: it prints `artifacts/greeting: v1, unchanged` and `tasks/hello.json: v1, unchanged`, then runs the task again.
+
+To change hello, copy its folder, which `agent-env run` prints under its row, and run the copy by path. The copy's ids are rooted at its own folder (`@local/~/my-hello/…` for a copy at `~/my-hello`), so it never shares a version with the installed one:
+
+```bash
+cp -R <the folder agent-env run prints> ./my-hello
+agent-env run ./my-hello
+```
+
+`agent-env run NAME` runs a bundle an installed package provides, and `agent-env run` with no argument lists them with what each holds, marking as invalid one that fails the checks `run` makes before it reads a store (see [Bundles from installed packages](#bundles-from-installed-packages)). An argument that is an existing folder, or starts with `.`, `/` or `~`, is always a folder.
+
+What it writes, and the instances it records, have `@local/` ids and land in the local stores, whatever stores are configured.
+
+A rerun writes a new version only of what changed since the bundle last wrote it, and reuses the rest. A reused task keeps whatever its steps took from the configuration when it was first written, such as a `rubrics_verifier`'s default judge model.
+
+- **What runs.** Every eval runs, or every task in a bundle without evals. `--task` and `--eval` select by name or id, and each is repeatable. When every eval runs, a task that no eval names doesn't run, and the command says how to run it.
+- **How tasks run.** Each selected task, and each task a selected eval names, runs once. At most four run at once, and they share one `run_group_id`.
+- **Overrides.**
+  - `--model` sets the agent's model. The judge keeps its own, so scores stay comparable across models.
+  - `--sandbox` sets the provider for `deploy_env`, `deploy_agent`, `deploy_sandbox` and the judge's deploy. It takes a name or a comma-separated fallback chain, and an unknown one is refused before anything is written. A chain can't create a VM, so under one a `deploy_sandbox` step in `vm` mode fails, and so does an environment behind a gateway.
+- **Results.** The summary gives each task's outcome, its scores labelled by the step that recorded each, its duration and its instance id, then each eval's pass count.
+  - A task passes when it recorded a score and every score is at least 1. A task that recorded no score is `unscored`.
+  - The command exits 1 when a run raised or left a failed step; a score below 1 doesn't change the exit status. With `agent-env --verbose run`, each run that raised also prints its traceback.
+  - `agent_env.bundle.run_bundle()` returns the same results, contexts included, to Python. It runs its own event loop, so from async code call it in a thread: `await asyncio.to_thread(run_bundle, path)`.
+- **Teardown.** Each run's sandboxes are torn down as it ends, passed or failed, and a local sandbox's work folder goes with them. Teardown removes compute only: the instance, its outputs and the artifacts it collected stay. The summary ends with `Tore down N sandboxes.`, and lists any sandbox it couldn't terminate as still up.
+  - `--keep` holds them up instead: after the summary it prints each run's sandboxes with the endpoints they record (MCP, gateway, pgweb, tunnel URLs, the local work folder), waits, and tears them down on Ctrl-C. From Python, `run_bundle(path, keep=True)` leaves them up and `result.teardown()` removes them; a signal during it raises `RunInterrupted` with what it reached.
+  - Ctrl-C or SIGTERM during the runs cancels them: each run that started is marked `cancelled` in the store and torn down, a run that was waiting shows `didn't start`, the summary prints, and the command exits 130 (143 for SIGTERM). A second Ctrl-C stops the teardown and prints what is still up. From Python, `run_bundle()` raises `RunInterrupted`, a `KeyboardInterrupt` whose `result` holds the runs.
+
+Known limits:
+- An eval in a bundle runs only the bundle's own tasks. One that names a store task is refused; run that task with `agent-env task run`.
+- A step that writes an entity under an id it makes up is refused when it runs, since that id isn't under `@local/`. This refuses `run_container_unit_tests_verifier`'s stdout artifacts and `collect_artifacts`, and `snapshot_env` unless the task names its `snapshot_id`. `verify_sandbox` writes nothing, so it runs.
+- A step's reference to one of the bundle's entities names no version, so it reads the latest version when the step runs. Another run of the same folder, made after an edit, can write a newer one first.
+- Teardown reaches only the sandboxes a run's context records. A `rubrics_verifier`'s judge, and an agent whose deploy was cancelled, terminate their own sandboxes but leave their local work folders. A run killed outright (`kill -9`) leaves everything it deployed.
+- A process a local sandbox's command detaches from itself (a double fork, `setsid`) outlives the command and the run.
+- A run still opens the configured stores: it reads store entities through them and sets up their indexes. Under a config whose stores are remote, their credentials must be available, even for a bundle, such as `hello`, that writes nothing there.
 
 ### The local explorer and runner
 
@@ -892,17 +1014,13 @@ The canonical chain (`deploy_env`, `deploy_agent`, `prompt_agent`, `rubrics_veri
 1. The bootstrap environments `default-db` and `default` in the same document store; the two `put` commands are in [Start the local stack](#start-the-local-stack). Missing: `NotFoundError: Env default-db not found` at `deploy_env`.
 2. An agent registered under the id `deploy_agent` resolves: `[agents] default_a2a_agent_id` in `.agentenv/config.toml`, `a2a-default` when unset, or `--a2a-agent-id` per run; the command is in [Register an agent](#register-an-agent-the-bundled-echo-agent). Missing: `A2AAgent a2a-default not found` at `deploy_agent`.
 3. A model key and endpoint: `LITELLM_API_KEY` and `LITELLM_BASE_URL` exported, or `[model] api_key` / `base_url`. `deploy_agent` resolves them when it creates the agent container (`A2AAgent.deploy`), unless the agent was registered with both as `--env-var` defaults. Missing, at `deploy_agent`: `ConfigError: No model API key configured` when nothing is set, `ConfigError: No model endpoint configured` when only the endpoint is missing. A `rubrics_verifier` needs them again: its direct judge stops with `ConfigError: No model endpoint configured for '<model>'` when the endpoint is missing, and its agent judge deploys the judge agent through the same `A2AAgent.deploy` check. `agent_prompt_response_verifier` needs no model.
-4. On the default local object store, `trajectory_output_prefix` on every `prompt_agent` step, as a `file://` URL inside the object store root. The default prefix assumes an S3-style store. Missing: `ConfigError: This caller needs an S3 object store, but the configured store is LocalFilesystemObjectStore` at `prompt_agent`; fix the step and create a new task version.
-   ```json
-   "trajectory_output_prefix": "file:///<path-to-project>/.agentenv/object_store/prompt_agent_trajectories/<prompt-id>/"
-   ```
-5. A running Docker daemon for the `local` sandbox, and a `--project-id` label on `task create` (required; any string).
+4. A running Docker daemon for the `local` sandbox, and a `--project-id` label on `task create` (required; any string).
 
 `task run` never tears down, so a fatal step leaves earlier deployments running; close them as described in [Reattach, look up a known instance, tear down](#reattach-look-up-a-known-instance-tear-down).
 
 ### At scale: bring your own durable runner
 
-agent-env ships one runner, `LocalRunner`. Anything durable, queued or multi-host is a `Runner` subclass registered through the `[runner]` seam; the contract is in [Custom sandbox, state and runner providers](#custom-sandbox-state-and-runner-providers).
+agent-env ships one runner, `LocalRunner`. Anything durable, queued or multi-host is a `Runner` subclass registered through the `[runner]` seam; the contract is in [Custom sandbox, state, environment and runner providers](#custom-sandbox-state-environment-and-runner-providers).
 
 ```toml
 [runner]
@@ -928,7 +1046,7 @@ agent-env task get-instance --id <instance-id>
 
 This prints `Instance ID`, `Task ID`, `Task Version`, `Status` (`running | completed | failed`), `Progress` (`<done>/<total>`), `Created At (UTC)`, `Completed At (UTC)` and the full `Context`. The instance id is printed at the top of every run and stored as `instance_id` in the context JSON. There is no instance list command; keep the id, or query `GET /api/v1/tasks/{task_id}/instances` on the [explorer](#the-local-explorer-and-runner). Instance fields also include `current_step`, `total_steps`, `error`, `completed_steps[{step_id, status}]` and `step_attempt_failures`.
 
-The context JSON is `context.to_safe_dict()`: model API keys and remote tokens are stripped. Top-level keys:
+The context JSON is `context.to_safe_dict()`, which strips credential keys such as `litellm_api_key` and `cf_access_client_secret` at any depth. Top-level keys:
 
 | Key | Contents |
 |---|---|
@@ -958,7 +1076,7 @@ The aggregator reads `result`, `score` and `weight`; rows flagged `skipped` are 
 
 ### Trajectories
 
-The agent trajectory is written to the object store and referenced from `prompt_responses[i].agent_trajectory_s3_uri`. The field names keep their legacy `s3` spelling, but the value is an object URL for whatever store is configured: `file://...` on the local store, `s3://...` on an S3 store. The object is whatever the agent's `urn:agentenv:trajectory/v1` extension returned for the prompt, written as JSON; the format is agent-defined. The bundled echo agent reports its native format, one `{"type": "echo", "input": ..., "output": ...}` entry per prompt. An agent that reports OpenTelemetry spans stores a list of spans, each with `name`, `context`, `kind`, `parent_id`, `start_time`, `end_time`, `status`, `attributes`, `events`, `links` and `resource`; the LLM judge reads them through the GenAI semantic conventions: it selects spans by `gen_ai.operation.name` (`chat` for model turns, `execute_tool` for tool calls, `chain` for the conversation root), takes the tool label from the span `name`, the arguments from `gen_ai.prompt` (`input`) and the result from `gen_ai.completion` (`output`). No span-name convention is required; the judge compacts such trajectories before grading, and a list with no `gen_ai.operation.name` attribute is passed through unchanged.
+The agent trajectory is written to the object store and referenced from `prompt_responses[i].agent_trajectory_s3_uri`. The field names keep their legacy `s3` spelling, but the value is an object URL for whatever store is configured: `file://...` on the local store, `s3://...` on an S3 store. The object is whatever the agent's `urn:agentenv:trajectory/v1` extension reports for the prompt, as JSON; the format is agent-defined. An agent that advertises the object form uploads it itself through a signed grant when the store issues grants, as `S3ObjectStore` does; otherwise, and always on the local default store, the agent returns it inline and agent-env writes it (see [Object transfer](packages/agentenv-protocol/README.md#object-transfer)). The bundled echo agent reports its native format, one `{"type": "echo", "input": ..., "output": ...}` entry per prompt. An agent that reports OpenTelemetry spans stores a list of spans, each with `name`, `context`, `kind`, `parent_id`, `start_time`, `end_time`, `status`, `attributes`, `events`, `links` and `resource`; the LLM judge reads them through the GenAI semantic conventions: it selects spans by `gen_ai.operation.name` (`chat` for model turns, `execute_tool` for tool calls, `chain` for the conversation root), takes the tool label from the span `name`, the arguments from `gen_ai.prompt` (`input`) and the result from `gen_ai.completion` (`output`). No span-name convention is required; the judge compacts such trajectories before grading, and a list with no `gen_ai.operation.name` attribute is passed through unchanged.
 
 No CLI downloads a trajectory. Read it through the object store in Python, or via the explorer's `GET /api/v1/objects/content?object_url=...`:
 
@@ -1006,7 +1124,7 @@ agent-env eval run --id <eval-id> --k 1 --output-dir <path>
 
 Output is compact: one `[<task-id>] Completed step ...` line per step, `Output written to: <path>/<task-id>_<8hex>.json` per run, then a `Results:` block with `[<task-id>] PASSED` or `FAILED: <error>`, and exit 1 if any run failed. `PASSED` means the task completed; it carries no score because `eval run` reads `metadata.score`, which verifiers do not set. Scores live in each run's JSON under `metadata.verifications`, or in `task get-instance` using the `instance_id` inside the JSON.
 
-To compare agents or models, run the same eval again with `--agent-model <model>` or `--agent-artifact-id <artifact-id>` (and `--max-concurrency N`). Aggregation across runs is yours. `eval run` has no `--a2a-agent-id` and no sandbox overrides, and there is no `eval get` or `eval list`; read an eval through the explorer API. Like `task run`, it leaves sandboxes running; only remote providers reclaim them at TTL.
+To compare agents or models, run the same eval again with `--agent-model <model>` or `--agent-artifact-id <artifact-id>` (and `--max-concurrency N`). Aggregation across runs is yours. `eval run` has no `--a2a-agent-id` and no sandbox overrides, and there is no `eval get` or `eval list`; read an eval through the explorer API. It tears down each run's sandboxes as the run ends, whether it passed, failed or was interrupted, and prints `[<task-id>] Tore down N sandboxes`; a run's context JSON still records them. Ctrl-C or SIGTERM cancels the runs still going, lets a teardown already under way finish, lists the cancelled runs as `CANCELLED` and exits 130 (143 for SIGTERM); a second one stops the teardown.
 
 ### Iterate safely
 
@@ -1028,7 +1146,7 @@ Exactly one file is read, and it is used whole. There is no layering: no user-le
 2. Otherwise the nearest `.agentenv/config.toml`, walking up from the working directory through every parent to `/`.
 3. Otherwise no file, which parses as an empty table.
 
-Local state (`document_store/`, `object_store/`, an auto-managed `.gitignore`) lives next to the discovered config file; with no file it is created under `./.agentenv/`.
+The `local` document and object stores keep their state in one per-user root, whatever config file was found: `$XDG_STATE_HOME/agent-env/` when `XDG_STATE_HOME` is an absolute path, else `~/.local/state/agent-env/` (`%LOCALAPPDATA%\agent-env\` on Windows). Every project you run from shares that one store, and `.agentenv/` holds only config. A `[stores.document]` table with its own `path`, or a `[stores.object]` table with its own `root`, puts that store somewhere else. Each store directory is created on the first write, readable only by you, with a `.gitignore` of `*`.
 
 A section the file does not define falls back to a code default, never to another file: a file that sets only `[stores.document]` leaves the other three stores on `local`. Several of those defaults are a real selection rather than "off", so read the last column as what you get. Where a section has an environment variable, the variable wins over the file:
 
@@ -1043,6 +1161,7 @@ A section the file does not define falls back to a code default, never to anothe
 | `[state]` | none | a fresh environment state store is `local_postgres`; built-in providers only |
 | `[envs]`, `[artifacts]`, `[task_steps]` | none | built-in types only; no plugin classes registered |
 | `[explorer]` | none | `port = 8234`; no explorer plugins |
+| `[plugins.<package>]` | none | nothing: agent-env reads none of it; each plugin reads its own table (see [Plugin settings](#plugin-settings)) |
 
 `agent-env config show` answers the same question for the install you are running and names the module each fallback comes from. Prefer it over this table, which is a snapshot of one release's defaults; see [Inspect the resolved configuration](#inspect-the-resolved-configuration).
 
@@ -1050,8 +1169,8 @@ Precedence per seam, lowest to highest: built-in default, config table, `AGENT_E
 
 ```toml
 [stores]
-document = "local"   # SQLite      .agentenv/document_store/documents.db
-object   = "local"   # filesystem  .agentenv/object_store/
+document = "local"   # SQLite      ~/.local/state/agent-env/document_store/documents.db
+object   = "local"   # filesystem  ~/.local/state/agent-env/object_store/
 
 [stores.image]
 impl = "agent_env.store.image_store:LocalRegistryImageStore"
@@ -1071,9 +1190,9 @@ $ agent-env config show
 config:         <project>/.agentenv/config.toml
                 discovered by walking up from the working directory
 
-document:       LocalSqliteDocumentStore  path=<project>/.agentenv/document_store/documents.db
+document:       LocalSqliteDocumentStore  path=<home>/.local/state/agent-env/document_store/documents.db
                 from [stores.document]
-object:         LocalFilesystemObjectStore  root=<project>/.agentenv/object_store
+object:         LocalFilesystemObjectStore  root=<home>/.local/state/agent-env/object_store
                 from [stores.object]
 image:          LocalRegistryImageStore  registry_host=localhost:5000
                 from [stores.image]
@@ -1087,11 +1206,13 @@ sandbox:        default=local  agent_default=local
 ...
 ```
 
-Fourteen sections are reported. With no file the header reads `config: (none)` and every store `from built-in default`. When an environment variable beats the file, the section says so and names what it shadowed: with `AGENT_ENV_DOCUMENT_STORE=local` exported against a file whose `[stores.document]` names another class, the `document` block reads `from $AGENT_ENV_DOCUMENT_STORE` followed by `; <class> in [stores.document], shadowed`. That line is the point: one variable can downgrade a single store while every other section stays on the file, and nothing else in the system says so. Sections resolved through an alias report the class the name became; the rest report what the file contributes and, when absent, the module their fallback lives in. A section that fails validation is reported in place as `(unresolved)` with the `ConfigError` text, for example an empty `[agents] default_a2a_agent_id`.
+Fourteen sections are reported, followed by a `plugins:` block that lists each `[plugins.<package>]` table under the distribution it belongs to (see [Plugin settings](#plugin-settings)). With no file the header reads `config: (none)` and every store `from built-in default`. When an environment variable beats the file, the section says so and names what it shadowed: with `AGENT_ENV_DOCUMENT_STORE=local` exported against a file whose `[stores.document]` names another class, the `document` block reads `from $AGENT_ENV_DOCUMENT_STORE` followed by `; <class> in [stores.document], shadowed`. That line is the point: one variable can downgrade a single store while every other section stays on the file, and nothing else in the system says so. Sections resolved through an alias report the class the name became; the rest report what the file contributes and, when absent, the module their fallback lives in. A section that fails validation is reported in place as `(unresolved)` with the `ConfigError` text, for example an empty `[agents] default_a2a_agent_id`.
 
-`agent-env config debug` answers the other question, why that file: it prints every path discovery considers, in order, marking the winner with `->` and each with `(walk-up, exists: yes|no)`; with `AGENT_ENV_CONFIG` set, the single line reads `($AGENT_ENV_CONFIG, exists: yes)` and `config show` reports `via $AGENT_ENV_CONFIG`. Every command in the group takes `--json`; the JSON keeps the provenance (`winner`, `shadowed`, `impl`, `config`, `error` per section, plus `config_path` and `config_source`) rather than flattening to effective values. All are read-only: no store is constructed, nothing is fetched, and no `.agentenv/` directory is created. Secret values never appear: an `env:` or `secret:` reference prints as the reference, and a literal under a secret-shaped key (`api_key`, `token`, `password` and similar) prints as `***`, as does anything nested beneath one.
+`config show` also warns, under the header, about anything in the file that nothing reads: a top-level section's name bound to the table above it by a bare key, a key set both beside a `config` table and inside it, and a table or key agent-env does not have. The last names the one meant when one is close, so `[sanbox]` gets `Did you mean [sandbox]?` and `[envs] implz` gets `Did you mean 'impls'?`; otherwise it says what the table takes, that a seam's class takes its settings under `config`, or, for a top-level table, that a plugin's own settings go under `[plugins.<package>]`. The file is checked as written, so a typo in a table an environment variable replaces is still reported. Tables whose keys a class, a plugin or you choose are not checked: a seam's `config`, provider names and their `config`, `[sandbox.attribution]`, `[model.roles]`, `[model.params]`, `[artifacts.type_aliases]` and everything under `[plugins]`. The warnings are advice: `config show` still exits 0, `--json` lists them in `warnings`, a service that logs the report logs them, and `plugin check` does not fail on them.
 
-`agent-env config explain <path>` narrows `show` to one value. `<path>` is a section name or a TOML path — `document` and `stores.document` both work — and the output is that section's block on its own: the resolved value, `from <layer>`, and any `; ... shadowed` lines. A path *above* a section — `stores`, say — has no single winner, so it lists the sections under it and how each resolved rather than echoing a file table a higher layer may already have replaced. A path *below* a section is read out of whichever layer won that section, not out of the file — so with `AGENT_ENV_DOCUMENT_STORE=local` set, `config explain stores.document.config.database` reports what the local backend resolves to and names the shadowed file table, rather than echoing a database name the process never reads. Keys the file is not the only source for (`model.api_key`, `agents.default_a2a_agent_id` and the like) resolve through their own layers, so an environment override or a built-in default is reported as the winner. A path nothing supplies reads `(unset)`, and one only the file knows about says so.
+`agent-env config debug` answers the other question, why that file: it prints every path discovery considers, in order, marking the winner with `->` and each with `(walk-up, exists: yes|no)`; with `AGENT_ENV_CONFIG` set, the single line reads `($AGENT_ENV_CONFIG, exists: yes)` and `config show` reports `via $AGENT_ENV_CONFIG`. Every command in the group takes `--json`; the JSON keeps the provenance (`winner`, `shadowed`, `impl`, `config`, `error` per section, plus `config_path` and `config_source`) rather than flattening to effective values. `config show --json` also has a `plugins` object, `{error, tables}`, where each table is `{name, installed, version, plugin, keys, value, error}`: `installed` says a distribution of that name is installed, `plugin` that it declares an `agent_env.*` entry point, and `keys` lists the table's keys as the file spells them. All are read-only: no store is constructed, nothing is fetched, and no `.agentenv/` directory is created. Secret values never appear: an `env:` or `secret:` reference prints as the reference (its `?default`, a literal, is masked like one), and a literal under a secret-shaped key (`api_key`, `token`, `password` and similar) prints as `***`, as does anything nested beneath one.
+
+`agent-env config explain <path>` narrows `show` to one value. `<path>` is a section name or a TOML path — `document` and `stores.document` both work — and the output is that section's block on its own: the resolved value, `from <layer>`, and any `; ... shadowed` lines. A path *above* a section — `stores`, say — has no single winner, so it lists the sections under it and how each resolved rather than echoing a file table a higher layer may already have replaced. A path *below* a section is read out of whichever layer won that section, not out of the file — so with `AGENT_ENV_DOCUMENT_STORE=local` set, `config explain stores.document.config.database` reports what the local backend resolves to and names the shadowed file table, rather than echoing a database name the process never reads. Keys the file is not the only source for (`model.api_key`, `agents.default_a2a_agent_id` and the like) resolve through their own layers, so an environment override or a built-in default is reported as the winner. A path nothing supplies reads `(unset)`, and one only the file knows about says so. A `plugins.<package>` path is read from that plugin's table, with the package matched by canonical name. Its last line says whose table it is and that agent-env does not read it; agent-env cannot tell whether the plugin reads that key. `--json` puts the owner in `plugin`, `{name, installed, version, plugin}`, which is `null` for every other path. A package segment may be quoted as `config show` prints it, `plugins."AgentEnv.Toy".region`, or dotted as `plugin list` prints it.
 
 `agent-env config sources` answers the question between the other two — not which file, and not what each section became, but which *layers* are in play at all. It lists them lowest precedence first, marking each present one with `->` and naming what each shadows:
 
@@ -1106,14 +1227,6 @@ Fourteen sections are reported. With no file the header reads `config: (none)` a
 -> env      $LITELLM_API_KEY -> [model.api_key]  (***)
    env      $LITELLM_BASE_URL -> [model.base_url]
    env      $AGENT_ENV_HUMAN_A2A_URL -> [conversations.default_human_a2a_url]
-   env      $AGENT_ENV_RDS_HOST -> [state.providers]  (selects the group)
-   env      $AGENT_ENV_RDS_PORT -> [state.providers]
-   env      $AGENT_ENV_RDS_DBNAME -> [state.providers]
-   env      $AGENT_ENV_RDS_USERNAME -> [state.providers]
-   env      $AGENT_ENV_RDS_PASSWORD -> [state.providers]
-   env      $AGENT_ENV_RDS_SSLMODE -> [state.providers]
-   env      $AGENT_ENV_RDS_AUTH -> [state.providers]
-   env      $AGENT_ENV_RDS_REGION -> [state.providers]
    env      $AGENT_SANDBOX_MODE  (no file equivalent)
    env      $AGENT_ENV_MODAL_REGION  (no file equivalent)
    env      $AGENT_ENV_MODAL_APP_NAME  (no file equivalent)
@@ -1128,12 +1241,67 @@ The layers contributing nothing are listed on purpose: "the file I edited is not
 
 | Seam | Alias | Built-in implementations | Env var |
 |---|---|---|---|
-| `[stores.document]` | `local` (SQLite) | `LocalSqliteDocumentStore`, `MongoDocumentStore` (table only) | `AGENT_ENV_DOCUMENT_STORE` |
-| `[stores.object]` | `local` (filesystem) | `LocalFilesystemObjectStore`, `S3ObjectStore` (table only) | `AGENT_ENV_OBJECT_STORE` |
+| `[stores.document]` | `local` (SQLite) | `LocalSqliteDocumentStore`, `MongoDocumentStore`, `DynamoDbDocumentStore` (table only), `FirestoreMongoDocumentStore` (`gcp` extra, table only) | `AGENT_ENV_DOCUMENT_STORE` |
+| `[stores.object]` | `local` (filesystem) | `LocalFilesystemObjectStore`, `S3ObjectStore` (table only), `GcsObjectStore` (`gcp` extra, table only) | `AGENT_ENV_OBJECT_STORE` |
 | `[stores.image]` | `local` (registry at `localhost:5000`) | `LocalRegistryImageStore`, `OciRegistryImageStore`, `EcrImageStore` | `AGENT_ENV_IMAGE_STORE` |
-| `[stores.secret]` | `local` (process env vars) | `LocalSecretStore`, `AwsSecretsManagerSecretStore` | `AGENT_ENV_SECRET_STORE` |
+| `[stores.secret]` | `local` (process env vars) | `LocalSecretStore`, `AwsSecretsManagerSecretStore`, `GcpSecretManagerSecretStore` (`gcp` extra, table only) | `AGENT_ENV_SECRET_STORE` |
+
+`DynamoDbDocumentStore` keeps each collection in its own on-demand table, `{table_prefix}{collection}`, created on first use. It authenticates through the standard boto3 credential chain; that identity needs `dynamodb:CreateTable` (only if agent-env creates the tables), `DescribeTable`, `GetItem`, `PutItem`, `DeleteItem`, `Query` and `Scan` on the prefixed tables. Items are keyed by the collection's unique index, and the table's sort key is named for that index's fields as a JSON list (`sk` when it has none), so every process reads the keying from the table itself; a pre-created table needs a string hash key `pk` and a string sort key named that way. The index must exist before the collection's first write; agent-env ensures each collection's index before writing it, except conversations, so call `agent_env.a2a_agent.conversation_store.ensure_indexes()` once before the first multi-turn run. A read that pins every index field is a GetItem, one that pins the first is a Query, and any other read scans the whole table. A document is limited to DynamoDB's 400 KB item size:
+
+```toml
+[stores.document]
+impl = "agent_env.store.document_store:DynamoDbDocumentStore"
+config = { table_prefix = "agentenv_", region = "<region>" }
+```
+
+`FirestoreMongoDocumentStore`, from the `gcp` extra, keeps documents in a Firestore database with MongoDB compatibility (Enterprise edition). It takes `host`, which is `<uid>.<location>.firestore.goog` (`gcloud firestore databases describe --database=<database> --format='value(uid)'` prints the uid), and `database`. It signs in with an access token of the Application Default Credentials, so it runs wherever those do, on Google Cloud or off it. That identity needs `roles/datastore.user` for the documents and `roles/datastore.indexAdmin` for the index creation every process runs when it starts:
+
+```toml
+[stores.document]
+impl = "agent_env.store.document_store.firestore_mongo_document_store:FirestoreMongoDocumentStore"
+config = { host = "<uid>.<location>.firestore.goog", database = "<database>" }
+```
+
+It is `MongoDocumentStore` with the changes Firestore needs. Retryable writes are off. When two guarded writes race on one document, Firestore tells both that they matched, so every update and replace stamps an `_agentenv_write` field with a fresh value and counts as applied only when its own stamp landed, and an update that returns the document's previous state runs in a transaction, retried on write conflicts. Reads through the store drop the field. Raw pymongo access to the same collections (`Config.db`) gets none of this: it sees the field, and a raw guarded write that loses a race is still reported as matched. An upsert that loses an insert race is retried once, as MongoDB's server does for itself. Building an index takes about a minute even on an empty collection, and `ensure_index` waits for it, so the first process on a new database takes that long for each collection it touches. Threads in that process wait for the same build; let the process finish before starting others, because an index another process is still building does not yet reject duplicates, and duplicates written then leave a unique index needing repair. Documents nest at most 20 levels deep.
 
 The aliases `mongo`, `s3`, `ecr` and `aws` are recognized but have no built-in coordinates; using one raises `ConfigError` until you supply the table. The local image store starts a `registry:2` container named `agentenv-registry` on first push. Private registry credentials go in `[stores.image.config] credentials`.
+
+`S3ObjectStore` takes `bucket`, an optional `region` and `share_credentials` (default `false`), and authenticates through the standard boto3 credential chain (environment variables, shared config or SSO profile, instance or task role):
+
+```toml
+[stores.object]
+impl = "agent_env.store.object_store:S3ObjectStore"
+config = { bucket = "<bucket>", region = "<region>" }
+```
+
+With `share_credentials = true`, the AWS credentials boto3 resolves are frozen and handed to every agent container agent-env deploys and to every environment service that advertises `urn:agentenv:add-s3-credentials/v1` during `snapshot_env`. They carry that identity's whole IAM scope, not just the bucket.
+
+`GcsObjectStore`, from the `gcp` extra, takes `bucket` and an optional `project` and `signing_service_account`, and authenticates through Application Default Credentials (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or the attached service account). That identity needs to create, read, list and overwrite objects in the bucket (overwriting takes `storage.objects.delete`), as `roles/storage.objectUser` allows. Its object URLs are `gs://<bucket>/<key>`, and like the S3 store's they reach any bucket those credentials can read. The store's reads return an object's bytes as stored, so a gzip-encoded object comes back compressed, matching its reported size; Cloud Storage decompresses one fetched through a signed URL or grant, so the protocol client refuses those as oversize. Each write-once object carries an `agentenv-write-id` metadata entry, which lets a create the client retried after a lost response recognize its own write:
+
+```toml
+[stores.object]
+impl = "agent_env.store.object_store.gcs_object_store:GcsObjectStore"
+config = { bucket = "<bucket>", signing_service_account = "<name>@<project>.iam.gserviceaccount.com" }
+```
+
+Signed URLs and grants need something to sign with. With `signing_service_account` set, the store always signs as that account through IAM, which needs the same object access, while the store's identity needs `iam.serviceAccounts.signBlob` on it (`roles/iam.serviceAccountTokenCreator`); Google guarantees those signatures for twelve hours, and each is a network round trip. Without it, credentials that hold a service-account key sign locally, for up to seven days, and ADC of the `impersonated_service_account` type sign through IAM as their account; other ADC, such as a user login, an attached service account or Workload Identity Federation, sign nothing. `from_config` needs the network: it lists the bucket, and signs once when IAM signs, so a missing bucket or an unusable signer fails there. Without a signer the store signs nothing: a remote sandbox receives an object over its sandbox connection instead of fetching it, trajectories come back inline, and what needs a signed upload or a grant is unavailable, which includes `env snapshot`, GitHub image builds and the skill bundles, snapshots and changelogs agents move themselves. The object store never hands workloads Google credentials.
+
+For Artifact Registry, point `OciRegistryImageStore` at the registry and give it `GoogleAccessTokenCredentials`, from the `gcp` extra. It hands out access tokens of a service account that the Application Default Credentials impersonate, so the identity behind them needs `iam.serviceAccounts.getAccessToken` on that account (`roles/iam.serviceAccountTokenCreator`):
+
+```toml
+[stores.image]
+impl = "agent_env.store.image_store:OciRegistryImageStore"
+
+[stores.image.config]
+registry_host = "<region>-docker.pkg.dev"
+repository_prefix = "<project>/<repository>"
+
+[stores.image.config.credentials]
+impl = "agent_env.store.image_store.google_credentials:GoogleAccessTokenCredentials"
+service_account = "<registry-account>@<project>.iam.gserviceaccount.com"
+```
+
+The token is used for `docker login` inside sandboxes and handed to Modal as a registry secret, so give that account nothing but `roles/artifactregistry.writer` on the repository: writer rather than reader, because images built from GitHub are pushed from inside a sandbox. A token lasts an hour and is replaced once less than 45 minutes of it are left, so an image build can push at its end with the token it was given at its start. Create the repository beforehand; the store does not create repositories. The token can move any tag in the repository. The store logs in with the token for every image on the registry host, which Artifact Registry shares among all projects in a region. Without impersonation, `agent_env.store.image_store:SecretStoreCredentials` can read the registry's entry from a Docker config held in the secret store (under `registry_auths`), with the username `_json_key` and a service-account key as the password. That key does not expire and reaches every sandbox, so prefer impersonation.
 
 `LocalSecretStore` reads process environment variables first (`use_env = true`), then an optional flat YAML or JSON file:
 
@@ -1145,6 +1313,26 @@ config = { file_path = "<path>/secrets.yaml", use_env = true }
 
 `file_path` is resolved against the process working directory, not the config file, and must exist. `secret:` references cannot appear inside `[stores.secret]` itself. Store implementations are validated by the conformance suites in `tst/store/` (see [Conformance suites](#conformance-suites)).
 
+`AwsSecretsManagerSecretStore` reads one AWS Secrets Manager secret holding a flat JSON (or YAML) mapping, so `secret:KEY` resolves to that mapping's `KEY`, read verbatim as a string. It authenticates through the standard boto3 credential chain, needs `secretsmanager:GetSecretValue` on the secret, and re-reads it every `ttl_seconds` (default 300):
+
+```toml
+[stores.secret]
+impl = "agent_env.store.secret_store:AwsSecretsManagerSecretStore"
+config = { secret_name = "<secret name or ARN>", region = "<region>" }
+```
+
+`GcpSecretManagerSecretStore`, from the `gcp` extra, reads one Google Cloud Secret Manager secret version holding the same kind of mapping, and re-reads it on the same schedule. It takes `secret_name` (the secret's id), an optional `project`, which defaults to the one Application Default Credentials resolve (`GOOGLE_CLOUD_PROJECT`, a key file's or the metadata server's), and an optional `version`, which defaults to `latest`. It authenticates through Application Default Credentials and needs `secretmanager.versions.access` on the secret, which `roles/secretmanager.secretAccessor` granted on that secret alone allows:
+
+```toml
+[stores.secret]
+impl = "agent_env.store.secret_store.gcp_secret_manager_secret_store:GcpSecretManagerSecretStore"
+config = { secret_name = "<secret id>", project = "<project>" }
+```
+
+`latest` is the newest version even when it is disabled, so undo a bad rotation by adding a corrected version: a disabled `latest` fails every new process's first read.
+
+Both stores keep serving the last mapping they read when a re-read fails; only the first read, and an explicit `refresh()`, raise.
+
 ### Compute, state and runner
 
 | Seam | Purpose | Default | Notes |
@@ -1155,7 +1343,7 @@ config = { file_path = "<path>/secrets.yaml", use_env = true }
 | `[state.providers.<name>]` | durable environment state stores | `local_postgres` | the table name must equal the class's `type`; `local_postgres` is the only built-in and accepts no override |
 | `[runner]` / `[runner.config]` | who executes runs submitted through the explorer API | `local` (`LocalRunner`, `workers = 2`) | `AGENT_ENV_RUNNER=local` overrides the table; see [The local explorer and runner](#the-local-explorer-and-runner) |
 
-A chain such as `default = "my_cloud_flaky,my_cloud"` tries each provider in order and raises `RuntimeError: All N providers failed` when every member fails. Unknown provider names raise `ValueError`. Putting `impl` on a built-in name (`[sandbox.providers.local]`) is a `ConfigError`. See [`docs/e2b-sandbox-provider.md`](docs/e2b-sandbox-provider.md) for the `e2b` provider's `config` keys.
+A chain such as `default = "my_cloud_flaky,my_cloud"` tries each provider in order and raises `RuntimeError: All N providers failed` when every member fails. Unknown provider names raise `ValueError`. Putting `impl` on a built-in name (`[sandbox.providers.local]`) is a `ConfigError`. The `e2b` provider's `config` table needs two keys: `api_key` (a secret reference such as `secret:e2b_api_key` or `env:E2B_API_KEY`) and `base_template` (an immutable, versioned E2B template with Docker Engine and the Docker Compose v2 plugin).
 
 ### Model, human endpoint, explorer, registries
 
@@ -1167,8 +1355,8 @@ An example `[model]` table and the per-run precedence order are in [Model config
 | `[conversations]` | `default_human_a2a_url` | `ConfigError` when a human-in-the-loop step needs it and nothing is set |
 | `[agents]` | `default_a2a_agent_id` | the agent a `deploy_agent` step without `a2a_agent_id` (and a `rubrics_verifier` without `judge_a2a_agent_id`) deploys; precedence `configure(default_a2a_agent_id=...)`, then `[agents]`, then the built-in `a2a-default`; no env var; the value may be an `env:` / `secret:` reference; a blank value or any other key under `[agents]` is `ConfigError` (`[agents] has unknown keys [...]; allowed: ['default_a2a_agent_id']`) |
 | `[explorer]` | `port` (8234), `cors_origins`, `allowed_hosts`, `static_dir` | host is always `127.0.0.1`; foreign `Host` headers get HTTP 421 unless listed |
-| `[explorer.plugins]` | `impls` list | mounted before core routers; no per-plugin config |
-| `[task_steps]`, `[artifacts]`, `[envs]` | `impls` list of `"module:Class"` | each class needs its own unique `type`; duplicates and inherited base types are `ConfigError` |
+| `[explorer.plugins]` | `impls` list | mounted before core routers; a plugin's own settings go in `[plugins.<package>]` |
+| `[task_steps]`, `[artifacts]`, `[envs]` | `impls` list of `"module:Class"` | each class needs its own unique `type`; duplicates, inherited base types and a class that leaves a method its base requires unimplemented are `ConfigError` |
 | `[artifacts] type_aliases` | `legacy = "canonical"` string pairs | maps an artifact `type` string found in stored documents to a registered type; core ships no aliases. An alias that maps to itself, to a non-string, or to another alias is `ConfigError` |
 
 `LITELLM_BASE_URL` and `LITELLM_API_KEY` override `[model] base_url` and `api_key`; endpoint requirements and the full per-run precedence are in [Model configuration](#model-configuration-owns-precedence).
@@ -1183,12 +1371,150 @@ An example `[model]` table and the per-run precedence order are in [Model config
 | `AGENT_ENV_HUMAN_A2A_URL` | human-in-the-loop A2A base URL; wins over `[conversations]` |
 | `AGENT_ENV_LOCAL_SANDBOX_DIR` | work directory for local compose stacks (default `~/.agent-env-sandboxes`); must be a path Docker Desktop shares |
 | `AGENT_ENV_SNAPSHOT_AFTER_LOAD` | default for `--snapshot-after-load` on universe loads; `1`, `true` or `yes` turns it on |
-| `AGENT_ENV_FIXTURE_PREFIX` | prefix prepended to artifact object keys in a shared bucket |
+| `AGENT_ENV_FIXTURE_PREFIX` | prefix prepended, in a shared bucket, to every object key core builds: artifact objects, image builds, env and agent snapshots, changelogs, default agent and judge trajectories, verifier outputs and the A2A validator's fixtures |
 | `GITHUB_TOKEN` | auth for `--dockerfile-github-url` builds |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `E2B_API_KEY` | provider credentials; `E2B_API_KEY` is read as `env:E2B_API_KEY` from `[sandbox.providers.e2b.config]` |
 | `AGENT_ENV_MODAL_REGION` | region for the `modal` / `modal_vm` providers (default `us-east-1`) |
 
 No variable relaxes TLS verification; every client verifies certificates. Variables injected into containers are separate: the environment server reads `MCP_HOST`, `MCP_PORT` and `ENVIRONMENT_NAME`; an A2A agent reads `A2A_HOST`, `A2A_PORT`, and `A2AAgent.deploy` (called by `deploy_agent`) injects `LITELLM_BASE_URL` and `LITELLM_API_KEY`.
+
+## Run on Google Cloud
+
+agent-env runs on Google Cloud with no AWS account: Cloud Storage holds objects, Artifact Registry holds images, Secret Manager holds secrets, and MongoDB, as Atlas on Google Cloud or your own deployment, or Firestore with MongoDB compatibility holds documents. Each is an ordinary store table, described with its options in [Stores and secrets](#stores-and-secrets). This section puts them together: one configuration, the identities it needs, a first-day checklist, what does not work yet, and a run you can reproduce on a laptop.
+
+### Configuration
+
+Install agent-env with the `gcp` extra (see [Optional extras and bundled cloud SDKs](#optional-extras-and-bundled-cloud-sdks)): `uv sync --extra gcp` in a clone, or `uv tool install 'agentenv-framework[gcp]'`. Then point every store at Google Cloud in `.agentenv/config.toml`:
+
+```toml
+[stores.document]
+impl = "agent_env.store.document_store:MongoDocumentStore"
+config = { uri = "secret:mongodb_uri", database = "<database>" }
+
+[stores.object]
+impl = "agent_env.store.object_store.gcs_object_store:GcsObjectStore"
+config = { bucket = "<bucket>", signing_service_account = "<signer>@<project>.iam.gserviceaccount.com" }
+
+[stores.image]
+impl = "agent_env.store.image_store:OciRegistryImageStore"
+
+[stores.image.config]
+registry_host = "<region>-docker.pkg.dev"
+repository_prefix = "<project>/<repository>"
+
+[stores.image.config.credentials]
+impl = "agent_env.store.image_store.google_credentials:GoogleAccessTokenCredentials"
+service_account = "<registry>@<project>.iam.gserviceaccount.com"
+
+[stores.secret]
+impl = "agent_env.store.secret_store.gcp_secret_manager_secret_store:GcpSecretManagerSecretStore"
+config = { secret_name = "<secret id>", project = "<project>" }
+
+[model]
+base_url = "https://<your-openai-compatible-endpoint>/v1"
+api_key = "secret:litellm_api_key"
+
+[sandbox]
+default = "local"
+agent_default = "local"
+```
+
+The Secret Manager secret holds one YAML or JSON mapping, here with `mongodb_uri` and `litellm_api_key` among its keys, and each `secret:` reference reads one key, so no credential is written in the file; `[stores.secret]` itself cannot use `secret:` references, though `env:` works there. With Atlas, `uri` is the cluster's `mongodb+srv://` connection string, and the cluster must accept connections from wherever agent-env runs. To keep Secret Manager out of the process, mount the secret as a file instead (a Cloud Run secret volume, or the Secret Manager add-on on GKE) and read it with `LocalSecretStore(file_path=...)`. That store reads the file once, when it is built, and parses it as typed YAML, so quote a value such as `0123` or `on` that must stay a string; the Secret Manager store reads every value verbatim. `agent-env config show` confirms each store resolved to the class you meant without building any of them.
+
+To keep documents on Google Cloud as well, use a Firestore database with MongoDB compatibility (Enterprise edition) in place of MongoDB: `FirestoreMongoDocumentStore` signs in with the same Application Default Credentials, so the secret needs no `mongodb_uri`. Its table and what it changes are in [Stores and secrets](#stores-and-secrets):
+
+```toml
+[stores.document]
+impl = "agent_env.store.document_store.firestore_mongo_document_store:FirestoreMongoDocumentStore"
+config = { host = "<uid>.<location>.firestore.goog", database = "<database>" }
+```
+
+### Identities and IAM
+
+Three identities are involved, and each needs only what its row names:
+
+| Identity | Grant | Why |
+|---|---|---|
+| The one agent-env runs as, its Application Default Credentials | `roles/storage.objectUser` on the bucket | reads, lists and writes objects; replacing one takes `storage.objects.delete`, which this role has |
+| | `roles/iam.serviceAccountTokenCreator` on the signer account | `iam.serviceAccounts.signBlob`, to sign URLs and grants as that account |
+| | `roles/iam.serviceAccountTokenCreator` on the registry account | `iam.serviceAccounts.getAccessToken`, to mint registry tokens |
+| | `roles/secretmanager.secretAccessor` on the secret alone | `secretmanager.versions.access`, to read the bundle |
+| | `roles/datastore.user` and `roles/datastore.indexAdmin` on the project, with Firestore | reads and writes documents, and creates the indexes every process asks for when it starts |
+| The signer account (`signing_service_account`) | `roles/storage.objectUser` on the bucket | a signed request acts with the signer's access: a read needs `storage.objects.get`, an upload `create`, and a replacement `delete` |
+| The registry account (`service_account` under the image store's credentials) | `roles/artifactregistry.writer` on the one repository, nothing else | its token is used for `docker login` inside sandboxes and handed to Modal as a registry secret |
+
+MongoDB takes no Google IAM: its credentials are in the connection string, which is why the example keeps that in the secret. Firestore takes the `roles/datastore.*` row instead.
+
+- **Signing needs a service account.** A user login (`gcloud auth application-default login`), the attached service account of a VM, GKE or Cloud Run workload, and Workload Identity Federation cannot sign on their own, so without `signing_service_account` the store signs nothing and every feature that needs a signed URL or grant is unavailable (the list is in [Stores and secrets](#stores-and-secrets)). A workload may also sign as its own attached service account by setting `signing_service_account` to that account, which then needs `iam.serviceAccounts.signBlob` on itself (`roles/iam.serviceAccountTokenCreator` with the account as its own principal). IAM signatures are guaranteed for twelve hours; a service-account key signs locally for up to seven days, but it is a long-lived secret.
+- **Keep the signer account to the bucket.** `signBlob` on an account is enough to obtain that account's access tokens, so whoever can sign as the signer can act as it. Grant it nothing beyond the bucket.
+- **Keep the registry account dedicated.** Its token reaches every sandbox that pulls an image and Modal's registry secret, for up to an hour, and it can push or move any tag in the repository. An account with more than `artifactregistry.writer` on one repository would hand all of that to every workload.
+- **Set a quota project on a user login.** User credentials bill their API calls to a quota project, and the APIs must be enabled there. When the project `gcloud` recorded at login is not yours, signing fails at the first store use with `ConfigError: Cannot sign as <signer> (requests are billed to quota project '<other-project>'): ... IAM Service Account Credentials API has not been used in project <other-project> before or it is disabled`. Fix it with `gcloud auth application-default set-quota-project <project>`, or export `GOOGLE_CLOUD_QUOTA_PROJECT=<project>` for one shell.
+
+### Topology
+
+Put the bucket, the Artifact Registry repository and the machines that run agent-env in one region. With the `local` sandbox provider on a Compute Engine VM in that region, environment loads download their image tarballs from the bucket and agent containers pull from the registry without leaving it. Modal and E2B sandboxes run outside your project, on a cloud and region agent-env does not choose beyond Modal's `AGENT_ENV_MODAL_REGION`. A VM-mode deploy (`modal_vm`, `e2b`) downloads its image tarballs from the bucket through signed URLs, while the container-mode `modal` provider pulls every image, and every agent image, from the registry with the registry token, so expect that traffic to be billed as egress. The providers themselves are in [Choose compute, network policy and state](#choose-compute-network-policy-and-state).
+
+### Day-one checklist
+
+1. Enable the Cloud Storage (`storage.googleapis.com`), IAM Service Account Credentials (`iamcredentials.googleapis.com`), Artifact Registry (`artifactregistry.googleapis.com`) and Secret Manager (`secretmanager.googleapis.com`) APIs, and Firestore (`firestore.googleapis.com`) if documents go there, in your project and in the quota project of any user login.
+2. Create the bucket with uniform bucket-level access, since agent-env sets no object ACLs, and public access prevention enforced.
+3. Add lifecycle rules, because the object store never deletes anything. `a2a_validator/` holds validator probes and is disposable. Run outputs can expire as far as your run retention allows: `prompt_agent_trajectories/`, `judge_trajectories/`, `compacted-trajectories/`, `env_trajectory/`, `env_trigger_state/` and `verifier-outputs/`. Run records point at them, and each `verifier-outputs/` object is also registered as a per-run `FileArtifact`, which is left pointing at nothing once the object expires. `agent_changelog/` is a run output too, except for a capture a task replays through a `deploy_agent` step's `agent_changelog_object_url`; keep those. Keep `artifacts/`, `agent_snapshots/`, `env-snapshots/` and `github-builds/`: versioned artifacts point at them. With `AGENT_ENV_FIXTURE_PREFIX` set, every one of these keys starts with `<prefix>/`, so write the rules for the prefixed paths.
+4. Create the Docker repository in Artifact Registry; the image store does not create repositories. Every artifact version pushes its own `v<N>` tag, so the repository grows with every `put`. A cleanup policy that deletes old tags leaves those versions deployable only where the image is loaded from its tarball in the bucket (VM-mode environment deploys, `local` included, and agents on `modal_vm` and `e2b`), not where it is pulled (agents on `local` and `modal`, and environments on the container-mode `modal` provider).
+5. Create the signer and registry service accounts and make the grants in [Identities and IAM](#identities-and-iam).
+6. Create the secret and add its first version holding the mapping.
+7. Run `agent-env config show`, then any command that uses the object store. When `GcsObjectStore` is built it lists the bucket as your identity and, with `signing_service_account`, signs once as that account, so a missing bucket, a missing grant for your identity on the bucket or on the signer, or the quota-project trap fails there with a `ConfigError` rather than mid-run. The signer account's own grant on the bucket is first used by a signed URL, so a missing one fails later, with `403 AccessDenied` from Cloud Storage.
+
+### What works, and what does not yet
+
+- **Agents that take the object-transfer forms** (see [Object transfer](packages/agentenv-protocol/README.md#object-transfer)) get HTTPS grants for everything they move: skill bundles, trajectories, snapshot saves and loads, and changelog capture and replay. None needs Google credentials. A grant lasts at most as long as the signer can sign, twelve hours through IAM, so a changelog capture configured to last longer fails its step for an agent that takes only the object form, and sends an agent that also takes `s3_prefix` that form, which it cannot use here.
+- **Agents that take only the older S3-named forms** are handed `gs://` URLs as `skill_s3_url` or `s3_prefix`, which they cannot use without their own Google credentials. A legacy snapshot save also carries a `presigned_post` that Cloud Storage accepts; an agent that uploads through it instead of `s3_prefix` works. A legacy agent that returns its trajectory inline works, since agent-env uploads it; one that answers with a `trajectory_s3_prefix` it wrote itself does not.
+- **No credentials are shared.** agent-env hands agents and environment services no Google credentials: `GcsObjectStore` shares none, and `urn:agentenv:add-s3-credentials/v1` applies to S3 only. What they move goes through grants and signed URLs.
+- **Without a signer**, the store still reads and writes, but a remote sandbox receives each object over its sandbox connection instead of fetching it, trajectories come back inline, and `env snapshot`, GitHub image builds, and the skill bundles, snapshots and changelogs agents move themselves are unavailable; see [Stores and secrets](#stores-and-secrets).
+
+### A local run on Google Cloud
+
+This reproduces the [Quickstart](#quickstart-a-local-environment-you-can-call-then-a-graded-run) with objects and images on Google Cloud and no AWS account or credentials; documents and secrets stay local, so the project needs only the bucket, the repository, the two accounts and their grants. Log in and set the quota project:
+
+```bash
+gcloud auth application-default login
+gcloud auth application-default set-quota-project <project>
+```
+
+Write this as `.agentenv/config.toml` in an empty project directory, in place of the Quickstart's all-local example:
+
+```toml
+[stores]
+document = "local"
+secret = "local"
+
+[stores.object]
+impl = "agent_env.store.object_store.gcs_object_store:GcsObjectStore"
+config = { bucket = "<bucket>", signing_service_account = "<signer>@<project>.iam.gserviceaccount.com" }
+
+[stores.image]
+impl = "agent_env.store.image_store:OciRegistryImageStore"
+
+[stores.image.config]
+registry_host = "<region>-docker.pkg.dev"
+repository_prefix = "<project>/<repository>"
+
+[stores.image.config.credentials]
+impl = "agent_env.store.image_store.google_credentials:GoogleAccessTokenCredentials"
+service_account = "<registry>@<project>.iam.gserviceaccount.com"
+
+[sandbox]
+default = "local"
+agent_default = "local"
+```
+
+`agent-env config show` should report `object: GcsObjectStore` and `image: OciRegistryImageStore`, each `from [stores.object]` and `from [stores.image]`. Unset every `AWS_*` variable to confirm nothing needs AWS credentials; the bootstrap images' base images and the local state Postgres still come, anonymously, from Amazon ECR Public (`public.ecr.aws`). Then run the Quickstart from [Point at a model](#point-at-a-model) through [Tear down](#tear-down), with four differences:
+
+- Skip the `cp` in [Start the local stack](#start-the-local-stack), which would replace this config with the all-local example.
+- Every `put` pushes its image to `<region>-docker.pkg.dev/<project>/<repository>/` and uploads the image's tarball to `gs://<bucket>/artifacts/docker_image/`. The push runs `docker login` with a registry token, which Docker keeps in its credential store after the token expires within the hour; `docker logout <region>-docker.pkg.dev` removes the entry.
+- Trajectories go to `gs://<bucket>/prompt_agent_trajectories/prompt_id=<prompt-id>/`; `task.json` needs no change.
+- Environment deploys download each image tarball through a signed URL, and the agent container is pulled from Artifact Registry.
+
+The context JSON's `prompt_responses[0].agent_trajectory_s3_uri` is then a `gs://` URL; the field keeps its older name. Nothing agent-env wrote is deleted by tear-down: the images stay in the repository and the objects in the bucket, which the lifecycle rules and cleanup policy above take care of.
 
 ## CLI reference
 
@@ -1201,7 +1527,7 @@ The root `agent-env --help` listing is shown under [Verify and platform notes](#
 - `put` never overwrites: repeating it on an existing id appends a version.
 - References are `id` or `id:version`; `--version` and bare ids default to the latest version.
 - `--platform` on every image-building `put` defaults to `linux/amd64`; see [Verify and platform notes](#verify-and-platform-notes) for Apple Silicon.
-- `--sandbox`, `--env-sandbox` and `--agent-sandbox` accept a name or a comma-separated fallback chain. `--cua-sandbox` on `task run` / `task run-batch` takes a single backend, no chain; it is forwarded to `deploy_env` as `cua_sandbox_type` and only a custom `Env.deploy()` that accepts that keyword uses it. The built-in `mcp-server`, `website` and `multi` kinds log `Ignoring cua_sandbox=...` and proceed.
+- `--sandbox`, `--env-sandbox` and `--agent-sandbox` accept a name or a comma-separated fallback chain.
 - `--output-dir` on `task run`, `task run-batch`, `eval run` and the `artifact ... get` commands selects where files land.
 - `--help`, `config show`, `config explain`, `config sources`, `config debug`, `plugin list`, `plugin show` and `plugin check` never touch `.agentenv/`; every other command may create it.
 
@@ -1214,7 +1540,8 @@ The root `agent-env --help` listing is shown under [Verify and platform notes](#
 | `config` | inspect the resolved configuration, read-only | `show [--json]`, `explain PATH [--json]`, `sources [--json]`, `debug [--json]` |
 | `env` | build, register, deploy and inspect environments | `mcp-server put/validate/create-cli/load-environment-artifact`, `multi put/validate/load-environment-artifact/load-environment-universe-artifact/compatible-universes/validate-universe-compatibility`, `website put/load-environment-artifact`, `website-browser put`, `service-db put`, `gateway put`, `deploy`, `get-instance`, `snapshot`, `init-env-state`, `teardown-env-state` |
 | `eval` | groups of tasks | `create`, `add-tasks`, `run` |
-| `plugin` | installed plugins: what each contributes and whether it took effect | `list [--json] [--no-load]`, `show PACKAGE [--json] [--no-load]`, `check [--json]` |
+| `plugin` | installed plugins: what each contributes and whether it took effect; add and remove them | `list [--json] [--no-load]`, `show PACKAGE [--json] [--no-load]`, `check [--json]`, `add SPEC...`, `remove PACKAGE...` |
+| `run` | write and run the tasks and evals of a bundle folder or an installed bundle, such as the `hello` agent-env ships; with no argument, list the installed bundles and their folders | `--task`, `--eval`, `--model`, `--sandbox`, `--keep`; see [Run a bundle folder](#run-a-bundle-folder) |
 | `task` | define and run tasks | `create`, `get`, `validate`, `run`, `run-batch`, `get-instance` |
 | `up` | local stack: resolves backends, bootstraps `default-db` and `default`, serves the explorer API | `--no-bootstrap` |
 
@@ -1222,13 +1549,12 @@ Plugin groups appear in `--help` next to the built-ins; `agent-env plugin list` 
 
 ### Deprecated aliases and legacy paths
 
-No renamed-command aliases remain. `artifact service`, `artifact service-universe`, `load-service-artifact`, `load-service-universe-artifact` and the `--service-artifact*` options answer `No such command` or `No such option`; the names are `artifact environment`, `artifact environment-universe`, `load-environment-artifact`, `load-environment-universe-artifact` and `--environment-artifact-id`. `--service-version` survives on `env mcp-server put` and `env website put` (the environment's seed-schema version, default `1`); no artifact or load command takes it. There is no `agent` command group either (the former `agent put-image` and `agent deploy` are gone): `a2a-agent put` is the only way to register an agent image, and `deploy_agent` resolves it by id through `[agents] default_a2a_agent_id`. Stored documents that still carry a legacy artifact `type` string load only if `[artifacts] type_aliases` maps it (see [Configuration reference](#configuration-reference)).
+No renamed-command aliases remain. `artifact service`, `artifact service-universe`, `load-service-artifact`, `load-service-universe-artifact` and the `--service-artifact*` options answer `No such command` or `No such option`; the names are `artifact environment`, `artifact environment-universe`, `load-environment-artifact`, `load-environment-universe-artifact` and `--environment-artifact-id`. `--service-version` is gone from every command, along with the field it set. There is no `agent` command group either (the former `agent put-image` and `agent deploy` are gone): `a2a-agent put` is the only way to register an agent image, and `deploy_agent` resolves it by id through `[agents] default_a2a_agent_id`. Stored documents that still carry a legacy artifact `type` string load only if `[artifacts] type_aliases` maps it (see [Configuration reference](#configuration-reference)).
 
 ### Known gaps
 
 | Missing | Workaround |
 |---|---|
-| `agent-env --version` | `python -c "import importlib.metadata as m; print(m.version('agentenv-framework'))"` |
 | `init` or config scaffolding | copy `.agentenv/config.example.toml` to `.agentenv/config.toml`, then `agent-env config show` to confirm it is the file in effect |
 | `list` for environments, tasks, evals, agents, instances | `Env.query().execute()` in Python, or `GET /api/v1/{envs,tasks,agents,artifacts,evals}` on the explorer; only `artifact file-artifact-universe list` exists |
 | `env get` | `Env.get(id[, version])` in Python |
@@ -1246,7 +1572,7 @@ Every backend and primitive plugs in through the same pattern, so a company or l
 
 ### The seam pattern
 
-A config table names an implementation with `impl = "module.path:ClassName"`. agent-env imports the class, checks that it subclasses the seam's base class, resolves `env:` and `secret:` references in the `config` table, and calls `Class.from_config(**config)` (default: `Class(**config)`). Primitives register under their own `type`. Misconfiguration raises `agent_env.config.ConfigError` naming the impl and the reason: cannot import, not a subclass, malformed pointer, missing `impl`, unresolved reference, duplicate `type`, or inherited base `type`. The error appears when the seam is first used, so a broken `[task_steps]` entry breaks every task load.
+A config table names an implementation with `impl = "module.path:ClassName"`. agent-env imports the class, checks that it subclasses the seam's base class, resolves `env:` and `secret:` references in the `config` table, and calls `Class.from_config(**config)` (default: `Class(**config)`). Primitives register under their own `type`. Misconfiguration raises `agent_env.config.ConfigError` naming the impl and the reason: cannot import, not a subclass, malformed pointer, missing `impl`, unresolved reference, duplicate `type`, inherited base `type`, or, for a store or the runner, a `config` key the class does not take or a required one it lacks. The error appears when the seam is first used, so a broken `[task_steps]` entry breaks every task load.
 
 Conformance suites exist for the four store seams only. Sandbox, state, runner, step, artifact, environment and explorer-plugin seams have none yet; the unit tests under `tst/unit/providers/` and `tst/unit/cli/plugins_test.py` are the closest contract specification.
 
@@ -1263,13 +1589,70 @@ path = "env:MYCORP_DOCS_PATH?.agentenv/mycorp_docs.json"
 
 A custom store may resolve relative paths in its `config` table as it likes; only the built-in `local` aliases anchor to the config file's directory. Run the conformance suites from a source checkout, as described in [Conformance suites](#conformance-suites).
 
-### Custom sandbox, state and runner providers
+An `ObjectStore`'s `get`, `open` and `download_to_file` must raise `ObjectNotFoundError` (from `agent_env.store`; both a `NotFoundError` and a `FileNotFoundError`) for a missing object, and `get_object_key` must raise `ValueError` for a URL that is not one of its own. Core never checks for a particular backend's URL scheme. It hands object URLs to the store, which reads whatever its backend can reach, and asks `owns(url)` where only the store's own objects may be served; `owns` is by default true exactly when `get_object_key` accepts the URL.
 
-Sandbox: subclass `agent_env.providers.sandbox_provider.SandboxProvider`, implement `create_sandbox`, and register it under `[sandbox.providers.<name>]` or as an `agent_env.sandbox_providers` entry point named `<name>`. The `<name>` must equal the `.type` of the `Sandbox` objects it produces. That check runs on the first `create_*` call, terminates the mis-typed sandbox, and raises `SandboxProviderTypeError`, a `ConfigError`. This name-equals-type rule is what lets agent-env reconnect to an instance from its stored record.
+An `ImageStore`'s `owns(ref)` says whether a ref is on the store's registry, the refs `auth(ref)` logs in for. The default owns nothing; `OciRegistryImageStore`, and so the ECR and local stores, owns every ref on its host. The Modal container path runs a configured service-db, pgweb or db-mcp image only when the store serving it owns it, and otherwise stock Postgres, or no sidecar.
 
-State: subclass `agent_env.providers.state.env_state_provider.EnvStateProvider`, set `type`, implement `acquire`, `_teardown` and `deploy_state_context(ttl_seconds=, name_hint=)`. Register under `[state.providers.<name>]` or as an `agent_env.state_providers` entry point; here the name-equals-type check runs at registration. Once a non-local provider exists, `env init-env-state --env-state-type <name>` can pre-create a store out of band; `local_postgres` refuses that.
+Core calls a store from worker threads, several at once: every sign, registry login and grant runs off the event loop, since for a remote backend each is a network round trip. A store must be safe to call concurrently.
 
-Runner: subclass `agent_env.runner.runner.Runner` (`submit`, `status`, `cancel` abstract) and set `[runner] impl` plus `[runner.config]`; the contract and what the runner serves are in [At scale: bring your own durable runner](#at-scale-bring-your-own-durable-runner). Only `LocalRunner` ships. None of these three seams has a conformance suite.
+An `ObjectStore` has three optional methods that sign the HTTPS grants through which A2A agents move skill bundles, trajectories, snapshots and changelog increments without storage credentials (see [Object transfer](packages/agentenv-protocol/README.md#object-transfer)). To offer them, set `supports_transfer_grants = True`, on the class or per instance, and implement all three; agent-env requests grants only from a store that sets the flag. The defaults raise `NotImplementedError`, so one the store cannot offer raises `GrantUnavailableError` instead. `S3ObjectStore` sets the flag unless its endpoint is plain HTTP, as a local S3 emulator's usually is, because grants are HTTPS URLs. A store whose provider caps what one upload can create sets `max_single_upload_bytes`, and no write grant promises more.
+
+| Method | Returns |
+|---|---|
+| `issue_read_grant(object_url, *, expires_in=3600)` | `HttpGetGrant` for one existing object |
+| `issue_write_grant(object_url, *, media_type, max_bytes, expires_in=3600)` | `HttpPutGrant` for one object, signed for `media_type` |
+| `issue_upload_policy(prefix_url, *, max_object_bytes, expires_in)` | `UploadPolicy`: a multipart POST (`HttpPostPolicyGrant`) for uploads below `prefix_url`, and its `expires_at` |
+
+A grant's `expires_at` is when it stops working: at most `expires_in` from now, and earlier if the store's signing credentials expire first. agent-env wraps an upload policy in the changelog's object-count and total-size limits, which the agent's uploader enforces, and hands it over once for a whole capture, so the policy must last all of `expires_in`: raise `GrantUnavailableError` (from `agent_env.store`) when it could be cut short, and for any `expires_in` longer than the store can sign. Decide that from what signs the grant, not from how long the current credentials happen to have left, so that one configuration always gets the same answer. `deploy_agent` then falls back to the older `s3_prefix` form for an agent that also takes it, and fails the step for an agent that takes only `write_namespace`. Have the provider enforce the prefix and the per-object size. `S3ObjectStore` implements all three with presigned GET and PUT URLs and POST policies, which SigV4 caps at seven days, and states S3's 5 GiB single-PUT cap. It issues upload policies only when it signs with long-term credentials: temporary ones, such as an assumed role's, SSO's or an instance profile's, are replaced during a capture and end the grants they signed. `GcsObjectStore` sets the flag when it has a signer and an HTTPS endpoint, and implements all three with V4 signed URLs and POST policies, for as long as its signer can sign (above); a write grant signs `x-goog-content-length-range` and an upload policy a `content-length-range`, so Cloud Storage itself refuses an upload over the limit, and a policy's signed `starts-with` condition refuses one whose key falls outside its prefix. Its signature does not depend on how long the caller's own token lasts, so every signer counts as long-term within its cap. A capture longer than that cap sends an agent that also takes `s3_prefix` that form instead, with a `gs://` prefix it cannot write to.
+
+### Custom sandbox, state, environment and runner providers
+
+Sandbox: subclass `agent_env.providers.sandbox_providers.sandbox_provider.SandboxProvider`, implement `create_sandbox`, and register it under `[sandbox.providers.<name>]` or as an `agent_env.sandbox_providers` entry point named `<name>`. The `<name>` must equal the `.type` of the `Sandbox` objects it produces. That check runs on the first `create_*` call, terminates the mis-typed sandbox, and raises `SandboxProviderTypeError`, a `ConfigError`. This name-equals-type rule is what lets agent-env reconnect to an instance from its stored record.
+
+State: subclass `agent_env.providers.env_state.env_state_provider.EnvStateProvider`, set the `type` ClassVar, implement `acquire`, `_teardown` and `deploy_state_context(ttl_seconds=, name_hint=)`. Register under `[state.providers.<name>]` or as an `agent_env.state_providers` entry point; here the name-equals-type check runs at registration. Once a non-local provider exists, `env init-env-state --env-state-type <name>` can pre-create a store out of band; `local_postgres` refuses that.
+
+Environment: subclass `agent_env.providers.env_providers.env_provider.EnvironmentProvider`, set `type`, and implement `deploy(env, sandbox_provider, **options)` and `close()`. `deploy` returns the env's record unregistered, a `DeployedEnv`, `DeployedSandboxEnv` or `DeployedGatewayEnv` whose `env_provider_type` is `type`, and `close` tears down everything the deploy created: agent-env's reapers find only its own sandboxes, by the ids a record carries. Register it as an `agent_env.env_providers` entry point named `type`; the name-equals-type check runs at registration, and `gateway` (a gateway and service database in front of the server) and `server` (the server on its own) are built in.
+
+A stock `MCPServerEnv`, `WebsiteEnv` or `MultiEnv` deploys through the provider its `env_provider_type` names, so it runs on yours. Set the type with `--env-provider-type <type>` on `agent-env env mcp-server put`, `env website put` or `env multi put`, which check that the type is installed, or with `env_provider_type="<type>"` on the env's `put`; a task's `deploy_env` then builds your provider when it deploys the env. Reading a stored env needs no provider installed, but saving a task that deploys it does: `task create` checks the step's options against your `deploy`, and reports a type it can't find.
+
+```python
+from agent_env.env.env import DeployedEnv
+from agent_env.env.envs.mcp_server import MCPServerEnv
+from agent_env.env.envs.multi_env import MultiEnv
+from agent_env.providers.env_providers import EnvironmentProvider
+
+class PodProvider(EnvironmentProvider):
+    type = "pod"
+
+    async def deploy(self, env, sandbox_provider, **options) -> DeployedEnv:
+        if isinstance(env, MultiEnv) and not env.website_envs:
+            servers = env.mcp_server_envs
+        elif isinstance(env, MCPServerEnv):
+            servers = [env]
+        else:
+            raise TypeError(f"{self.type} doesn't deploy a {env.type} env")  # before creating anything
+        # One server serves its own card; several run behind a gateway whose card lists each of them.
+        url = await start_pods({s.environment_name: s.docker_image_artifact.image_name for s in servers},
+                               ttl_seconds=options["ttl_seconds"])
+        return DeployedEnv(env_id=env.id, env_version=env.version, env_provider_type=self.type,
+                           environment_card_url=f"{url}/.well-known/agent-env.json", environment_card=await read_card(url))
+
+    async def close(self) -> None:
+        await stop_pods()
+```
+
+- **What it deploys.** `deploy` receives an `MCPServerEnv`, a `WebsiteEnv` or a `MultiEnv`, and reads what to run from the attributes [the plugin surface](#plugin-compatibility) lists. A provider handed an env it doesn't host raises `TypeError` before it creates anything. The built-in `server` deploys only an `MCPServerEnv`, so a `WebsiteEnv` or `MultiEnv` of that type is refused at `put`, when a task is saved, and at deploy.
+- **A `MultiEnv`** is deployed by its own `env_provider_type`, which hosts all of its MCP servers and websites; the children's own types are ignored. A `MultiEnv` whose MCP server and website share a name is refused for a plugin's type, at `put` as at deploy, since one card can't tell them apart.
+
+- **Options.** Take `**options`: it receives every option the env's deploy was given, `ttl_seconds`, `disk_size_gb`, `gateway_mode`, `cpu`, `memory_mb`, `priority`, `env_state_type`, `env_state_instance_id` and `attribution`. A `deploy` that names its options instead gets those, and the deploy is refused any other option set away from its default: `deploy_env` always sets `ttl_seconds` and `attribution`, and `agent-env env deploy` and a run's overrides set `priority`.
+- **The record** must say `env_provider_type` is your `type` and carry the server's MCP URL, in its env card (`environment_card` and `environment_card_url`, which come together and which the URL derives from) or in `mcp_url`. A card must be named the env's `environment_name`, or list a child env of that name; a `MultiEnv`'s lists each of its MCP servers and websites as a child env by `environment_name`, and needn't list the website browser our gateway adds. A child env's `url` is a path under the record's address, such as `/svc/<name>/agentenv`. Agents see a `MultiEnv`'s MCP server under the record's `mcp_server_name`, which defaults to its card's `name`; when the env has a `name`, it must be that. A record that breaks one of these fails the deploy, which closes the provider.
+- **Loads** (`load_artifact`, `env mcp-server load-environment-artifact`) hand the server the data file as a signed URL in the data plane's `add_data`, at the address its record's env card gives; each of a `MultiEnv`'s children, websites included, loads this way. The server must fetch an `http(s)` `FileWithUri` part, and the object store must sign URLs: S3 does, while the local filesystem store can't. A load the store can't sign, of an object that is gone, or into a card whose operations leave out `data/reset` or `data/add` is refused before it touches the env's data. A universe loads service by service, with no resume and no snapshot restore or bake, as on an external state store. Staging files onto the env's host (`load_file_artifact_universe`, or a universe's metadata files) is refused before anything is loaded, and so is snapshot capture before it reads anything.
+- **Lifetime.** `close()` runs when the deploy fails, or when a caller holding the env object that deployed closes it; a task doesn't. `teardown_sandboxes`, and the cleanup after an env's `validate()`, terminate the sandboxes a `DeployedSandboxEnv` record names; a deployment outside agent-env's sandboxes must end by itself, for example at `ttl_seconds`. An env reattached from a plugin's record, as `Env.from_instance_id` gives, holds no provider, so its `close()` does nothing.
+- **A provider that subclasses a built-in** (`EnvironmentGatewayProvider`, `EnvironmentServerProvider`) is handled as one: loads stage into its sandboxes, and its records reattach to them. Its `deploy` must return the built-in's kind of record, a `DeployedSandboxEnv`, or the deploy fails.
+
+A custom env can use a provider itself: it builds it with `build_env_provider(type)` and registers the record with `agent_env.env.store.register_env_instance`, and it may list the types it accepts in its `env_provider_types`. `register_env_instance` refuses a record that would load back as another class and drop the fields its own class adds, so a deploy keeps what it learns on the env card and the containers it created in `sandbox_ids`.
+
+Runner: subclass `agent_env.runner.runner.Runner` (`submit`, `status`, `cancel` abstract) and set `[runner] impl` plus `[runner.config]`; the contract and what the runner serves are in [At scale: bring your own durable runner](#at-scale-bring-your-own-durable-runner). Only `LocalRunner` ships. None of these four seams has a conformance suite.
 
 ### Custom envs, task steps, artifacts
 
@@ -1277,14 +1660,14 @@ Runner: subclass `agent_env.runner.runner.Runner` (`submit`, `status`, `cancel` 
 |---|---|---|---|
 | task step | `agent_env.task_step.task_step.TaskStep` | `type` ClassVar, `to_dict`/`from_dict`, `async execute(context)`, optional `preflight()` | `[task_steps] impls`, or an `agent_env.task_steps` entry point |
 | artifact | `agent_env.artifact.artifact.Artifact` (pydantic) | `type` field default is the registry key | `[artifacts] impls`, or an `agent_env.artifacts` entry point |
-| environment | `agent_env.env.env.Env` (subclass it directly; there are no generic parameters) | `type` ClassVar, `from_dict`, `async deploy(**kwargs) -> DeployedEnv` (both raise `NotImplementedError` on the base); `to_dict` is inherited | `[envs] impls`, or an `agent_env.envs` entry point |
+| environment | `agent_env.env.env.Env` (subclass it directly; there are no generic parameters) | `type` ClassVar, `from_dict`, `async deploy(**kwargs) -> DeployedEnv` and the async classmethod `from_deployed_env(deployed)` (all three raise `NotImplementedError` on the base); `to_dict` is inherited | `[envs] impls`, or an `agent_env.envs` entry point |
 
 ```toml
 [task_steps]
 impls = ["mycorp_demo.steps:GradeEssayTaskStep"]
 ```
 
-A custom step's `preflight()` participates in `task create` and `task validate`. Verifiers are ordinary steps that write `context.metadata["verifications"][verifier_id] = {"score", "results"}`. A task made only of custom steps that need no sandbox runs in-process with no Docker, model or remote backend. Custom artifacts and environments round-trip through `put`, `get` and `query().type(...)`, and `Artifact.get` / `Env.get` return the registered subclass. There are no CLI subcommands for custom artifact or environment types; those round trips are Python-only. A custom environment's full contract is `type`, `from_dict` and `deploy`:
+A custom step's `preflight()` participates in `task create` and `task validate`. Verifiers are ordinary steps that write `context.metadata["verifications"][verifier_id] = {"score", "results"}`. A task made only of custom steps that need no sandbox runs in-process with no Docker, model or remote backend. Custom artifacts and environments round-trip through `put`, `get` and `query().type(...)`, and `Artifact.get` / `Env.get` return the registered subclass. There are no CLI subcommands for custom artifact or environment types; those round trips are Python-only. A custom environment's full contract is `type`, `from_dict`, `deploy` and `from_deployed_env`, which core calls to drive a running deployment, as `load_artifact` and `Env.from_instance_id` do:
 
 ```python
 from agent_env.env.env import DeployedEnv, Env
@@ -1297,14 +1680,18 @@ class MyCustomEnv(Env):
         ...                                      # rebuild from the stored document
 
     async def deploy(self, **kwargs) -> DeployedEnv:
-        ...                                      # provision and return a DeployedEnv
+        ...                                      # provision and return its record, e.g. a DeployedSandboxEnv
+
+    @classmethod
+    async def from_deployed_env(cls, deployed: DeployedEnv) -> "MyCustomEnv":
+        ...                                      # the env that record serves, connected to it
 ```
 
-An environment can also be referenced without ever being deployed. When a `deploy_agent` step lists its id in `env_ids` and no `deploy_env` step deployed it, the step reads an http(s) `mcp_url` attribute from the stored environment document and registers that live endpoint with the agent (a bearer token comes from `task run --remote-token <env-id>=<token>`), so such a class may leave `deploy()` unimplemented. This is how an MCP server that already runs elsewhere joins a task. Any other undeployed id fails with `Env '<id>' is not in context.deployed_envs; add a DeployEnvTaskStep for it, or reference an env that exposes a live http(s) 'mcp_url'`.
+An environment can also be referenced without ever being deployed. When a `deploy_agent` step lists its id in `env_ids` and no `deploy_env` step deployed it, the step reads an http(s) `mcp_url` attribute from the stored environment document and registers that live endpoint with the agent, so such a class may leave `deploy()` unimplemented. The step sends the endpoint no bearer token, so it must accept requests without one. This is how an MCP server that already runs elsewhere joins a task. Any other undeployed id fails with `Env '<id>' is not in context.deployed_envs; add a DeployEnvTaskStep for it, or reference an env that exposes a live http(s) 'mcp_url'`.
 
 ### Register types from an installed package
 
-An installed distribution registers envs, task steps, artifacts, sandbox and state providers and explorer plugins by declaring entry points, with no config. The group says what kind of thing it is, the entry-point name is the registry key, and the value is the class:
+An installed distribution registers envs, task steps, artifacts, sandbox, state and environment providers and explorer plugins by declaring entry points, with no config. The group says what kind of thing it is, the entry-point name is the registry key, and the value is the class:
 
 ```toml
 [project.entry-points."agent_env.envs"]
@@ -1316,23 +1703,26 @@ browser_navigate = "agentenv_browser.steps:NavigateTaskStep"
 
 | Group | Value | Name |
 |---|---|---|
-| `agent_env.envs` | `Env` subclass with its own `type` | must equal the class's `type`, the spelling its documents are written under |
-| `agent_env.task_steps` | `TaskStep` subclass with its own `type` | must equal the class's `type` |
+| `agent_env.envs` | `Env` subclass with its own `type`, implementing `from_dict` | must equal the class's `type`, the spelling its documents are written under |
+| `agent_env.task_steps` | `TaskStep` subclass with its own `type`, implementing `execute` and `from_dict` | must equal the class's `type` |
 | `agent_env.artifacts` | `Artifact` subclass with its own `type` field default | the registry key; a class may also register under extra names, such as a legacy spelling, as long as its own `type` default resolves to it and its `type` field accepts each extra name |
-| `agent_env.sandbox_providers` | `SandboxProvider` subclass | the registry key; it must equal the `.type` of the sandboxes the provider produces, checked on the first `create_*` call |
-| `agent_env.state_providers` | `EnvStateProvider` subclass | must equal the class's `type`, checked at registration |
-| `agent_env.explorer_plugins` | `ExplorerPlugin` subclass with its own `type` | must equal the class's `type` |
+| `agent_env.sandbox_providers` | `SandboxProvider` subclass implementing `create_sandbox` | the registry key; it must equal the `.type` of the sandboxes the provider produces, checked on the first `create_*` call |
+| `agent_env.state_providers` | `EnvStateProvider` subclass implementing `acquire` and `_teardown` | must equal the class's `type`, checked at registration |
+| `agent_env.env_providers` | `EnvironmentProvider` subclass implementing `deploy` and `close` | must equal the class's `type`, which its records carry as `env_provider_type`; checked at registration |
+| `agent_env.explorer_plugins` | `ExplorerPlugin` subclass with its own `type`, implementing `router` | must equal the class's `type` |
 
+- The class must implement every abstract method of its base, and, for envs and task steps, `from_dict` as a classmethod, which the base defines only to raise. A plugin that does not is `failed` with `invalid-plugin`, naming what is missing, for example `GradeTaskStep must implement execute and from_dict`. An `impls` entry or provider table naming such a class is a `ConfigError`.
 - Each registry takes the built-ins first, then plugins, then config. A plugin cannot replace a built-in: it is skipped with a warning, however many distributions claim that name.
-- Two installed distributions registering any other name in one group raise `agent_env.plugins.PluginConflictError`, a `ConfigError` naming both distributions and their versions. Uninstall one of them.
-- A plugin that fails to import, fails the checks above, or (for explorer plugins) fails to construct is skipped with a warning and the others still load. Resolving its name then reports the recorded error, for example `Unknown env type: browser (registered by 'browser' from agentenv-web 2.1.0 (…) but failed to load: ModuleNotFoundError(…))`.
-- Config replaces a plugin's class with a warning: an `impls` entry of the same `type`, or a `[sandbox.providers.<name>]` / `[state.providers.<name>]` table carrying `impl`. Naming the plugin's own class is silent. A provider table without `impl` configures the plugin's provider the way it configures a built-in's, which is where per-deployment settings such as a secret name belong. A config-only provider table, or an `[artifacts] type_aliases` entry, that points at a plugin which failed to load is skipped with a warning rather than failing the whole registry.
-- `agent_env.plugins.load_failures()` lists every plugin that did not take effect in the registries the current `Config` has built (failed to load, validate or construct, or clashed with a built-in), by group and name, with the reason. The record belongs to the `Config`, so `reset_config()` starts a new one. A deployment that ships its plugins can build its registries at startup and assert it is empty.
-- `agent_env.plugins.inventory()` lists every installed distribution that declares entry points in these groups, with a status for each contribution: `active`; `replaced` (config names a different class, and `replaced_in` says where); `failed`; `skipped` (a built-in owns the name); `conflict`; `blocked` (the group's real build fails, for example because two distributions claim a name in it, so nothing in the group loads); or `unloaded`. It builds the registries on a throwaway `Config` that reads the same document, so the `Config` in use keeps its registries and its `load_failures()`, and it reports a conflict instead of raising it. `inventory(load=False)` reads installed metadata only and runs no plugin code, so a status that needs a build is `unloaded`. With the default `load=True` the plugins are imported and the explorer plugins constructed, with whatever process-wide effects that has. `discovery_errors` names each group whose installed entry points could not be read at all, so none of its plugins is listed.
+- A name that two installed distributions register in one group, or that one declares twice, is left out of the registry with a warning, and the rest of the group, built-ins included, loads. An explorer plugin under that name is not mounted, so its routes are absent. Resolving the name fails like a plugin that did not load, naming each claimant and its version, for example `Unknown env type: browser (2 installed plugins register 'browser' in agent_env.envs: …)`, and says to remove all but one with `agent-env plugin remove PACKAGE`, or, when one package declares the name twice, to report it to the package's author. Neither claimant is picked, because the order entry points are found in is not fixed.
+- Config cannot settle a conflicted name. An `impls` entry, a provider table, an `[explorer.plugins]` impl or an `[artifacts] type_aliases` entry mapping to that name is checked as usual, then skipped with a warning. A `type_aliases` entry whose old spelling is that name is a `ConfigError`, as it is when one plugin registers it.
+- A plugin that fails to import, fails the checks above, or (for explorer plugins) fails to construct is skipped with a warning and the others still load. So is one whose requirement on agent-env excludes the installed version, before it is imported (see [Plugin compatibility](#plugin-compatibility)). Resolving its name then reports the recorded error, for example `Unknown env type: browser (registered by 'browser' from agentenv-web 2.1.0 (…) but failed to load: ModuleNotFoundError(…))`.
+- Config replaces a plugin's class with a warning, except under a conflicted name: an `impls` entry of the same `type`, or a `[sandbox.providers.<name>]` / `[state.providers.<name>]` table carrying `impl`. Naming the plugin's own class is silent. A provider table without `impl` configures the plugin's provider the way it configures a built-in's, which is where per-deployment settings such as a secret name belong. A config-only provider table, or an `[artifacts] type_aliases` entry, that points at a plugin which failed to load is skipped with a warning rather than failing the whole registry.
+- `agent_env.plugins.load_failures()` lists every plugin that did not take effect in the registries the current `Config` has built (failed to load, validate or construct, clashed with a built-in, or claims a name another entry point claims), by group and name, with the reason. The record belongs to the `Config`, so `reset_config()` starts a new one. A deployment that ships its plugins can build its registries at startup and assert it is empty.
+- `agent_env.plugins.inventory()` lists every installed distribution that declares entry points in these groups, with a status for each contribution and a `code` saying why (see [Plugin report format](#plugin-report-format)): `active`; `replaced` (config names a different class, and `replaced_by` says where); `failed`; `skipped` (a built-in owns the name); `conflict`; `blocked` (the group's real build fails, for example because its config table is invalid, so nothing in the group loads); or `unloaded`. It builds the registries on a throwaway `Config` that reads the same document, so the `Config` in use keeps its registries and its `load_failures()`. `inventory(load=False)` reads installed metadata only and runs no plugin code, so a status that needs a build is `unloaded`. With the default `load=True` the plugins are imported and the explorer plugins constructed, with whatever process-wide effects that has. `discovery_errors` names each group whose installed entry points could not be read at all, so none of its plugins is listed.
 - Discovery reads installed metadata and imports nothing. When entry points are loaded is unspecified: today each group is imported when its registry is first built, but a plugin must not depend on that.
 - Loading a plugin never changes which config a `Config` reads: the `Config` resolves its document before it imports any plugin. A plugin package that sets `AGENT_ENV_CONFIG` on import affects only configs built afterwards, such as after `reset_config()`.
 
-The distribution that declares the entry points is the plugin, so `pip uninstall` removes it completely. CLI commands are a separate contribution, described next.
+The distribution that declares the entry points is the plugin, so `pip uninstall` removes it completely, apart from any `[plugins.<package>]` table in the config file. CLI commands are a separate contribution, described next.
 
 ### CLI plugins, root options, explorer routes
 
@@ -1345,27 +1735,81 @@ my-tools = "mycorp_demo.cli:my_tools"
 tenant = "mycorp_demo.cli:tenant_option"
 ```
 
-`agent_env.cli_plugins` entries are click commands or groups added next to the built-ins. `agent_env.cli_root_options` entries are optional `click.Option` instances with `expose_value=False`; their callback runs before the subcommand, so it can set `AGENT_ENV_CONFIG` and call `agent_env.config.reset_config()` to select the config for the whole process. Plugins load when `agent_env.cli` is imported, after the built-ins. Clash rules: a plugin command or flag that core already owns is skipped with a warning on stderr, and core wins. Two plugins claiming the same root flag abort the CLI with `RootOptionConflictError`. Nothing grafts onto existing groups.
+`agent_env.cli_plugins` entries are click commands or groups added next to the built-ins, under the entry-point name whatever the command object is called: `my-tools` above is `agent-env my-tools`. `agent_env.cli_root_options` entries are optional `click.Option` instances with `expose_value=False`; their callback runs before the subcommand, so it can set `AGENT_ENV_CONFIG` and call `agent_env.config.reset_config()` to select the config for the whole process. Plugins load when `agent_env.cli` is imported, after the built-ins. Clash rules: a plugin command whose entry-point name core already uses, or a flag core owns, is skipped with a warning on stderr, and core wins. Two different root options on the same flag are both left off with a warning, and `agent-env plugin list` reports each as a `conflict`; the CLI still starts, so `agent-env plugin remove` can settle it. The same `click.Option` object exported by two entry points, from one package or two, is attached once. Nothing grafts onto existing groups.
 
-Explorer routes: subclass `agent_env.explorer.plugin.ExplorerPlugin`, set `type`, and return a FastAPI `APIRouter` from the `router` property. List it under `[explorer.plugins] impls` or declare an `agent_env.explorer_plugins` entry point; `from_config()` takes no arguments. `agent-env up --no-bootstrap` mounts it before the core routers and needs no Docker.
+Explorer routes: subclass `agent_env.explorer.plugin.ExplorerPlugin`, set the `type` ClassVar, and return a FastAPI `APIRouter` from the `router` property. List it under `[explorer.plugins] impls` or declare an `agent_env.explorer_plugins` entry point; `from_config()` takes no arguments, and a plugin reads its own settings with `agent_env.plugins.settings` (see [Plugin settings](#plugin-settings)). `agent-env up --no-bootstrap` mounts it before the core routers and needs no Docker.
+
+### Bundles from installed packages
+
+A package ships bundles by naming the package that holds their folders:
+
+```toml
+[project.entry-points."agent_env.bundles"]
+triage = "mycorp_demo.bundles"
+```
+
+- The bundle `triage` is the folder `mycorp_demo/bundles/triage/`. The entry-point name is both the bundle's name and its folder's name, so it may contain `-`.
+- The value names a package, never an object. The folder is found without importing any of the package's code, so listing bundles runs nothing.
+- The folder ships in the wheel as package data, and the package must be installed unpacked.
+- An installed bundle's ids are rooted at its distribution, wherever the package is installed: `triage` above writes `@local/mycorp-demo/triage/...`.
+- `agent-env run triage` runs it, and `agent-env run` with no argument lists the installed bundles, each with its folder.
+- When two packages install bundles of one name, run each as `<package>/<name>`, using the canonical distribution name, for example `mycorp-demo/triage`. agent-env's own bundles keep their bare names, so a package's `hello` runs only as `<package>/hello`.
+- `agent-env plugin list` shows each bundle as a contribution of its package, agent-env's own `hello` as `agentenv-framework … bundle hello`. `plugin check` fails when a bundle doesn't resolve to a folder, fails a check `agent-env run` makes before it reads a store (it isn't a valid bundle, a type it names doesn't resolve, or a step's fields don't build), is registered twice by one package (`conflict`), or comes from a package whose agent-env requirement isn't met (`incompatible-core`). `list --no-load` and `show --no-load` only parse it.
+
+### Plugin settings
+
+A plugin that needs settings of its own reads them from `[plugins.<package>]`, where `<package>` is its distribution name: the name `pip install` takes and `agent-env plugin list` prints. That table belongs to the plugin. agent-env reads nothing in it and checks none of its keys. Every other top-level table belongs to agent-env, which warns about one it does not read (see [Inspect the resolved configuration](#inspect-the-resolved-configuration)), so a plugin keeps nothing of its own anywhere else.
+
+```toml
+[plugins.acme-agentenv-browser]
+endpoint = "env:BROWSER_URL?http://localhost:9222"
+timeout = 30
+
+[plugins.acme-agentenv-browser.viewport]
+width = 1280
+```
+
+```python
+from agent_env.plugins import settings
+
+def browser_timeout() -> int:
+    browser = settings("acme-agentenv-browser")   # {} when the file has no such table
+    return browser.get("timeout", 10)             # the plugin keeps its own defaults
+```
+
+- Pass the distribution name, not the module's `__name__` or `__package__`: `acme-agentenv-browser` may import as `acme_browser`.
+- Call `settings()` where the value is used, in `from_config`, `execute` or a command's body, not at import. Entry points are imported before a root option can select the config file, so a value read at import may come from another file.
+- The key is matched by canonical name (PEP 503: lowercase, with each run of `-`, `_` and `.` read as one `-`), so `[plugins.acme_agentenv_browser]` is the same table. Write the canonical form. It never needs quoting, whereas a dotted name written bare (`[plugins.acme.browser]`) nests. Two tables that name one package are a `ConfigError`, not a guess.
+- `settings(name, *, config=None)` returns a copy of the table, read from `config`'s document (default: the process `Config`), with `env:` and `secret:` references resolved as in every other table. It raises `agent_env.config.ConfigError` when `[plugins]` or the plugin's entry is not a table, when two keys name the package, or when a reference without a `?default` cannot be resolved; the message names the table. agent-env never reads the table itself, so a broken entry fails only its own plugin's read, and `config show` reports it in place.
+- No environment variable overrides a plugin setting. For a value that differs per deployment, write an `env:` reference in the table.
+- `agent-env config show` lists each table under its package: with the installed version, with `(declares no agent_env entry point)` when the distribution is installed but is not a plugin, which usually means a misspelled entry-point group, with `(agent-env itself)` for `agentenv-framework`, whose table agent-env does not read, or with `(not installed)`. `config explain plugins.<package>.<key>` says whose table holds the key; agent-env does not read or check it, so it cannot tell whether the plugin reads that key, and a misspelled key is still shown (see [Inspect the resolved configuration](#inspect-the-resolved-configuration)). A table for a plugin that is not installed is reported, never an error, because one config file is often shared by processes that install different plugins.
+- Both commands mask a plugin's table the way they mask agent-env's, and a service may log what they report. A literal value is printed as `***` when its key, or a key above it in the table, contains `password`, `passwd`, `passphrase`, `secret`, `token`, `credential`, `api_key`, `private_key`, `auth` or `bearer` in any case, and a connection URI's userinfo is masked. Any other literal is printed, so keep credentials behind `secret:` or `env:` references. A reference prints as written, with any `?default` masked like a literal.
+- A provider the plugin registers is still configured in `[sandbox.providers.<name>]` or `[state.providers.<name>]`, under the provider's name, and an explorer plugin class is still listed in `[explorer.plugins]`. agent-env reads those tables itself. `[plugins.<package>]` holds only what the plugin reads.
+- Uninstalling a plugin leaves its table in the config file.
+- A top-level table one letter from `[plugins]`, such as `[plugin]`, gets a warning in `config show`: nothing reads it, so the plugin would get no settings.
 
 ### Manage plugins
 
-`agent-env plugin` shows what the installed plugins contribute and whether each piece took effect.
+<!-- tst/installer/test_container_journey.py runs the commands in the first bash block below. -->
+
+`agent-env plugin` shows what the installed plugins contribute and whether each piece took effect, and adds or removes them.
 
 ```bash
 agent-env plugin list            # every plugin package, what it provides, and its status
 agent-env plugin show PACKAGE    # each contribution and why it is in that state
 agent-env plugin check           # exit 1 if any contribution did not take effect
+agent-env plugin add SPEC...     # install through this environment's installer, then check
+agent-env plugin remove PACKAGE  # uninstall through the same installer, after safety checks
 ```
 
 ```
 agent-env 0.9.1193 · uv tool at ~/.local/share/uv/tools/agentenv-framework
 config: (none)
 
-PACKAGE           VERSION  PROVIDES                                 STATUS
-agentenv-browser  1.0.0    env browser, task step browser_navigate  ok
-agentenv-grader   0.3.1    task step grade_essay                    1 failed
+PACKAGE             VERSION   PROVIDES                                 STATUS
+agentenv-browser    1.0.0     env browser, task step browser_navigate  ok
+agentenv-framework  0.9.1193  bundle hello                             ok
+agentenv-grader     0.3.1     task step grade_essay                    1 failed
 ```
 
 | Status | Meaning |
@@ -1374,20 +1818,155 @@ agentenv-grader   0.3.1    task step grade_essay                    1 failed
 | `replaced` | config names a different class for the name; `show` says where. Not a failure |
 | `failed` | failed to import, validate or construct |
 | `skipped` | a built-in, a core command or root option, or (for CLI commands) a plugin loaded first owns the name |
-| `conflict` | another installed package registers the same name |
-| `blocked` | the group cannot load at all, for example because of a conflict in it, so this contribution does not either |
+| `conflict` | another entry point, from another package or this one, claims the same name, so none of them is used. For a bundle, only a second claim from the same package is a conflict; another package's bundle of that name is `qualified-only` |
+| `blocked` | the group cannot load at all, for example because its config table is invalid, so this contribution does not either |
 | `unloaded` | not loaded (`--no-load`). When loading, it means the status could not be determined, and `check` fails on it |
 
-- The header says how agent-env is installed (uv tool, pipx, uv project, virtualenv or system Python) and where: a plugin has to be installed into that same environment. It warns when the retired `agent-env` distribution is installed next to `agentenv-framework`, since both write the same package.
+A contribution that is not `active` also has a code saying why, shown in brackets after its reason; the codes are listed under [Plugin report format](#plugin-report-format).
+
+- The header says how agent-env is installed (uv tool, pipx, uv project, virtualenv or system Python) and where: a plugin has to be installed into that same environment.
 - `list` and `show` take `--json` and `--no-load`. `--no-load` reads installed metadata only and imports no type plugin; CLI plugins are already loaded, because the CLI loads them when it starts. Without it, `list`, `show` and `check` import every type plugin and construct the explorer plugins, so that plugin code runs.
 - `show` also reports whether importing the package sets `AGENT_ENV_CONFIG`, checked in a fresh interpreter.
-- `check` builds every registry the way a process does, adds the CLI's own plugins, and fails on `failed`, `skipped`, `conflict`, `blocked` or `unloaded`, or when the config file or the installed entry points cannot be read (a malformed `entry_points.txt` hides every plugin, so it fails rather than passing empty). `check --json` prints the problems as JSON. A `replaced` contribution passes: config chose it.
+- `check` builds every registry the way a process does, adds the CLI's own plugins, and fails on `failed`, `skipped`, `conflict`, `blocked` or `unloaded`, or when the config file or the installed entry points cannot be read (a malformed `entry_points.txt` hides every plugin, so it fails rather than passing empty). `check --json` prints the `list --json` report plus `ok` and `problems`. A `replaced` contribution passes: config chose it.
 - `plugin` is a core command: a CLI plugin that names a command `plugin` is skipped, like any clash with a core command.
 - The Python equivalent is `agent_env.plugins.inventory()` (see [Register types from an installed package](#register-types-from-an-installed-package)).
 
+#### Plugin report format
+
+`plugin list --json`, `plugin show --json` and `plugin check --json`, and the `agent_env.plugins` types they are built from, are the interface for scripts, CI and image builds. The human output of these commands is not: parse the JSON.
+
+```json
+{
+  "format_version": 1,
+  "agent_env": {"version": "0.9.1217", "environment": "uv tool", "location": "/home/me/.local/share/uv/tools/agentenv-framework"},
+  "config": {"path": "/work/.agentenv/config.toml", "error": null},
+  "loaded": true,
+  "group_errors": {},
+  "discovery_errors": {},
+  "plugins": [
+    {"name": "agentenv-grader", "version": "0.3.1", "contributions": [
+      {"group": "agent_env.task_steps", "name": "grade_essay", "value": "agentenv_grader.steps:GradeEssay",
+       "status": "failed", "code": "load-failed", "reason": "failed to load: ModuleNotFoundError(\"No module named 'openai'\")",
+       "replaced_by": null, "conflicts_with": []}
+    ]}
+  ]
+}
+```
+
+- Every key is always present; an empty value is `null`, `[]` or `{}`. `group_errors` and `discovery_errors` map an entry-point group to `{code, reason}`, and `config.error` is `{code, reason}` or `null`.
+- A distribution whose metadata cannot be read is listed under the label `(unreadable metadata: DIR)`, where `DIR` is its `.dist-info` directory. The label is not a package name, so `plugin remove` cannot take it: reinstall the package with its installer, or delete that directory.
+- A contribution's `status` says what happened to it (the table above) and its `code` says why. `code` and `reason` are set together: on every contribution that is not `active`, and on an `active` one only for information. `replaced_by` is set exactly when the status is `replaced`: `{file, table, impl}`, where `table` is the config table naming the other class (`envs`, `task_steps`, `artifacts`, `explorer.plugins`, `sandbox.providers.NAME` or `state.providers.NAME`). `conflicts_with` lists the other entry points that claim the name, as `{package, version, value}`.
+- `show --json` adds `config_effect`, a sentence saying whether importing the package sets `AGENT_ENV_CONFIG` (`null` with `--no-load`). `check --json` adds `ok` and `problems`, each a contribution with its `package` and `version`.
+- `check` exits 0 when `ok` and 1 otherwise; a usage error exits 2. `show` exits 1 with no report when no installed plugin package has that name. A run that does not print exactly one JSON document on stdout, such as a crash while agent-env starts, is not a report: count it as a failure whatever its exit status.
+
+`format_version` changes only for a change a consumer cannot ignore: a key removed, renamed or given another type, a new status, a code redefined or reused, or a new meaning for an exit status. A new key, a new code, reworded `reason` or `config_effect` text, and a change in list order leave it as it is. So a consumer should ignore keys it does not know, handle a code it does not know by its `status`, refuse a `format_version` it does not know, and never parse `reason`. Which situation gets which status and code, and which group error is reported when several apply, is behaviour rather than format: a release that changes one says so in its notes. A code is never removed or reused.
+
+| Code | Where | Meaning | What to do |
+|---|---|---|---|
+| `load-failed` | `failed` | The plugin's code raised: when it was imported (`SystemExit` included), when an explorer plugin was constructed, or in a root option's callback with the flag absent | Install what it needs, or report it to the plugin's author |
+| `invalid-plugin` | `failed` | It imported but does not fit its group: not a subclass of the group's base class; a `type` that is missing, inherited or not the entry-point name; a method its base requires left unimplemented; not a `click.Command` or `click.Option`; a root option that is required or exposes a value; a command click refused; an extra artifact name that reads no document. A bundle is never imported: it is invalid when its value isn't an installed, unpacked package holding that folder, when its metadata can't be read, or when the folder isn't a valid bundle (with plugins loading, one whose step, env or artifact types don't resolve) | Report it to the plugin's author; for a bundle whose package is installed zipped, reinstall it unpacked. For an extra name whose class's own type is in conflict, settle that conflict |
+| `incompatible-core` | `failed` | The plugin's requirement on `agentenv-framework` or `agentenv-protocol` excludes the installed version, so it was not imported. See [Plugin compatibility](#plugin-compatibility) | Upgrade agent-env, or install a version of the plugin that fits |
+| `builtin-name` | `skipped` | agent-env owns the name: a built-in type, a core command or a core root option | The plugin has to rename it |
+| `name-conflict` | `conflict`, `skipped` | More than one entry point claims the name, from two packages or twice from one; for bundles, only twice from one package (see `qualified-only`). In a type group none of them is registered, and the rest of the group loads; two different root options on one flag are each a `conflict`, and neither is attached. A CLI command whose name a plugin loaded earlier took is `skipped`, and the earlier one stays | Remove all but one: `agent-env plugin remove PACKAGE`. A package that declares a name twice has to be fixed by its author |
+| `replaced-by-config` | `replaced` | The config registers another class under the name | Nothing, unless you did not mean it |
+| `already-attached` | `active` | A second entry point, from the same package or another, exports the same `click.Option` object, which is attached once | Nothing |
+| `not-loaded` | `unloaded` | `--no-load`, or `inventory(load=False)`: whether it takes effect needs an import | Run without `--no-load` |
+| `status-unknown` | `unloaded` | It was loaded, but nothing was recorded for it. This should not happen | Report it as an agent-env bug |
+| `config-not-found` | config error, group error, `blocked` | `AGENT_ENV_CONFIG` names a file that does not exist | Fix or unset `AGENT_ENV_CONFIG` |
+| `config-unreadable` | config error, group error, `blocked` | The config file could not be read or parsed | Fix the file |
+| `config-invalid` | group error, `blocked` | The file parsed, but what it says for this group is invalid | Fix the table the reason names |
+| `group-build-failed` | group error, `blocked` | Building the group raised something else | See the reason |
+| `entry-points-unreadable` | discovery error | The group's installed entry points could not be read, so none of its plugins is listed | Reinstall the package the reason names |
+| `qualified-only` | `active` | Another package installs a bundle of the same name, so this one runs only as `<package>/<name>`. agent-env's own bundles keep the bare name | Run it by its qualified name |
+
+A `blocked` contribution carries its group error's code, so it says what to fix rather than only that the group failed.
+
+#### Add and remove plugins
+
+agent-env never installs anything itself. `add` and `remove` run the installer that owns the environment agent-env runs in, so that installer's next rebuild keeps the change:
+
+| agent-env installed as | `add` runs | `remove` runs |
+|---|---|---|
+| uv tool | `uv tool install agentenv-framework --with ... --with SPEC`, passing back the receipt's requirements (editable and git ones included), Python and options | the same, without the package |
+| pipx | `pipx inject VENV SPEC`, with the venv's own pip arguments (and `--force` to upgrade a package it already has) | `pipx uninject --leave-deps VENV PACKAGE` |
+| uv project | `uv add --no-sync --project ROOT SPEC` and `uv sync --inexact`, then shows the `pyproject.toml` diff | `uv remove --no-sync --project ROOT PACKAGE` and `uv pip uninstall PACKAGE` |
+| virtualenv | `python -m pip install SPEC` (or `uv pip install` when the venv has no pip) | `python -m pip uninstall -y PACKAGE` |
+| Poetry or PDM project | prints `poetry add` / `pdm add` to run yourself | prints `poetry remove` / `pdm remove` |
+| Hatch environment | says to add it to the environment's dependencies | the same, for removal |
+| system Python with the PEP 668 marker, or read-only site-packages | refuses, with guidance | refuses |
+
+`SPEC` is anything the installer accepts, so a plugin can come from an index, a git repository or a file:
+
+| From | `SPEC` |
+|---|---|
+| PyPI, or the index the installer is configured with | `agentenv-grader`, `'agentenv-grader==0.3.0'`, `'agentenv-grader>=0.3,<0.4'` |
+| a git tag, commit or branch | `'agentenv-grader @ git+https://github.com/mycorp/agentenv-grader@v0.3.0'` |
+| one package in a monorepo | `'agentenv-grader @ git+https://github.com/mycorp/plugins@v1#subdirectory=agentenv-grader'` |
+| a private repository | `'agentenv-grader @ git+ssh://git@github.com/mycorp/agentenv-grader.git@v0.3.0'` |
+| a release asset | `https://github.com/mycorp/agentenv-grader/releases/download/v0.3.0/agentenv_grader-0.3.0-py3-none-any.whl` |
+| a local wheel or checkout | `./dist/agentenv_grader-0.3.0-py3-none-any.whl`, `./agentenv-grader` |
+
+- Write a git URL as `NAME @ URL`, and a local checkout as `NAME @ file:///absolute/path`. agent-env cannot read the name from a bare `git+https://…` or a directory, so it cannot tell pipx or a uv tool which installed plugin the spec replaces: pipx leaves the installed one as it is, and `add` says so; a uv tool reports conflicting URLs, and the add is rolled back. A git install records the commit it resolved to, so a rollback reinstalls that commit.
+- `add` never replaces agent-env itself. A spec that names `agentenv-framework`, as a name, a wheel or `NAME @ URL`, is refused before anything runs. A bare URL or directory that turns out to build it is rolled back after the install: agent-env may move to a newer release from the index when a plugin requires one, but not to a URL, git or directory source. Upgrade agent-env with the installer that owns the environment.
+- Credentials stay with git and the installer: an SSH key or a git credential helper (`gh auth setup-git`) for a private repository, and the installer's own config for a private index. A token written into `SPEC` is kept in the installer's record of the environment.
+- `--installer` overrides the detected installer, `--index-url` passes an index through to it (a uv tool keeps it as its default index), `--dry-run` shows what would run, and `--yes` skips the prompt.
+- uv takes a pre-release or a yanked version only when you name it. If the installer reports that a plugin needs one, name that exact version in the same command, for example `agent-env plugin add agentenv-grader 'agentenv-grader-core==0.2.0b1'`; `plugin remove` removes it later the same way.
+- A uv project whose environment is set by `UV_PROJECT_ENVIRONMENT` is found from the current directory, as uv finds it, so run `add` and `remove` inside the project. In a uv workspace whose root has no `[project]` table, `add` goes to the one member that declares `agentenv-framework` (`uv add --package MEMBER`). `remove` drops a package from every member and group that declares it (`--package`, `--group`, `--optional`, `--dev`).
+- A uv project is never synced exactly, so packages from extras and anything installed outside the lock, agent-env included, stay installed.
+- pipx and a virtualenv leave a removed plugin's own dependencies installed, as `pip uninstall` does. Left to itself, `pipx uninject` would also uninstall everything nothing else requires, agent-env included.
+- A uv tool installed with constraints, overrides or executables from another package is refused: `uv tool install` cannot take those back from agent-env, so make that change with uv.
+- One `add` or `remove` runs at a time per environment; a second one is refused until the first finishes. The lock is a file in `$XDG_STATE_HOME/agent-env/locks` (by default `~/.local/state/agent-env/locks`). If the installer's record changes some other way while a change waits for confirmation, the change is refused rather than run from its outdated plan.
+- A plain virtualenv first shows the installer's own dry run of what would change. Every mode reports what did change afterwards, calling out a change to agent-env itself.
+- `add` then checks each new plugin package in a fresh interpreter: it must declare at least one `agent_env.*` entry point, and every contribution must be `active` or `replaced`. `show` reports whether importing it sets `AGENT_ENV_CONFIG`. If the check fails, the installer fails or removes another plugin, or the change is interrupted (Ctrl-C or SIGTERM), `add` puts the environment back as it was: every package at its old version from its old source, and the uv tool receipt, pipx metadata, or `pyproject.toml` and `uv.lock`, byte for byte. The installer runs with Ctrl-C ignored, since one stopped halfway leaves packages no installer can read: it finishes, and then the change is rolled back. A second Ctrl-C stops it at once. It keeps the terminal, so its own prompts, such as git's for credentials, still work. When the environment cannot be put back exactly, `add` says which packages differ and the installer command that reinstalls them. Adding what is already installed changes nothing and succeeds, and a bare name that a uv tool already lists keeps its version pin. `--keep` keeps a change that failed the check instead.
+- `remove` refuses, unless `--force`:
+  - while another installed package requires the package;
+  - while the config file names something only it provides (`[sandbox] default` or `agent_default`, a provider table, a `type_aliases` target), or an `impls` list, provider, store or runner `impl` names one of its modules;
+  - while stored documents use env, artifact or task-step types only it provides. This is checked for a local document store, and for a remote one only with `--check-usage`; a store that cannot be read also blocks, until `--force`.
+
+  It never removes agent-env itself. A package that declares no `agent_env.*` entry point is removed only when the installer records it on its own (a uv tool's `--with`, a pipx injection, a project dependency), as it does for a package named next to a plugin in `add`; after removing a plugin, `remove` names any such package that only the plugin needed. In a uv tool or a uv project, removing a plugin also removes the plugins that only it needed, as the installer's rebuild would, so `remove` names them first and checks them like the package itself. If the installer fails, removes a plugin it did not name, or the change is interrupted, `remove` puts the environment back the same way `add` does.
+- Plugins are trusted code: nothing installs one implicitly, from a task document, a config file or anywhere else.
+- A plugin that breaks CLI startup does not lock you out. A root option whose callback raises or exits while its flag is absent is skipped, with a warning, and reported as `failed`; a flag you pass still fails, naming the plugin. A CLI plugin that exits while being imported is skipped like any load failure. For a plugin that hangs or kills the interpreter while being imported, uninstall it with the installer directly: the command `plugin remove --dry-run` would print.
+
 ### Building a platform plugin
 
-One installable package can combine all of the above: bundled config files, a root option that selects one per invocation, store and provider classes, a `Runner`, custom steps, and explorer routers. The `--tenant` demo above is that pattern in miniature. Its callback points `AGENT_ENV_CONFIG` at a bundled `tenants/<name>.toml`; a name that does not exist fails loud with `ConfigError` on first use, while `--help` still works. A hosted control plane serves the explorer app from its own server process and lists its public hostnames under `[explorer] allowed_hosts` (see the comments in `.agentenv/config.example.toml`). Durable runners and hosted stores are the plugin's responsibility; this repository ships local implementations only.
+One installable package can combine all of the above: bundled config files, a root option that selects one per invocation, store and provider classes, a `Runner`, custom steps, and explorer routers. The `--tenant` demo above is that pattern in miniature. Its callback points `AGENT_ENV_CONFIG` at a bundled `tenants/<name>.toml`; a name that does not exist fails loud with `ConfigError` on first use, while `--help` still works. A hosted control plane serves the explorer app from its own server process and lists its public hostnames under `[explorer] allowed_hosts` (see the comments in `.agentenv/config.example.toml`). A durable runner is the plugin's responsibility: this repository ships only `LocalRunner`.
+
+### Plugin compatibility
+
+What a plugin can build on, how to declare the agent-env it needs, and what agent-env does when the installed one does not fit.
+
+**The plugin surface.** A plugin may rely on these. Anything else, including every underscored name other than a method a subclass must implement (`EnvStateProvider._teardown`), is internal and can change in any release.
+
+- The entry-point groups and their rules, in [Register types from an installed package](#register-types-from-an-installed-package) and [CLI plugins, root options, explorer routes](#cli-plugins-root-options-explorer-routes).
+- The base class each group names, with its public methods and attributes: `agent_env.env.env.Env`, `agent_env.task_step.task_step.TaskStep` and the `agent_env.task_step.context.TaskStepContext` a step runs with, `agent_env.artifact.artifact.Artifact`, `agent_env.providers.sandbox_providers.sandbox_provider.SandboxProvider`, `agent_env.providers.env_state.env_state_provider.EnvStateProvider`, `agent_env.providers.env_providers.env_provider.EnvironmentProvider`, and `agent_env.explorer.plugin.ExplorerPlugin`.
+- The two functions an env that uses an environment provider calls: `agent_env.providers.env_providers.env_provider.build_env_provider` and `agent_env.env.store.register_env_instance`.
+- What an environment provider reads to deploy a built-in env: `agent_env.env.envs.mcp_server.MCPServerEnv.docker_image_artifact` and `agent_env.env.envs.mcp_server.MCPServerEnv.environment_name`; `agent_env.env.envs.website.WebsiteEnv.backend_docker_image_artifact`, `agent_env.env.envs.website.WebsiteEnv.frontend_docker_image_artifact` and `agent_env.env.envs.website.WebsiteEnv.environment_name`; `agent_env.env.envs.multi_env.MultiEnv.mcp_server_envs`, `agent_env.env.envs.multi_env.MultiEnv.website_envs` and `agent_env.env.envs.multi_env.MultiEnv.name`; and each image's `agent_env.artifact.artifacts.docker_image.DockerImageArtifact.image_name`.
+- The top level of `agent_env.plugins`, including `settings`, and the `[plugins.<package>]` table it reads ([Plugin settings](#plugin-settings)).
+- The `plugin --json` output, which has its own rules: [Plugin report format](#plugin-report-format).
+
+The classes a config `impl` names, such as stores and runners, are not on the list yet.
+
+**Changes before 1.0.** Every merged change can ship as a release, several a day. A change that breaks the plugin surface is marked with `!` after the scope in its pull request title, which becomes its commit title, as in `feat(plugins)!: …`. Where the old behaviour can be kept for a while, it is deprecated first: it keeps working and emits a `DeprecationWarning` that names what replaces it. How long that lasts is not fixed before 1.0.
+
+The `plugin-api` CI job holds pull requests to this. It compares the listed base classes, `TaskStepContext`, the two functions, the env attributes and the top level of `agent_env.plugins` with the pull request's base (`.github/scripts/check_plugin_api.py`), and fails on a break the title does not mark; with the `!`, it lists the breaks and passes, and editing the title re-runs it. A break is what fails code written against the old surface:
+
+- for a caller, a name, parameter or `__all__` entry that is removed or renamed, a new required parameter, a parameter that can no longer be passed as before, or a changed default or constant, including the group-name constants `agent_env.plugins` exports, compared by value;
+- for a subclass of a base class, a new abstract or required method, a method that becomes abstract or required, a new `ClassVar` with no value, a method that changes between plain, `async`, `classmethod`, `staticmethod` and property, and a base-class method that accepts more than before: a new parameter, even an optional one, a parameter that stops being required, a new `*args` or `**kwargs`, or a keyword-only parameter that can now be passed by position, since an override written for the old signature fails when core passes it;
+- for construction, a changed `@dataclass(...)` option or pydantic `model_config`, a new metaclass, or a new `__init_subclass__` that can raise, which refuses a subclass.
+
+A member every subclass must implement is declared `@abstractmethod`, or listed in its registry's `_MUST_IMPLEMENT`, so that the check enforces it; a new method that only raises `NotImplementedError` gets a note but does not fail the job.
+
+agent-env ships `py.typed`, so mypy and pyright check a plugin against its annotations. Import each name from the module the list above gives, such as `TaskStepContext` from `agent_env.task_step.context`: pyright, and mypy under `--strict`, treat a name a module only imports as private to that module. Type annotations are not compared, so a release can correct one without a `!`. The check can report a change no plugin notices, such as a new parameter core never passes to an override; mark it all the same. It does not see a change in behaviour, in a type the surface only names in a signature, such as `DeployedEnv`, in a pydantic field's requirements or the order of dataclass fields, in an abstract method a new base from outside agent-env brings, or in a registration rule other than abstract methods and `_MUST_IMPLEMENT`; review covers those. A `!` can also mark a break outside the plugin surface.
+
+**Declaring the agent-env your plugin needs.** Declare a floor, `agentenv-framework>=X`, where `X` is the oldest release you test against. Leave out a ceiling such as `<1`: before 1.0 it would not guard against a change in a 0.9 release, and it would keep your plugin from installing with the next major one. Pin exact versions in the application or image that installs your plugin, not in the plugin. If your plugin imports `agentenv_protocol` itself, declare that as well.
+
+**What agent-env checks.** Before it imports a plugin, agent-env compares the plugin's requirements on `agentenv-framework` and `agentenv-protocol` with the versions installed. A plugin they exclude is not loaded:
+
+- `plugin list`, `show` and `check` report each of its contributions as `failed` with the code `incompatible-core`, with or without `--no-load`, and `check` exits 1;
+- using one of its types names the requirement, as in `needs agentenv-framework>=0.9.1220 (installed: 0.9.1218)`;
+- it claims none of its names, so a plugin that can load and registers the same name does not conflict with it.
+
+An installer that resolves dependencies never gets you there; `pip install --no-deps` or a forced install can. There is no override: upgrade agent-env, or install a version of the plugin that fits. A requirement under an extra, or whose environment marker is false, does not count, and an agent-env with no installed metadata, such as a source tree on `sys.path`, is not checked. Requirements between plugins are the installer's to check; `pip check` lists any that are unmet.
 
 ## Contribute, release, license
 
@@ -1401,15 +1980,16 @@ Set up with `uv sync --extra dev` or `make install` (both in [Install the packag
 |---|---|---|
 | `make unit-test`, or `python -m pytest tst/unit packages/agentenv-protocol/tests -n auto -q` | 3,086 unit tests (3,084 pass, 2 skip) in about 20 seconds; IP sockets are blocked by `pytest-socket` and AWS calls go to `moto` | nothing external |
 | `make int-test-fast` | the 129 integration tests not marked `int_test_slow`, in parallel | Docker and a local OCI registry on `:5000` |
+| `make clean-install-test` | both distributions built as the release builds them, installed into a fresh venv from public PyPI with nothing else, and `agent-env run hello` run twice by name and checked through the local store | Python 3.11, uv and git |
 | `make int-test-slow` | the 285 `int_test_slow` tests (12 of the 27 integration modules; real image builds and sandboxes), serially | Docker and the registry; a model endpoint, a remote sandbox or a registered default agent for some |
 
 Run the unit tier from the checkout root with `AGENT_ENV_CONFIG` unset; the Makefile targets hardcode `.venv/bin/python`. The integration tiers were not run for this guide. A test may skip only for a declared capability gap, with the reason `agentenv-capability-missing: <name>` where `<name>` is `model_endpoint_configured`, `remote_sandbox`, `default_a2a_agent` or `mcp_server_sources` (see `tst/util/capabilities.py`); CI rejects any other skip reason.
 
-CI is GitHub Actions. `.github/workflows/local-backends.yml` runs the `unit`, `integration-local` and `integration-local-slow` jobs on Python 3.12, installed from public PyPI with no secrets and a `registry:2` service container for the integration jobs. The `unit` job also fails if `uv.lock` resolves anything from a registry other than PyPI, if `agentenv-protocol` is not the editable workspace member, or if `uv.lock` is out of date, before or after a trial run of the release bump (`scripts/bump_version.py`). The public jobs skip `tst/integration/env/gateway/gateway_test.py`, which needs an x86 Chromium build and, for its virtual-clock tests, MCP server sources named by `AGENT_ENV_TEST_MCP_SERVERS_DIR`; `make int-test-slow` runs it, so run that locally when a change touches the gateway and say so in the pull request. Dependabot (`.github/dependabot.yml`) opens weekly updates for the uv lock and the pinned actions.
+CI is GitHub Actions. `.github/workflows/local-backends.yml` runs the `unit`, `integration-local` and `integration-local-slow` jobs on Python 3.12, installed from public PyPI with no secrets and a `registry:2` service container for the integration jobs. The `unit` job also fails if `uv.lock` resolves anything from a registry other than PyPI, if `agentenv-protocol` is not the editable workspace member, or if `uv.lock` is out of date, before or after a trial run of the release bump (`scripts/bump_version.py`). The public jobs skip `tst/integration/env/gateway/gateway_test.py`, which needs an x86 Chromium build and, for its virtual-clock tests, MCP server sources named by `AGENT_ENV_TEST_MCP_SERVERS_DIR`; `make int-test-slow` runs it, so run that locally when a change touches the gateway and say so in the pull request. `.github/workflows/plugin-api.yml` runs the `plugin-api` job on every pull request, including a title edit, and on `main`; it fails a break to the plugin surface that the title does not mark (see [Plugin compatibility](#plugin-compatibility)). `.github/workflows/clean-install.yml` runs the `clean-install` job on every pull request and on `main`, on Python 3.11: it builds both distributions as the release does, fails if the wheel leaves out a tracked example file or bundle entry point, installs the two wheels into a fresh venv from public PyPI with an allowlisted environment (no AWS credentials, config or plugin), runs `agent-env run hello` twice by name, and checks through the local store that both runs completed with a score of 1, left no sandbox work folder, and the second changed no artifact, task, ledger row or stored object the first wrote. The required checks on `main` are `unit`, `integration-local`, `integration-local-slow`, `installer`, `plugin-api` and `clean-install`. Dependabot (`.github/dependabot.yml`) opens weekly updates for the uv lock and the pinned actions.
 
 ### Conformance suites
 
-`tst/store/` holds four backend-neutral suites: `conformance.py` (`DocumentStore`, 27 cases), `object_conformance.py` (`ObjectStore`, 14), `secret_conformance.py` (`SecretStore`, 3; seed the backend with `FIXTURE` first) and `image_conformance.py` (`ImageStore`, 4; push and pull need Docker). Each exposes a `CASES` list; a backend test builds its store fixture and parametrizes over `CASES`, exactly as `tst/unit/store/sqlite_document_store_test.py` does. Every built-in backend, local and hosted, is tested against the same cases.
+`tst/store/` holds four backend-neutral suites: `conformance.py` (`DocumentStore`, 35 cases), `object_conformance.py` (`ObjectStore`, 17, plus 3 in `GRANT_CASES` for a store that sets `supports_transfer_grants`), `secret_conformance.py` (`SecretStore`, 3; seed the backend with `FIXTURE` first) and `image_conformance.py` (`ImageStore`, 5; push and pull need Docker). Each exposes a `CASES` list; a backend test builds its store fixture and parametrizes over `CASES`, exactly as `tst/unit/store/sqlite_document_store_test.py` does. `GRANT_CASES` send each grant to the provider over HTTPS, so they need a real store rather than a local stand-in, and on `S3ObjectStore` the namespace case needs long-term credentials. The unit tier runs `CASES` for the local stores, for `DynamoDbDocumentStore` through moto and for `GcsObjectStore` against a stand-in client; the MongoDB-protocol stores need a live database, so it does not run theirs.
 
 The suites are not packaged in the wheel. Run them from a source checkout with `PYTHONPATH=.`:
 
@@ -1424,7 +2004,6 @@ cd <agent-env checkout> && PYTHONPATH=. python -m pytest -p no:cacheprovider -q 
 | Document | Covers |
 |---|---|
 | [`packages/agentenv-protocol/README.md`](packages/agentenv-protocol/README.md) | wire contract, environment server SDK, A2A agent framework |
-| [`docs/e2b-sandbox-provider.md`](docs/e2b-sandbox-provider.md) | `[sandbox]` configuration for the `e2b` provider, templates, networking |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | development setup, test tiers, CI jobs, pull request rules |
 | [`AGENTS.md`](AGENTS.md) | repository map, configuration and extension-point summary, conventions for contributors and coding agents |
 | [`SECURITY.md`](SECURITY.md) | private vulnerability reporting and supported versions |
@@ -1432,11 +2011,11 @@ cd <agent-env checkout> && PYTHONPATH=. python -m pytest -p no:cacheprovider -q 
 | [`.agentenv/config.example.toml`](.agentenv/config.example.toml) | the all-local configuration to copy |
 | [`.env.example`](.env.example) | a commented reference of the `AGENT_ENV_*` variables; agent-env never loads this file, export what you need yourself. Its `AGENT_ENV_ENVIRONMENT` line is read only by an installed plugin, never by agent-env |
 
-Full configuration, CLI, step and extension references have not been split out of this README yet.
+Full configuration, CLI, step and extension references, and the [Run on Google Cloud](#run-on-google-cloud) guide, have not been split out of this README yet.
 
 ### Versioning and compatibility
 
-The `agentenv-framework` distribution and `agentenv-protocol` are versioned separately (`0.9.x` and `0.1.x` today), both in their `pyproject.toml`; agent-env releases carry a `vX.Y.Z` tag, and agentenv-protocol is bumped in the same commit and has no separate tag today. There is no `agent_env.__version__` attribute and no `--version` flag (workaround in [Known gaps](#known-gaps)). Protocol extensions carry their version in the URI (`urn:agentenv:clock/v1`, `urn:agentenv:agent-config/v1`, `urn:agentenv:trajectory/v1`). Renamed CLI commands are removed outright; no deprecated aliases exist at this version (see [Deprecated aliases and legacy paths](#deprecated-aliases-and-legacy-paths)). A written compatibility and deprecation policy does not exist yet.
+The `agentenv-framework` distribution and `agentenv-protocol` are versioned separately (`0.9.x` and `0.1.x` today), both in their `pyproject.toml`; agent-env releases carry a `vX.Y.Z` tag, and agentenv-protocol is bumped in the same commit and has no separate tag today. There is no `agent_env.__version__` attribute; `agent-env --version` prints the installed version. Protocol extensions carry their version in the URI (`urn:agentenv:clock/v1`, `urn:agentenv:agent-config/v1`, `urn:agentenv:trajectory/v1`). One version can take more than one request shape: under `v1` the skill, trajectory, snapshot and changelog extensions accept object-transfer requests next to their older shapes, and the request field lists on an agent's card say which ones that agent takes. Renamed CLI commands are removed outright; no deprecated aliases exist at this version (see [Deprecated aliases and legacy paths](#deprecated-aliases-and-legacy-paths)). What plugins may rely on, and how changes to it are made, is in [Plugin compatibility](#plugin-compatibility); the plugin commands' `--json` output has its own format version and rules ([Plugin report format](#plugin-report-format)). Beyond those, a written compatibility and deprecation policy does not exist yet.
 
 ### Releases
 
@@ -1444,4 +2023,4 @@ A release is a version bump in both `pyproject.toml` files plus a `vX.Y.Z` tag. 
 
 ### Support, security, license
 
-Report bugs and gaps as issues against this repository, with the installed `agentenv-framework` version and the sandbox backend in use. Report vulnerabilities privately through the contact in [SECURITY.md](SECURITY.md), not in public issues; only the latest release is supported, so reproduce against it first. Contributors follow [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md); every pull request needs a code-owner review. agent-env and agentenv-protocol are licensed under the Apache License 2.0; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+Report bugs and gaps as issues against this repository, with the installed `agentenv-framework` version and the sandbox backend in use. Report vulnerabilities privately through the contact in [SECURITY.md](SECURITY.md), not in public issues; only the latest release is supported, so reproduce against it first. Contributors follow [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md); every pull request needs a code-owner review. agent-env and agentenv-protocol are licensed under the Apache License 2.0; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Their third-party dependencies and those dependencies' licenses are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -32,7 +32,6 @@ def _service_artifact(id: str, environment_name: str, file_artifact: FileArtifac
         id=id,
         version=1,
         environment_name=environment_name,
-        service_version=3,
         file_artifact_ref=file_artifact.as_ref(),
     )
 

@@ -20,6 +20,34 @@ def test_conformance(case, store):
     case(store, "")
 
 
+def test_owns_only_file_urls_under_its_root(store, tmp_path):
+    """A bare path is readable but is not one of this store's urls, and nothing outside the root is."""
+    url = store.put("k/x.bin", b"v")
+    bare = url.removeprefix("file://")
+    assert store.owns(url)
+    assert not store.owns(bare)
+    assert not store.owns(f"file://{tmp_path.parent}/elsewhere.bin")
+    assert store.get(bare) == b"v"
+
+
+def test_owns_answers_for_a_symlink_loop(store, tmp_path):
+    """Path.resolve() raises on a loop on some Python versions and not others; owns() answers either way."""
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    url = f"file://{tmp_path}/loop/x"
+    assert store.owns(url) in (True, False)
+    if store.owns(url):
+        assert store.get_object_metadata_at(url) is None
+
+
+def test_download_into_a_directory_is_not_a_missing_object(store, tmp_path):
+    """Only a missing source is ObjectNotFoundError; a bad destination is the filesystem's error."""
+    url = store.put("k/x.bin", b"v")
+    dest = tmp_path / "dest-dir"
+    dest.mkdir()
+    with pytest.raises(IsADirectoryError):
+        store.download_to_file(url, str(dest))
+
+
 def test_resolve_rejects_key_escaping_root(store, tmp_path):
     """A key that traverses out of the store root is refused rather than
     silently written outside the directory."""
@@ -56,6 +84,17 @@ def test_at_ops_reject_foreign_scheme(store):
         store.get_object_metadata_at("s3://bucket/key")
     with pytest.raises(ValueError):
         store.put_file_at("s3://bucket/key", __file__)
+
+
+def test_at_ops_reject_a_bare_path(store):
+    """The _at ops take the store's own file:// urls, not bare paths under the root."""
+    bare = store.put("k/x.bin", b"v").removeprefix("file://")
+    with pytest.raises(ValueError):
+        store.get_object_metadata_at(bare)
+    with pytest.raises(ValueError):
+        store.list_at(bare.rsplit("/", 1)[0] + "/")
+    with pytest.raises(ValueError):
+        store.put_file_at(bare + ".copy", __file__)
 
 
 def test_signed_get_url_is_none(store):

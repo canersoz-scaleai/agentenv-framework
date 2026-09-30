@@ -11,7 +11,7 @@ import pytest
 
 import agent_env.task.store as store_mod
 from agent_env.store import Filter, LocalSqliteDocumentStore, Sort
-from agent_env.task.step_journal import commit_ordered, replay_context
+from agent_env.task.step_journal import _union, commit_ordered, replay_context
 from agent_env.task.store import (
     TASK_STEP_JOURNAL_COLLECTION, TaskInstanceStore, TaskStepResult, TaskStepStatus,
     seed_task_instance_context, set_task_instance_store,
@@ -562,3 +562,31 @@ def test_the_async_wrapper_propagates_a_refusal_but_not_a_missing_instance(store
     with pytest.raises(ValueError, match="no journal seed"):
         asyncio.run(undo_steps(iid, {"A"}))
     assert asyncio.run(undo_steps("nope", {"x"})) is None
+
+
+def test_a_deployed_env_written_by_two_kernels_stays_one_entry():
+    """The same deployment re-serialized by a newer kernel (a field added or derived since) matches by instance, not by value."""
+    old = {"env_id": "e", "instance_id": "i1", "mcp_server_name": None}
+    new = {"env_id": "e", "instance_id": "i1", "mcp_server_name": "env1234", "env_provider_type": "gateway"}
+    other, unregistered = {"env_id": "e2", "instance_id": "i2"}, {"env_id": "e3"}
+    assert _union([old, unregistered], [new, other, unregistered], path="context.deployed_envs") == [old, unregistered, other]
+    assert _union([old, other], [new], move_to_end=True, path="context.deployed_envs") == [other, new]
+    assert _union([old], [new], path="context.prompt_responses") == [old, new]  # every other list stays by value
+
+
+def test_a_completion_that_re_adds_a_deployed_env_keeps_one_entry(store):
+    iid = _new(store)
+    old = {"env_id": "e", "instance_id": "i1", "mcp_server_name": None}
+    _record(store, iid, "s0", ContextUpdateOps(add_to_sets={"context.deployed_envs": [old]}))
+    _record(store, iid, "s1", ContextUpdateOps(add_to_sets={"context.deployed_envs": [{**old, "mcp_server_name": "env1234"}]}))
+    assert _doc(store, iid)["context"]["deployed_envs"] == [old]
+    assert _replay(store, iid)["deployed_envs"] == [old]
+
+
+def test_a_seed_that_carries_one_deployment_twice_keeps_one_entry(store):
+    """A context persisted with a duplicate (e.g. from a mixed-version rollout) seeds one entry, which its replay agrees with."""
+    old = {"env_id": "e", "instance_id": "i1", "mcp_server_name": None}
+    inst = store.create_instance("t", 1, total_steps=9)
+    store.seed_context(inst.instance_id, ContextUpdateOps(add_to_sets={"context.deployed_envs": [old, {**old, "mcp_server_name": "env1234"}]}))
+    assert _doc(store, inst.instance_id)["context"]["deployed_envs"] == [old]
+    assert _replay(store, inst.instance_id)["deployed_envs"] == [old]

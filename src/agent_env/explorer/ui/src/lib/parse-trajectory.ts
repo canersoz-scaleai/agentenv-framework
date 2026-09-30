@@ -59,14 +59,7 @@ export interface ToolResultInfo {
   endTime: string;
   durationMs: number;
   isError: boolean;
-  screenshot?: string; // base64 PNG, post-action (CUA only)
-  /**
-   * base64 frame with the action marker baked in by the harness — the pre-action
-   * frame the gesture was measured on, with the ring/dot/line drawn onto the
-   * pixels (`cua.acted_screenshot_annotated`). The viewer shows this directly as
-   * the action-location frame. (CUA only; absent for non-gesture tools.)
-   */
-  actedScreenshotAnnotated?: string;
+  screenshot?: string; // base64 frame the harness took after the action
 }
 
 export interface ThinkingEvent {
@@ -84,7 +77,7 @@ export interface TextEvent {
  * ToolCallEvent when present. Populated only by the Claude Code CLI
  * stream-json parser today — the source format encodes sub-agent activity
  * as separate system records keyed by `tool_use_id`, which the parser
- * reattaches to the parent tool call. OTel/CUA paths leave this undefined.
+ * reattaches to the parent tool call. OTel paths leave this undefined.
  */
 export interface SubAgentSummary {
   description: string;
@@ -131,13 +124,6 @@ export interface ParsedTrajectory {
   numTurns: number;
   toolCallCount: number;
   serviceCounts: Record<string, number>;
-  /**
-   * base64 screenshot of the starting state — the screen the agent saw before
-   * its first action (CUA only; from the harness `initial_screenshot` span).
-   * Rendered at the top of the trajectory so the "before any action" state is
-   * visible, since execute_tool spans only carry post-action frames.
-   */
-  initialScreenshot?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,15 +291,8 @@ export function formatDuration(ms: number): string {
 
 export function parseOtelTrajectory(
   spans: OtelSpan[],
-  envType?: string,
   opts?: { modelHint?: string },
 ): ParsedTrajectory {
-  // ios_cua emits the same screenshot-bearing OTel span shape as desktop cua
-  // (chat spans + execute_tool spans with a base64 screenshot), so it renders
-  // through the same parser — screenshots-between-actions, no phone viewer.
-  if (envType === 'cua' || envType === 'ios_cua')
-    return parseCuaTrajectory(spans);
-
   // Claude Code CLI A2A agents emit Anthropic stream-json events, not
   // OTel/OpenInference spans. The records have no `attributes` field, so
   // the normalizer below would crash. Detect by shape (first record is a
@@ -358,6 +337,13 @@ export function parseOtelTrajectory(
     });
   }
 
+  // Harnesses that attach a base64 `screenshot` to each execute_tool result (the
+  // frames the screenshot judge reads) render one step per action, with the
+  // frame shown between actions.
+  if (looksLikeScreenshotTrajectory(spans)) {
+    return parseScreenshotTrajectory(spans);
+  }
+
   // Pre-pass: synthesize gen_ai.* attributes on OpenInference-shaped spans
   // (emitted by openai_agents_sdk) so the existing classification + extraction
   // logic below works for both schemes.
@@ -371,7 +357,7 @@ export function parseOtelTrajectory(
 
   for (const span of spans) {
     // Defensive: a non-OTel record that slipped past the dispatchers above
-    // (Claude CLI / Gemini / CUA) would otherwise crash here with
+    // (Claude CLI / Gemini) would otherwise crash here with
     // "Cannot read properties of undefined (reading 'gen_ai.operation.name')".
     // Skip rather than throw — better an empty timeline than a hard error.
     if (!span.attributes) continue;
@@ -573,31 +559,44 @@ export function parseOtelTrajectory(
 }
 
 // ---------------------------------------------------------------------------
-// CUA trajectory parser
+// Screenshot trajectory parser
 // ---------------------------------------------------------------------------
 
-function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
+// The GenAI operation name, falling back to the span name for harnesses that
+// name each span after its operation.
+function spanOperation(span: OtelSpan): string | undefined {
+  return span.attributes?.['gen_ai.operation.name'] ?? span.name;
+}
+
+function isScreenshotToolSpan(span: OtelSpan): boolean {
+  if (spanOperation(span) !== 'execute_tool') return false;
+  const raw = span.attributes?.['gen_ai.completion'];
+  if (typeof raw !== 'string' || !raw.includes('"screenshot"')) return false;
+  try {
+    const shot = JSON.parse(raw).screenshot;
+    return typeof shot === 'string' && shot.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** An OTel trajectory whose execute_tool results carry a base64 `screenshot`. */
+export function looksLikeScreenshotTrajectory(spans: unknown[]): boolean {
+  return (
+    Array.isArray(spans) &&
+    spans.some(
+      s => !!s && typeof s === 'object' && isScreenshotToolSpan(s as OtelSpan),
+    )
+  );
+}
+
+function parseScreenshotTrajectory(spans: OtelSpan[]): ParsedTrajectory {
   const sorted = [...spans].sort((a, b) =>
     a.start_time.localeCompare(b.start_time),
   );
 
-  const chatSpans = sorted.filter(s => s.name === 'chat');
-  const toolSpans = sorted.filter(s => s.name === 'execute_tool');
-
-  // Starting-state screenshot (harness `initial_screenshot` span) — the screen
-  // before any action. Rendered ahead of the events.
-  let initialScreenshot: string | undefined;
-  const initSpan = sorted.find(s => s.name === 'initial_screenshot');
-  if (initSpan) {
-    try {
-      const shot = JSON.parse(
-        initSpan.attributes['gen_ai.completion'] ?? '{}',
-      ).screenshot;
-      if (typeof shot === 'string' && shot) initialScreenshot = shot;
-    } catch {
-      /* no starting frame */
-    }
-  }
+  const chatSpans = sorted.filter(s => spanOperation(s) === 'chat');
+  const toolSpans = sorted.filter(s => spanOperation(s) === 'execute_tool');
 
   // Build a FIFO queue of tool results
   const toolResultQueue: ToolResultInfo[] = toolSpans.map(ts => {
@@ -618,13 +617,6 @@ function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
     } catch {
       output = completionRaw;
     }
-    // Harness-baked annotated frame (the pre-action frame with the gesture
-    // marker drawn into the pixels). Shown directly as the action-location frame.
-    const annotatedRaw = ts.attributes['cua.acted_screenshot_annotated'];
-    const actedScreenshotAnnotated =
-      typeof annotatedRaw === 'string' && annotatedRaw
-        ? annotatedRaw
-        : undefined;
     return {
       output,
       startTime: ts.start_time,
@@ -632,7 +624,6 @@ function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
       durationMs: durationMs(ts.start_time, ts.end_time),
       isError: ts.status.status_code === 'ERROR' || detectOutputError(output),
       screenshot,
-      actedScreenshotAnnotated,
     };
   });
 
@@ -669,7 +660,7 @@ function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
     let content: unknown[];
     try {
       const comp = JSON.parse(completionRaw);
-      // CUA format: completion is a JSON array directly (not {content: [...]})
+      // The completion may be the content array itself rather than {content: [...]}
       content = Array.isArray(comp)
         ? comp
         : Array.isArray(comp.content)
@@ -732,7 +723,7 @@ function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
     }
   }
 
-  const steps = groupCuaEventsIntoSteps(events, finalResponse);
+  const steps = groupEventsByAction(events, finalResponse);
 
   return {
     model,
@@ -744,7 +735,6 @@ function parseCuaTrajectory(spans: OtelSpan[]): ParsedTrajectory {
     numTurns: chatSpans.length,
     toolCallCount,
     serviceCounts,
-    initialScreenshot,
   };
 }
 
@@ -842,7 +832,7 @@ function cleanLabel(text: string): string {
   return c && !isLowSignalIntent(c) ? firstLine(c) : '';
 }
 
-export function groupCuaEventsIntoSteps(
+export function groupEventsByAction(
   events: TrajectoryEvent[],
   finalResponse: string,
 ): TrajectoryStep[] {

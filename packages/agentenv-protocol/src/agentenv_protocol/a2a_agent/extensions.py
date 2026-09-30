@@ -10,12 +10,26 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    ValidationError,
+    model_validator,
+)
 
 from ._triggers import MAX_SOLVER_MESSAGE_LENGTH
 from .tasks.v1 import AgentConfig
+from ..transfers import (
+    ReadObject,
+    RelativePath,
+    Uploaded,
+    WriteNamespaceGrant,
+    WriteObject,
+)
 
 
 class ImplementationOwner(str, Enum):
@@ -29,6 +43,15 @@ class ExtensionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ExtensionResponse(BaseModel):
+    """Base class for validated extension response bodies."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_SkillName = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+
+
 class McpAddRequest(ExtensionRequest):
     url: str
     headers: dict[str, str] | None = None
@@ -36,48 +59,165 @@ class McpAddRequest(ExtensionRequest):
 
 
 class InlineSkillRequest(ExtensionRequest):
-    name: str
+    name: _SkillName
     description: str
     skill_md: str
 
 
-class S3SkillRequest(ExtensionRequest):
-    name: str
+class SkillBundleFile(ExtensionRequest):
+    path: RelativePath
+    object: ReadObject
+
+
+class SkillBundle(ExtensionRequest):
+    max_total_bytes: PositiveInt
+    files: list[SkillBundleFile]
+
+    @model_validator(mode="after")
+    def _valid_bundle(self) -> SkillBundle:
+        paths = [item.path for item in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("skill bundle paths must be unique")
+        if "SKILL.md" not in paths:
+            raise ValueError("skill bundle must contain root SKILL.md")
+        maximum_size = sum(item.object.max_bytes for item in self.files)
+        if maximum_size > self.max_total_bytes:
+            raise ValueError("skill bundle file limits exceed max_total_bytes")
+        return self
+
+
+class BundleSkillRequest(ExtensionRequest):
+    name: _SkillName
     description: str
-    skill_s3_url: str
+    skill_bundle: SkillBundle
+
+
+class SkillAddResponse(ExtensionResponse):
+    name: str
 
 
 class TaskTrajectoryRequest(ExtensionRequest):
     task_id: str
-    trajectory_s3_prefix: str | None = None
 
 
 class ContextTrajectoryRequest(ExtensionRequest):
     context_id: str
-    trajectory_s3_prefix: str | None = None
 
 
-class SnapshotSaveRequest(ExtensionRequest):
+class TrajectoryWriteObjects(ExtensionRequest):
+    trajectory: WriteObject
+
+    @model_validator(mode="after")
+    def _json_trajectory(self) -> TrajectoryWriteObjects:
+        if self.trajectory.media_type != "application/json":
+            raise ValueError("trajectory object media_type must be application/json")
+        return self
+
+
+class TaskObjectTrajectoryRequest(ExtensionRequest):
+    task_id: str
+    objects: TrajectoryWriteObjects
+
+
+class ContextObjectTrajectoryRequest(ExtensionRequest):
     context_id: str
-    s3_prefix: str
-    presigned_post: dict[str, Any] | None = None
+    objects: TrajectoryWriteObjects
 
 
-class SnapshotLoadRequest(ExtensionRequest):
-    s3_prefix: str
+class TrajectoryUploadedObjects(ExtensionResponse):
+    trajectory: Uploaded
+
+
+class TrajectoryObjectsResponse(ExtensionResponse):
+    objects: TrajectoryUploadedObjects
+
+
+def _opaque_snapshot_objects(
+    objects: SnapshotWriteObjects | SnapshotReadObjects,
+) -> SnapshotWriteObjects | SnapshotReadObjects:
+    for name in ("trajectory", "workspace"):
+        descriptor = getattr(objects, name)
+        if descriptor is not None and descriptor.media_type != "application/octet-stream":
+            raise ValueError(f"snapshot {name} media_type must be application/octet-stream")
+    return objects
+
+
+class SnapshotWriteObjects(ExtensionRequest):
+    trajectory: WriteObject
+    workspace: WriteObject | None = None
+
+    _opaque_media_types = model_validator(mode="after")(_opaque_snapshot_objects)
+
+
+class ObjectSnapshotSaveRequest(ExtensionRequest):
+    context_id: str
+    objects: SnapshotWriteObjects
+
+
+class SnapshotReadObjects(ExtensionRequest):
+    trajectory: ReadObject
+    workspace: ReadObject | None = None
+
+    _opaque_media_types = model_validator(mode="after")(_opaque_snapshot_objects)
+
+
+class ObjectSnapshotLoadRequest(ExtensionRequest):
+    objects: SnapshotReadObjects
     target_context_id: str | None = None
 
 
-class ChangelogEnableRequest(ExtensionRequest):
-    s3_prefix: str
+class SnapshotUploadedObjects(ExtensionResponse):
+    trajectory: Uploaded
+    workspace: Uploaded | None = None
+
+
+class ObjectSnapshotSaveResponse(ExtensionResponse):
+    context_id: str
+    objects: SnapshotUploadedObjects
+
+
+class ObjectSnapshotLoadResponse(ExtensionResponse):
+    context_id: str
+
+
+class NamespaceChangelogEnableRequest(ExtensionRequest):
+    write_namespace: WriteNamespaceGrant
     roots: list[str] | None = None
 
 
-class ChangelogApplyRequest(ExtensionRequest):
-    s3_prefix: str
-    up_to_tool_call_exclusive: int | None = None
+class NamespaceChangelogEnableResponse(ExtensionResponse):
+    roots: list[str]
+
+
+class ChangelogIncrement(ExtensionRequest):
+    sequence: int = Field(ge=0)
+    object: ReadObject
+
+    @model_validator(mode="after")
+    def _opaque_media_type(self) -> ChangelogIncrement:
+        if self.object.media_type != "application/octet-stream":
+            raise ValueError(
+                "changelog increment media_type must be application/octet-stream"
+            )
+        return self
+
+
+class ObjectChangelogApplyRequest(ExtensionRequest):
+    increments: list[ChangelogIncrement]
     resume_conversation: bool = False
     target_context_id: str | None = None
+
+    @model_validator(mode="after")
+    def _ordered_unique_sequences(self) -> ObjectChangelogApplyRequest:
+        sequences = [increment.sequence for increment in self.increments]
+        if sequences != sorted(set(sequences)):
+            raise ValueError("changelog increment sequences must be strictly increasing")
+        return self
+
+
+class ObjectChangelogApplyResponse(ExtensionResponse):
+    count: int = Field(ge=0)
+    context_id: str | None = None
 
 
 class PeerAgent(ExtensionRequest):
@@ -150,7 +290,7 @@ class RequestVariant:
 
     @property
     def fields(self) -> FieldSchema:
-        return _model_field_schema(self.model)
+        return request_fields(self.model)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,8 +326,14 @@ class RequestDefinition:
     @property
     def common(self) -> FieldSchema:
         if self.model is not None:
-            return _model_field_schema(self.model)
-        schemas = [variant.fields for variant in self.variants]
+            return request_fields(self.model)
+        return self._common(self.variants)
+
+    @staticmethod
+    def _common(variants: Iterable[RequestVariant]) -> FieldSchema:
+        schemas = [variant.fields for variant in variants]
+        if not schemas:
+            return FieldSchema()
         first = schemas[0]
         required = tuple(
             name
@@ -233,12 +379,13 @@ class RequestDefinition:
         )
 
     def to_card(self, optional: Iterable[str] = ()) -> dict[str, Any]:
-        result = self.common.to_card()
         variants = self.enabled_variants(optional)
+        common = self._common(variants) if self.model is None else self.common
+        result = common.to_card()
         if not variants:
             return result
 
-        common_names = set(self.common.required) | set(self.common.optional)
+        common_names = set(common.required) | set(common.optional)
 
         if len(variants) == 1:
             only = variants[0].fields
@@ -280,13 +427,18 @@ class RequestDefinition:
                 raise ValueError(f"missing required fields: {sorted(missing)}")
             return None
 
-        common_names = set(self.common.required) | set(self.common.optional)
+        common = self._common(variants) if self.model is None else self.common
+        enabled_names = {
+            field_name
+            for variant in variants
+            for field_name in (*variant.fields.required, *variant.fields.optional)
+        }
         disabled = {
             field_name
             for variant in self.variants
             if variant not in variants
             for field_name in (*variant.fields.required, *variant.fields.optional)
-            if field_name not in common_names
+            if field_name not in enabled_names
         }
         supplied_disabled = disabled & set(payload)
         if supplied_disabled:
@@ -294,7 +446,7 @@ class RequestDefinition:
                 f"unsupported request variant fields: {sorted(supplied_disabled)}"
             )
 
-        missing_common = set(self.common.required) - set(payload)
+        missing_common = set(common.required) - set(payload)
         if missing_common:
             raise ValueError(f"missing required fields: {sorted(missing_common)}")
 
@@ -322,7 +474,8 @@ class RequestDefinition:
         return matches[0]
 
 
-def _model_field_schema(model: type[BaseModel]) -> FieldSchema:
+def request_fields(model: type[BaseModel]) -> FieldSchema:
+    """The wire fields of a request model, as an Agent Card declares them."""
     required: list[str] = []
     optional: list[str] = []
     for name, field_info in model.model_fields.items():
@@ -336,6 +489,33 @@ def _model_field_schema(model: type[BaseModel]) -> FieldSchema:
     return FieldSchema(required=tuple(required), optional=tuple(optional))
 
 
+def card_request_accepts(request: Mapping[str, Any], fields: Iterable[str]) -> bool:
+    """Whether an Agent Card's request contract (as ``RequestDefinition.to_card`` renders it, or
+    a hand-written card with ``supported`` lists) takes a body of exactly ``fields``: one of its
+    branches requires none of the others and declares all of them."""
+    sent = set(fields)
+    required, declared = _card_fields(request)
+    for branch in request.get("oneOf") or [{}]:
+        branch_required, branch_declared = _card_fields(branch)
+        if required | branch_required <= sent <= declared | branch_declared:
+            return True
+    return False
+
+
+def _card_fields(schema: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    required = set(schema.get("required") or ())
+    return required, required.union(schema.get("optional") or (), schema.get("supported") or ())
+
+
+def _response_model_field_schema(model: type[BaseModel]) -> FieldSchema:
+    required: list[str] = []
+    optional: list[str] = []
+    for name, field_info in model.model_fields.items():
+        wire_name = field_info.serialization_alias or field_info.alias or name
+        (required if field_info.is_required() else optional).append(wire_name)
+    return FieldSchema(required=tuple(required), optional=tuple(optional))
+
+
 @dataclass(frozen=True, slots=True)
 class OperationDefinition:
     name: str
@@ -343,7 +523,8 @@ class OperationDefinition:
     path: str
     implementation: ImplementationOwner
     request: RequestDefinition | type[BaseModel] | None = None
-    response: FieldSchema | None = None
+    response: FieldSchema | type[BaseModel] | None = None
+    response_model: type[BaseModel] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", self.method.upper())
@@ -355,6 +536,15 @@ class OperationDefinition:
             raise TypeError(
                 "operation request must be a Pydantic BaseModel subclass or "
                 "RequestDefinition"
+            )
+        if isinstance(self.response, type) and issubclass(self.response, BaseModel):
+            if self.response.model_config.get("extra") != "forbid":
+                raise TypeError(
+                    f"response model {self.response.__name__} must set extra='forbid'"
+                )
+            object.__setattr__(self, "response_model", self.response)
+            object.__setattr__(
+                self, "response", _response_model_field_schema(self.response)
             )
         if not self.path.startswith("/"):
             raise ValueError(
@@ -610,6 +800,7 @@ def _op(
     owner: ImplementationOwner,
     *,
     request_model: type[BaseModel] | None = None,
+    response_model: type[BaseModel] | None = None,
     response_required: Iterable[str] = (),
     response_optional: Iterable[str] = (),
     variants: Iterable[RequestVariant] = (),
@@ -622,17 +813,16 @@ def _op(
     request: RequestDefinition | type[BaseModel] | None = request_model
     if variants:
         request = RequestDefinition(variants=variants)
+    response: FieldSchema | type[BaseModel] | None = response_model
+    if response_required or response_optional:
+        response = FieldSchema(required=response_required, optional=response_optional)
     return OperationDefinition(
         name=name,
         method=method,
         path=path,
         implementation=owner,
         request=request,
-        response=(
-            FieldSchema(required=response_required, optional=response_optional)
-            if response_required or response_optional
-            else None
-        ),
+        response=response,
     )
 
 
@@ -740,9 +930,10 @@ SKILL_CONFIG_V1 = ExtensionDefinition(
             request=RequestDefinition(
                 variants=(
                     RequestVariant("inline", InlineSkillRequest),
-                    RequestVariant("s3", S3SkillRequest),
+                    RequestVariant("bundle", BundleSkillRequest),
                 ),
             ),
+            response=SkillAddResponse,
         ),
         "list": _op(
             "list", "GET", "/ext/skill-config", SDK, response_required=("skills",)
@@ -763,9 +954,16 @@ TRAJECTORY_V1 = ExtensionDefinition(
             request=RequestDefinition(
                 variants=(
                     RequestVariant("task", TaskTrajectoryRequest),
+                    RequestVariant("task_objects", TaskObjectTrajectoryRequest),
                     RequestVariant(
                         "context",
                         ContextTrajectoryRequest,
+                        support_required=False,
+                        implementation=RUNTIME,
+                    ),
+                    RequestVariant(
+                        "context_objects",
+                        ContextObjectTrajectoryRequest,
                         support_required=False,
                         implementation=RUNTIME,
                     ),
@@ -785,22 +983,16 @@ SNAPSHOT_V1 = ExtensionDefinition(
             "POST",
             "/ext/snapshot",
             RUNTIME,
-            request_model=SnapshotSaveRequest,
-            response_required=("s3_prefix", "context_id", "timestamp"),
-            response_optional=(
-                "object_key",
-                "file_count",
-                "byte_count",
-                "bytes_written",
-            ),
+            request_model=ObjectSnapshotSaveRequest,
+            response_model=ObjectSnapshotSaveResponse,
         ),
         "load": _op(
             "load",
             "PUT",
             "/ext/snapshot",
             RUNTIME,
-            request_model=SnapshotLoadRequest,
-            response_required=("ok", "context_id"),
+            request_model=ObjectSnapshotLoadRequest,
+            response_model=ObjectSnapshotLoadResponse,
         ),
     },
     optional_features={
@@ -811,17 +1003,16 @@ SNAPSHOT_V1 = ExtensionDefinition(
                     "POST",
                     "/ext/snapshot/changelog",
                     RUNTIME,
-                    request_model=ChangelogEnableRequest,
-                    response_required=("ok", "s3_prefix", "roots"),
+                    request_model=NamespaceChangelogEnableRequest,
+                    response_model=NamespaceChangelogEnableResponse,
                 ),
                 "apply": _op(
                     "apply-changelog",
                     "PUT",
                     "/ext/snapshot/changelog",
                     RUNTIME,
-                    request_model=ChangelogApplyRequest,
-                    response_required=("ok", "count"),
-                    response_optional=("context_id",),
+                    request_model=ObjectChangelogApplyRequest,
+                    response_model=ObjectChangelogApplyResponse,
                 ),
             }
         )

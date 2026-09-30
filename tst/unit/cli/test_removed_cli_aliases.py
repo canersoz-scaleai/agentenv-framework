@@ -5,12 +5,16 @@ fails at build time. A legacy spelling that survives here is invisible until som
 the CLI still answers to it, and a canonical spelling accidentally dropped alongside its alias
 is invisible until a script breaks. Both directions are asserted.
 
-Also pins the two boundaries the removal must NOT cross: the ServiceDB surface is a permanent
-exemption, and `--service-version` survives on the env commands (an MCPServerEnv/WebsiteEnv
-field) while it is gone from `artifact environment put` (the deleted artifact field).
+Also pins the ServiceDB surface, a permanent exemption the removal must NOT cross, and
+`--service-version`: its field is deleted everywhere, and no command takes the flag.
 """
 
+from unittest.mock import patch
+
 import pytest
+from click.testing import CliRunner
+
+from agent_env.cli import cli
 
 # (group path, removed noun, surviving replacement)
 _REMOVED_NOUNS = [
@@ -33,8 +37,6 @@ _REMOVED_FLAGS = [
 
 
 def _resolve(path):
-    from agent_env.cli import cli
-
     node = cli
     for part in path:
         node = node.commands[part]
@@ -58,7 +60,6 @@ def test_removed_flag_is_gone_and_replacement_survives(path, removed, replacemen
 
 def test_no_deprecated_command_is_registered_anywhere():
     """Catches a legacy spelling registered under a name this module does not enumerate."""
-    from agent_env.cli import cli
 
     def walk(node, path=()):
         for name, cmd in getattr(node, "commands", {}).items():
@@ -79,8 +80,6 @@ def test_the_alias_helper_module_is_gone():
 
 def test_servicedb_cli_surface_is_never_renamed():
     """Permanent exemption; a mechanical --service-* sweep would take all three."""
-    from agent_env.cli import cli
-
     assert "service-db" in cli.commands["env"].commands
     assert "environment-db" not in cli.commands["env"].commands
     deploy_flags = {o for p in cli.commands["env"].commands["deploy"].params for o in p.opts}
@@ -89,19 +88,28 @@ def test_servicedb_cli_surface_is_never_renamed():
     assert "--service-db-env-id" in run_flags
 
 
-def test_service_version_survives_on_envs_and_is_gone_from_the_artifact():
-    """The field split: MCPServerEnv/WebsiteEnv keep `service_version`; the artifact's was
-    deleted, so its flag goes with it. There is no `--environment-version` in either case."""
-    from agent_env.cli import cli
+def test_service_version_is_gone_from_every_put():
+    """No command takes the flag, and there is no `--environment-version` in its place."""
+    for path in (["env", "mcp-server", "put"], ["env", "website", "put"], ["artifact", "environment", "put"]):
+        opts = {o for p in _resolve(path).params for o in p.opts}
+        assert "--service-version" not in opts
+        assert "--environment-version" not in opts
 
-    for group, cmd in (
-        (cli.commands["env"].commands["mcp-server"], "put"),
-        (cli.commands["env"].commands["website"], "put"),
-    ):
-        flags = {o for p in group.commands[cmd].params for o in p.opts}
-        assert "--service-version" in flags
-        assert "--environment-version" not in flags
 
-    artifact_put = {o for p in cli.commands["artifact"].commands["environment"].commands["put"].params for o in p.opts}
-    assert "--service-version" not in artifact_put
-    assert "--environment-version" not in artifact_put
+_GITHUB = "https://github.com/o/r/tree/main/Dockerfile"
+
+_ENV_PUTS = [
+    pytest.param(["env", "mcp-server", "put", "--dockerfile-github-url", _GITHUB],
+                 "agent_env.cli.env.mcp_server.MCPServerEnv.put_from_github", id="mcp-server"),
+    pytest.param(["env", "website", "put", "--backend-dockerfile-github-url", _GITHUB, "--frontend-dockerfile-github-url", _GITHUB],
+                 "agent_env.cli.env.website.WebsiteEnv.put_from_github", id="website"),
+]
+
+
+@pytest.mark.parametrize("argv,put_target", _ENV_PUTS)
+def test_service_version_is_refused_before_anything_is_built(argv, put_target):
+    with patch(put_target) as put:
+        result = CliRunner().invoke(cli, [*argv, "--id", "x", "--environment-name", "email", "--service-version", "2"])
+    assert result.exit_code == 2, result.output
+    assert "No such option" in result.output and "--service-version" in result.output
+    put.assert_not_called()

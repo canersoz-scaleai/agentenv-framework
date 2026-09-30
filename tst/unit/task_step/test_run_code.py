@@ -16,9 +16,10 @@ import pytest
 
 from agent_env.artifact import FileArtifact
 from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, EnvNeedsSandbox
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
 from agent_env.task_step.task_steps import run_code as _run_code_module
+from tst.unit.event_loop_probe import on_event_loop
 from agent_env.task_step.task_steps.run_code import (
     RunCodeExecutionError,
     RunCodeTaskStep,
@@ -34,7 +35,7 @@ def _make_context(*, with_agent=True, metadata=None):
     agent = DeployedAgent(
         agent_name="default-agent", api_url="http://agent", sandbox_id="sb-agent"
     )
-    env = DeployedEnv(
+    env = DeployedGatewayEnv(
         env_id="env-x", env_version=1, gateway_url="", mcp_url="",
         db_web_url=None, sandbox_id="sb-env",
     )
@@ -130,10 +131,10 @@ def _sandbox(exec_results, *, artifact="single", agent_mode=True):
     # Tests that care about platform-injected secrets patch this themselves; the rest
     # must not reach for real AWS/secret-store credentials.
     with patch(
-        "agent_env.providers.sandbox_provider.get_agent_sandbox_provider",
+        "agent_env.providers.sandbox_providers.sandbox_provider.get_agent_sandbox_provider",
         return_value=provider,
     ), patch(
-        "agent_env.providers.sandbox_provider.get_env_sandbox_provider",
+        "agent_env.providers.sandbox_providers.sandbox_provider.get_env_sandbox_provider",
         return_value=provider,
     ), patch("agent_env.artifact.Artifact.get", return_value=artifact), patch.object(
         FileArtifact, "put_bytes", put
@@ -182,7 +183,7 @@ def _real_run(tmp_path, artifact):
     provider = MagicMock()
     provider.get_sandbox = AsyncMock(return_value=sandbox)
     with patch(
-        "agent_env.providers.sandbox_provider.get_agent_sandbox_provider",
+        "agent_env.providers.sandbox_providers.sandbox_provider.get_agent_sandbox_provider",
         return_value=provider,
     ), patch("agent_env.artifact.Artifact.get", return_value=artifact), patch.object(
         FileArtifact, "load", _load_body
@@ -210,6 +211,21 @@ async def test_result_is_stored_under_result_id():
 
 
 @pytest.mark.asyncio
+async def test_the_script_is_read_off_the_event_loop():
+    on_loop: list[bool] = []
+
+    def load(self):
+        on_loop.append(on_event_loop())
+        return _load_body(self)
+
+    step = _step()
+    with _sandbox([(0, "", ""), (0, "2", ""), (0, "{}", "")]), patch.object(FileArtifact, "load", load):
+        await step.execute(_make_context())
+
+    assert on_loop == [False]
+
+
+@pytest.mark.asyncio
 async def test_host_target_runs_with_no_agent_deployed():
     # `env_id` set + zero deployed agents: still succeeds. This is the whole point
     # of the host target — run code without a deploy_agent step (or LLM key).
@@ -220,6 +236,14 @@ async def test_host_target_runs_with_no_agent_deployed():
         ctx = await step.execute(_make_context(with_agent=False))
 
     assert ctx.metadata["script_results"]["filter"] == {"keep": True}
+
+
+@pytest.mark.asyncio
+async def test_host_target_on_an_env_outside_our_sandboxes_says_it_needs_one():
+    ctx = _make_context(with_agent=False)
+    ctx.deployed_envs = [DeployedEnv(env_id="env-x", env_version=1, env_provider_type="hosted")]
+    with pytest.raises(EnvNeedsSandbox, match="^run_code on the env's host needs a sandbox; env 'env-x' runs outside"):
+        await _step(env_id="env-x", result_id="filter")._host_target(ctx)
 
 
 @pytest.mark.asyncio
@@ -242,7 +266,7 @@ async def test_host_target_honors_custom_env_sandbox_type():
     provider.get_sandbox = AsyncMock(return_value=sandbox)
     artifact = _file_artifact()
     with patch(
-        "agent_env.providers.sandbox_provider.build_sandbox_provider",
+        "agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider",
         return_value=provider,
     ) as build, patch("agent_env.artifact.Artifact.get", return_value=artifact), patch.object(
         FileArtifact, "load", _load_body
@@ -250,6 +274,69 @@ async def test_host_target_honors_custom_env_sandbox_type():
         await step.execute(ctx)
 
     build.assert_called_once_with("arp")
+    assert ctx.metadata["script_results"]["filter"] == {"keep": True}
+
+
+@pytest.mark.asyncio
+async def test_agent_target_honors_the_agents_sandbox_type():
+    # an agent deployed on another provider is reached there, not through the configured default
+    step = _step(result_id="filter")
+    ctx = _make_context()
+    ctx.deployed_agents[0].sandbox_type = "modal"
+
+    sandbox = AsyncMock()
+    sandbox.mode = "vm"
+    sandbox.container_name = "agent-api"
+    sandbox.exec_with_output = AsyncMock(
+        # the `env` read execute() does for redaction, the clear, the script run, `wc -c`, then `cat`
+        side_effect=[(0, "", ""), (0, "", ""), (0, "", ""), (0, "13", ""), (0, '{"keep": true}', "")]
+    )
+    provider = MagicMock()
+    provider.get_sandbox = AsyncMock(return_value=sandbox)
+    with patch(
+        "agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider",
+        return_value=provider,
+    ) as build, patch(
+        "agent_env.providers.sandbox_providers.sandbox_provider.get_agent_sandbox_provider",
+    ) as default, patch("agent_env.artifact.Artifact.get", return_value=_file_artifact()), patch.object(
+        FileArtifact, "load", _load_body
+    ):
+        await step.execute(ctx)
+
+    build.assert_called_once_with("modal")
+    default.assert_not_called()
+    assert ctx.metadata["script_results"]["filter"] == {"keep": True}
+
+
+@pytest.mark.asyncio
+async def test_host_installed_agent_on_a_vm_runs_on_the_host():
+    step = _step(result_id="filter")
+    ctx = _make_context()
+    ctx.deployed_agents[0].sandbox_type = "modal_vm"
+    ctx.deployed_agents[0].on_host = True
+
+    sandbox = AsyncMock()
+    sandbox.mode = "vm"
+    sandbox.container_name = "agent-api"
+    sandbox.exec_with_output = AsyncMock(
+        side_effect=[(0, "", ""), (0, "13", ""), (0, '{"keep": true}', "")]
+    )
+    provider = MagicMock()
+    provider.get_sandbox = AsyncMock(return_value=sandbox)
+    with patch(
+        "agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider",
+        return_value=provider,
+    ), patch("agent_env.artifact.Artifact.get", return_value=_file_artifact()), patch.object(
+        FileArtifact, "load", _load_body
+    ):
+        await step.execute(ctx)
+
+    commands = [" ".join(map(str, c.args)) for c in sandbox.exec_with_output.await_args_list]
+    commands += [str(c.args[0]) for c in sandbox.exec_script.await_args_list]
+    assert not any("docker" in c for c in commands)
+    sandbox.write_file_from_text.assert_not_awaited()
+    written = [c.args[1].rsplit("/", 1)[-1] for c in sandbox.write_host_file.await_args_list]
+    assert {"input.json", "runner.py"} <= set(written)
     assert ctx.metadata["script_results"]["filter"] == {"keep": True}
 
 

@@ -13,9 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_env.env.envs.multi_env import MultiEnv
-from agent_env.providers.gateway_provider import GatewayProvider
-from agent_env.providers.state import LocalPostgresStateProvider
-from tst.unit.providers.state.fakes import ExternalDbStateProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider
+from agent_env.providers.env_state import LocalPostgresStateProvider
+from tst.unit.providers.env_state.fakes import ExternalDbStateProvider
 
 
 def _universe(n_services: int = 0):
@@ -30,9 +30,9 @@ def _universe(n_services: int = 0):
 def _env(provider=None, instance_id="inst-1"):
     env = MultiEnv(id="env-1", version=1, mcp_server_envs=[])
     env._instance_id = instance_id
-    gp = GatewayProvider()
+    gp = EnvironmentGatewayProvider()
     gp._state_provider = provider if provider is not None else LocalPostgresStateProvider()
-    env._gateway_provider = gp
+    env._env_provider = gp
     env._load_from_snapshot = AsyncMock()
     return env
 

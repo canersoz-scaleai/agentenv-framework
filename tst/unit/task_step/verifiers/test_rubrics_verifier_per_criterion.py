@@ -40,7 +40,7 @@ from agent_env.task_step.task_steps.verifiers.judge_utils.trajectory_filter impo
 
 _JPEG = "/9j/" + "A" * 300
 _BUDGET = 8
-_PINS = {"typed": r"^ios_type\b"}
+_PINS = {"typed": r"^gui_type\b"}
 
 
 def _span(tool: str, args: dict, shot: str | None = _JPEG) -> dict:
@@ -57,9 +57,9 @@ def _raw_run(n: int = 30) -> str:
                              "gen_ai.completion": json.dumps({"content": [
                                  {"type": "thinking", "thinking": "let me think"},
                                  {"type": "text", "text": "I will now book the table"}]})}}]
-    spans += [_span("ios_tap", {"x": i, "y": i}) for i in range(1, n + 1)]
-    spans[5] = _span("ios_type", {"text": "party of four"})                 # action 5
-    spans[12] = _span("ios_tap_element", {"label": "Reserve table"})          # action 12
+    spans += [_span("gui_tap", {"x": i, "y": i}) for i in range(1, n + 1)]
+    spans[5] = _span("gui_type", {"text": "party of four"})                 # action 5
+    spans[12] = _span("gui_tap_element", {"label": "Reserve table"})          # action 12
     return json.dumps(spans)
 
 
@@ -137,7 +137,7 @@ def test_filter_validates_the_per_criterion_budget_and_the_regex_knobs():
         _filter(evidence_exclude_pattern="(unclosed")
     with pytest.raises(ValueError, match=r"always_show_actions\['typed'\] is not a valid regex"):
         _filter(always_show_actions={"typed": "(unclosed"})
-    for bad in ({"": r"^ios_type"}, {"typed": 3}, ["^ios_type"], "^ios_type", {3: "x"}):
+    for bad in ({"": r"^gui_type"}, {"typed": 3}, ["^gui_type"], "^gui_type", {3: "x"}):
         with pytest.raises(ValueError, match="always_show_actions"):
             _filter(always_show_actions=bad)
     _filter(always_show_actions={})                                   # nothing pinned is a valid configuration
@@ -221,8 +221,8 @@ async def test_execute_attaches_labelled_per_criterion_frames_with_an_action_log
     text = captured["eval_prompt"]
     assert "/9j/" not in text and "let me think" not in text                      # no frames or thinking in the text
     assert 'agent said: "I will now book the table"' in text                     # the agent's words, labelled as such
-    assert text.index("agent said:") < text.index("1. ios_tap")                  # ...in run order
-    assert "12. ios_tap_element" in text and '"label": "Reserve table"' in text and ' -> {"result": "ok"}' in text
+    assert text.index("agent said:") < text.index("1. gui_tap")                  # ...in run order
+    assert "12. gui_tap_element" in text and '"label": "Reserve table"' in text and ' -> {"result": "ok"}' in text
     assert "`agent said:`" in text                                              # the grounding explains the agent's lines
     assert "harness" not in per_criterion_grounding(1, cites_evidence=True)     # no one bridge's conventions in the prompt
     assert "## Grading policy" in text and "never accept an autocomplete suggestion" in text
@@ -247,7 +247,7 @@ async def _frame_labels(monkeypatch, v: RubricsVerifierTaskStep) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_exclude_pattern_drops_actions_as_evidence_case_insensitively(monkeypatch):
-    # action 12 is `ios_tap_element {"label": "Reserve table"}` — the only evidence for c1 (table-reserved)
+    # action 12 is `gui_tap_element {"label": "Reserve table"}` — the only evidence for c1 (table-reserved)
     assert "FRAME: [c1] action 12" in await _frame_labels(monkeypatch, _verifier())
     labels = await _frame_labels(monkeypatch, _verifier(trajectory_filter=_filter(evidence_exclude_pattern=r"reserve TABLE")))
     assert not any(label.startswith("FRAME: [c1]") for label in labels)        # mixed-case action, mixed-case pattern
@@ -256,8 +256,8 @@ async def test_exclude_pattern_drops_actions_as_evidence_case_insensitively(monk
 
 @pytest.mark.asyncio
 async def test_always_show_actions_pins_frames_case_insensitively_and_none_pins_nothing(monkeypatch):
-    # action 5 is `ios_type {"text": "party of four"}`; the pin is spelled in upper case and over the arguments
-    pins = {"TYPED": r"^IOS_TYPE\b", "party": r'"text": "PARTY'}
+    # action 5 is `gui_type {"text": "party of four"}`; the pin is spelled in upper case and over the arguments
+    pins = {"TYPED": r"^GUI_TYPE\b", "party": r'"text": "PARTY'}
     labels = await _frame_labels(monkeypatch, _verifier(trajectory_filter=_filter(always_show_actions=pins)))
     assert "FRAME: [c2] TYPED party action 5" in labels
     labels = await _frame_labels(monkeypatch, _verifier(trajectory_filter=_filter(always_show_actions=None)))
@@ -272,13 +272,13 @@ async def test_action_log_line_cap_keeps_the_final_actions_in_the_prompt(monkeyp
     await v.execute(_ctx())
     text = captured["eval_prompt"]
     # 1 agent message + 30 tool calls = 31 lines; 10 kept — the message and calls 1-4, then calls 26-30
-    assert 'agent said: "I will now book the table"\n1. ios_tap' in text and "\n4. ios_tap" in text
-    assert "\n... (21 lines not shown) ...\n26. ios_tap" in text and "\n30. ios_tap" in text
-    assert "\n5. ios_type" not in text and "\n25. ios_tap" not in text
+    assert 'agent said: "I will now book the table"\n1. gui_tap' in text and "\n4. gui_tap" in text
+    assert "\n... (21 lines not shown) ...\n26. gui_tap" in text and "\n30. gui_tap" in text
+    assert "\n5. gui_type" not in text and "\n25. gui_tap" not in text
     v = _verifier()                                                             # the default cap elides nothing here
     default = _capture_judge(monkeypatch, v, _passing_rows)
     await v.execute(_ctx())
-    assert "not shown" not in default["eval_prompt"] and "\n5. ios_type" in default["eval_prompt"]
+    assert "not shown" not in default["eval_prompt"] and "\n5. gui_type" in default["eval_prompt"]
 
 
 @pytest.mark.asyncio
@@ -299,7 +299,7 @@ async def test_rubric_evidence_refuses_to_run_when_an_override_drops_the_filter(
     assert captured["image_blocks"] == [] and ctx.metadata["verifications"]["vid"]["score"] == 1.0
 
 
-_NO_SCREENSHOTS = json.dumps([_span("ios_tap", {"x": i}, shot=None) for i in range(1, 6)])
+_NO_SCREENSHOTS = json.dumps([_span("gui_tap", {"x": i}, shot=None) for i in range(1, 6)])
 
 
 @pytest.mark.asyncio
@@ -327,7 +327,7 @@ async def test_a_format_without_evidence_fields_degrades_to_the_text_only_prompt
     ctx = _ctx()
     await v.execute(ctx)
     text = captured["eval_prompt"]
-    assert captured["image_blocks"] == [] and "1. ios_tap" in text             # the action log still goes...
+    assert captured["image_blocks"] == [] and "1. gui_tap" in text             # the action log still goes...
     assert "## Screenshots" not in text and "FRAME:" not in text                # ...with no frame rules to follow
     assert ctx.metadata["verifications"]["vid"]["score"] == 1.0
 
@@ -370,7 +370,7 @@ async def test_final_frames_strategy_with_the_action_log_text_view(monkeypatch):
     ctx = _ctx()
     await v.execute(ctx)
     assert [b["type"] for b in captured["image_blocks"]] == ["image_url", "image_url"]   # plain last-2, no labels
-    assert "1. ios_tap" in captured["eval_prompt"] and "Final-state screenshots" in captured["eval_prompt"]
+    assert "1. gui_tap" in captured["eval_prompt"] and "Final-state screenshots" in captured["eval_prompt"]
     assert "<image omitted" not in captured["eval_prompt"]                     # the action log, not stripped text
     assert "## Grading policy" not in captured["eval_prompt"]
     assert ctx.metadata["verifications"]["vid"]["format"] == "rubric_binary"
@@ -429,23 +429,23 @@ def test_restore_frame_labels_rewrites_every_tag_without_prefix_collisions():
 
 # --------------------------------------------------------------------------- context_facts_for_judge
 
-_FACTS = {"autocomplete fragments": "verifications.ios-mechanical-flail.typing_fragments",
-          "first tap": "verifications.ios-mechanical-flail.taps.0.target",
+_FACTS = {"autocomplete fragments": "verifications.mechanical-flail.typing_fragments",
+          "first tap": "verifications.mechanical-flail.taps.0.target",
           "missing": "verifications.nope.count"}
 _FLAIL = {"typing_fragments": {"zeta": 1, "alpha": ["ca", "caf"]}, "taps": [{"target": "Café"}, {"target": "b"}]}
 
 
 def _facts_ctx() -> TaskStepContext:
     ctx = _ctx()
-    ctx.metadata["verifications"] = {"ios-mechanical-flail": _FLAIL}
+    ctx.metadata["verifications"] = {"mechanical-flail": _FLAIL}
     return ctx
 
 
 def test_resolve_context_facts_walks_dicts_and_lists_and_marks_what_does_not_resolve():
-    meta = {"verifications": {"ios-mechanical-flail": _FLAIL}, "n": 3, "long": "x" * 1000}
+    meta = {"verifications": {"mechanical-flail": _FLAIL}, "n": 3, "long": "x" * 1000}
     facts = {**_FACTS, "count": "n", "long value": "long",
-             "index past the end": "verifications.ios-mechanical-flail.taps.7.target",
-             "key under a scalar": "n.child", "key under a list": "verifications.ios-mechanical-flail.taps.target"}
+             "index past the end": "verifications.mechanical-flail.taps.7.target",
+             "key under a scalar": "n.child", "key under a list": "verifications.mechanical-flail.taps.target"}
     resolved = dict(resolve_context_facts(facts, meta))
     assert list(resolved) == list(facts)                                             # requested order kept
     assert resolved["autocomplete fragments"] == '{"alpha": ["ca", "caf"], "zeta": 1}'   # compact JSON, sorted keys

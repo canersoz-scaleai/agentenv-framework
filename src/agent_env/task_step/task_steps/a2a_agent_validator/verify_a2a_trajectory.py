@@ -1,13 +1,22 @@
-"""Verify A2A agent trajectory extension supports inline and S3 retrieval."""
+"""Verify the advertised A2A trajectory retrieval variants."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import ClassVar, Optional
 
-import httpx
-
 from agent_env.task_step.context import TaskStepContext
+from agent_env.a2a_agent.object_transfer import (
+    REPLY_TIMEOUT_SECONDS,
+    TransferCall,
+    TrajectoryUpload,
+    choose_transfer,
+    fetch_trajectory,
+    invoke_transfer,
+    trajectory_mode,
+)
+from agent_env.task_step.snapshot_utils.agent_state_capture import trajectory_object_url
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
@@ -58,8 +67,8 @@ class VerifyA2ATrajectoryStep(TaskStep):
             return context
 
         a2a_url = deployed_agent.a2a_url or deployed_agent.api_url
-        ext_config = traj_ext.get("config") or traj_ext.get("params") or {}
-        endpoint = a2a_url + ext_config.get("endpoint", "/ext/trajectory")
+        get_method, get_path = A2AAgent.operation(traj_ext, "get")
+        endpoint = a2a_url + get_path
 
         # Get task_id from the MCP step
         mcp_result = context.metadata.get("verifications", {}).get("a2a_agent_mcp", {})
@@ -70,45 +79,72 @@ class VerifyA2ATrajectoryStep(TaskStep):
         # Test inline trajectory retrieval
         inline_ok = False
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(endpoint, json={"task_id": task_id}, timeout=120)
-                resp.raise_for_status()
-                data = resp.json()
-                if "trajectory" in data and data["trajectory"]:
-                    inline_ok = True
-                    logger.info(f"Inline trajectory: OK ({len(data['trajectory'])} events)")
-                else:
-                    logger.warning("Inline trajectory: response missing 'trajectory' key or empty")
+            fetched = await fetch_trajectory(endpoint, {"task_id": task_id})
+            if fetched.inline:
+                inline_ok = True
+                logger.info(f"Inline trajectory: OK ({len(fetched.inline)} events)")
+            else:
+                logger.warning("Inline trajectory: response missing 'trajectory' key or empty")
         except Exception as e:
             logger.warning(f"Inline trajectory: failed ({e})")
 
-        # Test S3 prefix trajectory retrieval
+        # The object variant is probed only on a store that can issue its grant.
+        objects_ok = False
+        config = get_config()
+        store = config.get_object_store()
+        probe_prefix = f"{config.get_artifact_key_prefix()}a2a_validator_trajectories/{self.a2a_agent_id}/"
+        if trajectory_mode(get_method, store, by="task_id") == "objects":
+            try:
+                prefix = store.object_url(probe_prefix)
+                upload = await asyncio.to_thread(
+                    TrajectoryUpload.to, store, trajectory_object_url(prefix, name=task_id, store=store)
+                )
+                await fetch_trajectory(endpoint, {"task_id": task_id}, upload=upload)
+                objects_ok = True
+                logger.info("Object trajectory: OK")
+            except Exception as e:
+                logger.warning(f"Object trajectory: failed ({e})")
+
         s3_ok = False
-        bucket = get_config().get_s3_bucket()
-        s3_prefix = f"s3://{bucket}/a2a_validator_trajectories/{self.a2a_agent_id}/"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(endpoint, json={"task_id": task_id, "trajectory_s3_prefix": s3_prefix}, timeout=120)
-                resp.raise_for_status()
-                data = resp.json()
-                if "trajectory_s3_prefix" in data and data["trajectory_s3_prefix"]:
+        if choose_transfer(
+            get_method, legacy=("task_id", "trajectory_s3_prefix"), store=store
+        ) == "legacy":
+            s3_prefix = store.object_url(probe_prefix)
+            try:
+                data = await invoke_transfer(
+                    endpoint,
+                    TransferCall(
+                        "legacy", {"task_id": task_id, "trajectory_s3_prefix": s3_prefix}
+                    ),
+                    verb="POST",
+                    operation="legacy trajectory get",
+                    timeout=REPLY_TIMEOUT_SECONDS,
+                )
+                if data.get("trajectory_s3_prefix"):
                     s3_ok = True
                     logger.info(f"S3 trajectory: OK ({data['trajectory_s3_prefix']})")
                 else:
-                    logger.warning("S3 trajectory: response missing 'trajectory_s3_prefix' key or empty")
-        except Exception as e:
-            logger.warning(f"S3 trajectory: failed ({e})")
+                    logger.warning(
+                        "S3 trajectory: response missing 'trajectory_s3_prefix' key or empty"
+                    )
+            except Exception as e:
+                logger.warning(f"S3 trajectory: failed ({e})")
 
-        logger.info(f"Trajectory validation: inline={inline_ok} s3={s3_ok}")
+        logger.info(
+            f"Trajectory validation: inline={inline_ok} objects={objects_ok} s3={s3_ok}"
+        )
 
         # Build validated_a2a_extensions entry
         traj_entry = {
-            "supported": inline_ok or s3_ok,
+            "supported": inline_ok or objects_ok or s3_ok,
             "methods": {
                 "get": {
-                    "supported": inline_ok or s3_ok,
+                    "supported": inline_ok or objects_ok or s3_ok,
                     "options": {
-                        "task_id": {"supported": inline_ok or s3_ok},
+                        "task_id": {
+                            "supported": inline_ok or objects_ok or s3_ok
+                        },
+                        "objects": {"supported": objects_ok},
                         "trajectory_s3_prefix": {"supported": s3_ok},
                     },
                 },
@@ -120,5 +156,9 @@ class VerifyA2ATrajectoryStep(TaskStep):
         validated_ext[A2AAgent.EXT_TRAJECTORY] = traj_entry
         agent.update_metadata({**agent.metadata, "validated_a2a_extensions": validated_ext})
 
-        context.metadata.setdefault("verifications", {})["a2a_trajectory"] = {"inline": inline_ok, "s3": s3_ok}
+        context.metadata.setdefault("verifications", {})["a2a_trajectory"] = {
+            "inline": inline_ok,
+            "objects": objects_ok,
+            "s3": s3_ok,
+        }
         return context

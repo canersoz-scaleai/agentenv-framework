@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from agent_env.plugins import _registration
+from agent_env.plugins import _registration, _report
 from agent_env.artifact.artifact import Artifact
 from agent_env.artifact.artifacts.cli import CliArtifact
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
@@ -51,14 +52,17 @@ def _build_registry(source: Config | None = None) -> dict[str, type[Artifact]]:
     _merge_config_toml_artifacts(registry, source=source, from_plugins=from_plugins)
     # After config, which may have replaced a class's own spelling and stranded its extra names.
     for name in from_plugins:
-        if reason := _extra_name_problem(name, registry[name], registry):
-            from_plugins.reject(name, reason)
+        if reason := _extra_name_problem(name, registry[name], registry, from_plugins.conflicts):
+            from_plugins.reject(name, _report.INVALID_PLUGIN, reason)
     # This document's aliases, not the ambient Config's, or the two can disagree.
     _check_type_aliases(registry, _load_type_aliases(source), from_plugins=from_plugins)
     return registry
 
 
-def _extra_name_problem(name: str, cls: type[Artifact], registry: dict[str, type[Artifact]]) -> str | None:
+def _extra_name_problem(
+    name: str, cls: type[Artifact], registry: dict[str, type[Artifact]],
+    conflicts: Mapping[str, tuple[Any, ...]] | None = None,
+) -> str | None:
     """Why a plugin's extra name (a legacy spelling) for ``cls`` would read nothing, if it would.
 
     It only reads old documents: the class writes its own spelling, which must resolve to it,
@@ -70,6 +74,9 @@ def _extra_name_problem(name: str, cls: type[Artifact], registry: dict[str, type
     builtin = ARTIFACT_REGISTRY.get(own)
     if builtin is not None and builtin is not cls:
         return f"its class inherits the built-in type {own!r}; give it its own 'type' field default"
+    if conflicts and own in conflicts:
+        claimants = list(conflicts[own])
+        return f"its class writes type {own!r}, which is left out: {_registration.conflict_message(own, _registration.ARTIFACTS, claimants)}"
     if registry.get(own) is not cls:
         elsewhere = registry.get(own)
         where = "nothing registers it" if elsewhere is None else f"it resolves to {elsewhere.__qualname__}"
@@ -86,6 +93,8 @@ def _validate_plugin(name: str, loaded: Any) -> type[Artifact]:
     cls = _registration.require_subclass(loaded, Artifact)
     if not isinstance(_get_type(cls), str):
         raise TypeError(f"{cls.__qualname__} does not define its own 'type' field default")
+    if problem := _registration.unimplemented(cls, Artifact):
+        raise TypeError(problem)
     return cls
 
 
@@ -165,6 +174,8 @@ def _check_type_aliases(
     from_plugins = from_plugins if from_plugins is not None else _registration.Registrations.empty()
     for legacy, canonical in aliases.items():
         if canonical not in registry:
+            if from_plugins.refuse(canonical, f"[artifacts] type_aliases {legacy!r}"):
+                continue
             if from_plugins.failed(canonical):
                 # Like a config-only provider table for a failed plugin: skipped, not fatal, so
                 # one broken plugin does not take every artifact read down with it.
@@ -179,6 +190,12 @@ def _check_type_aliases(
         # Aliasing a type that is still registered is normal mid-rename, as long as both
         # spellings mean the same class. Pointing it at a different class instead silently
         # redirects every document that type owns.
+        if legacy in from_plugins.conflicts:
+            claimants = "; ".join(str(p) for p in from_plugins.conflicts[legacy])
+            raise ConfigError(
+                f"[artifacts] type_aliases {legacy!r} maps to {canonical!r}, but plugins {claimants} "
+                f"register {legacy!r}; uninstall them or drop the alias"
+            )
         owner = registry.get(legacy)
         if owner is not None and owner is not registry[canonical]:
             if (plugin := from_plugins.plugin(legacy)) is not None:
@@ -222,7 +239,11 @@ def _merge_config_toml_artifacts(
                 f"[artifacts] impl {impl!r} does not define its own 'type' "
                 f"(inherits the base Artifact default); set a concrete 'type' field default"
             )
-        if not from_plugins.release(artifact_type, f"[artifacts] impl {impl!r}", cls) and artifact_type in registry:
+        if problem := _registration.unimplemented(cls, Artifact):
+            raise ConfigError(f"[artifacts] impl {impl!r}: {problem}")
+        if from_plugins.refuse(artifact_type, f"[artifacts] impl {impl!r}"):
+            continue
+        if not from_plugins.release(artifact_type, "artifacts", impl, cls) and artifact_type in registry:
             raise ConfigError(
                 f"[artifacts] impl {impl!r} type {artifact_type!r} is already registered "
                 f"(conflicts with a built-in or another custom artifact)"

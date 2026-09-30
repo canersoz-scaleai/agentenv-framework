@@ -10,6 +10,10 @@ if TYPE_CHECKING:
     from agent_env.env.env import Env
     from agent_env.config.runtime import Config
 
+# Env defines this only to raise, so a registered class must override it. Not ``deploy``: a
+# component env such as ``service_db`` is deployed by the env that contains it.
+_MUST_IMPLEMENT = ("from_dict",)
+
 
 def _get_type(cls: type["Env"]) -> str:
     return cls.type
@@ -37,7 +41,7 @@ def _build_registry(source: Config | None = None) -> dict[str, type["Env"]]:
     from agent_env.env.env import Env
 
     registry = _builtin_registry()
-    validate = _registration.typed_validator(Env, builtins=frozenset(registry))
+    validate = _registration.typed_validator(Env, builtins=frozenset(registry), required=_MUST_IMPLEMENT)
     from_plugins = _registration.merge(registry, _registration.ENVS, validate, source=source)
     _merge_config_toml_envs(registry, source=source, from_plugins=from_plugins)
     return registry
@@ -77,7 +81,11 @@ def _merge_config_toml_envs(
                 f"[envs] impl {impl!r} does not define its own 'type' "
                 f"(inherits the base default {Env.type!r}); set a unique 'type' ClassVar"
             )
-        if not from_plugins.release(cls.type, f"[envs] impl {impl!r}", cls) and cls.type in registry:
+        if problem := _registration.unimplemented(cls, Env, _MUST_IMPLEMENT):
+            raise ConfigError(f"[envs] impl {impl!r}: {problem}")
+        if from_plugins.refuse(cls.type, f"[envs] impl {impl!r}"):
+            continue
+        if not from_plugins.release(cls.type, "envs", impl, cls) and cls.type in registry:
             raise ConfigError(
                 f"[envs] impl {impl!r} type {cls.type!r} is already registered "
                 f"(conflicts with a built-in or another custom env)"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import tempfile
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -24,17 +25,30 @@ _SANDBOX_TYPES = frozenset({
 })
 
 
+def _owned_store(object_url: str):
+    """The store serving ``object_url``, which must be one of its objects: the explorer reads
+    nothing outside the configured store."""
+    store = get_config().get_object_store_at(object_url)
+    if not store.owns(object_url):
+        raise HTTPException(status_code=400, detail="object_url is not in the configured object store")
+    if not store.get_object_key(object_url):
+        raise HTTPException(status_code=400, detail="object_url names a bucket, not an object")
+    return store
+
+
+def _content_disposition(filename: str) -> str:
+    """``inline`` with the name for the browser to save under. Header values are Latin-1, so a
+    name that is not plain ASCII goes in RFC 6266's ``filename*`` beside an ASCII fallback."""
+    fallback = "".join(c if " " <= c <= "~" and c not in '"\\' else "_" for c in filename)
+    if fallback == filename:
+        return f'inline; filename="{filename}"'
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 @router.get("/content")
 def object_content(object_url: str = Query(...)):
     """Proxy an object-store blob to the browser, resolved through the configured store."""
-    store = get_config().get_object_store()
-    # Ownership check: get_object_key raises for a url outside this store (foreign
-    # bucket / path traversal), so the route only ever serves this store's objects.
-    try:
-        store.get_object_key(object_url)
-    except Exception:
-        raise HTTPException(status_code=400, detail="object_url is not in the configured object store")
-
+    store = _owned_store(object_url)
     meta = store.get_object_metadata_at(object_url)
     if meta is None:
         raise HTTPException(status_code=404, detail="no object at the given object_url")
@@ -43,13 +57,21 @@ def object_content(object_url: str = Query(...)):
     fd, tmp = tempfile.mkstemp(prefix="agentenv-content-")
     os.close(fd)
     try:
-        store.download_to_file(object_url, tmp)
-    except Exception:
+        try:
+            store.download_to_file(object_url, tmp)
+        except Exception:
+            # Object existed at the metadata check above, so a read failure here is an
+            # upstream store error (permission/timeout/outage), not a missing object.
+            raise HTTPException(status_code=502, detail="object store failed to read the object")
+        response = _streamed(tmp, object_url, meta)
+    except BaseException:
+        # The response owns the file once it exists; until then nothing else will remove it.
         os.unlink(tmp)
-        # Object existed at the metadata check above, so a read failure here is an
-        # upstream store error (permission/timeout/outage), not a missing object.
-        raise HTTPException(status_code=502, detail="object store failed to read the object")
+        raise
+    return response
 
+
+def _streamed(tmp: str, object_url: str, meta) -> StreamingResponse:
     def _stream_and_cleanup():
         try:
             with open(tmp, "rb") as fh:
@@ -64,10 +86,13 @@ def object_content(object_url: str = Query(...)):
     content_type = meta.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     headers = {
         "X-Content-Type-Options": "nosniff",  # untrusted artifact bytes must not sniff-execute
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": _content_disposition(filename),
     }
     if content_type.split(";")[0].strip().lower() in _SANDBOX_TYPES:
         headers["Content-Security-Policy"] = "sandbox"
+    # Reads return the bytes as stored, so the browser needs the encoding to decode them.
+    if meta.content_encoding:
+        headers["Content-Encoding"] = meta.content_encoding
     if meta.size is not None:
         headers["Content-Length"] = str(meta.size)
     return StreamingResponse(
@@ -80,12 +105,7 @@ def object_content(object_url: str = Query(...)):
 @router.get("/metadata")
 def object_metadata(object_url: str = Query(...)):
     """Size + content-type for an object, without transferring the bytes."""
-    store = get_config().get_object_store()
-    try:
-        store.get_object_key(object_url)
-    except Exception:
-        raise HTTPException(status_code=400, detail="object_url is not in the configured object store")
-
+    store = _owned_store(object_url)
     meta = store.get_object_metadata_at(object_url)
     if meta is None:
         raise HTTPException(status_code=404, detail="no object at the given object_url")

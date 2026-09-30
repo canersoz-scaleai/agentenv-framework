@@ -8,6 +8,7 @@ import dataclasses
 import logging
 import random
 import string
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -206,8 +207,8 @@ class TaskInstance:
 
 @dataclass
 class StepAttemptFailure:
-    """Recorded once per failed activity attempt, so a later Temporal retry can't clobber
-    the earlier, more useful failure messages."""
+    """Recorded once per failed step attempt, so a later retry can't clobber the earlier,
+    more useful failure messages."""
 
     attempt: int
     step_id: str | None = None
@@ -352,14 +353,16 @@ class TaskInstanceStore:
         the instance, so aggregating those ids over every instance matching
         the batch gives the set of universes that batch produced.
 
-        De-duplicates while preserving first-appearance order.
+        De-duplicates while preserving first-appearance order: instances by creation time (to the
+        minute), then by instance id. The order is imposed here, since a document store returns a
+        query's matches in no particular order.
         """
         docs = self._doc_store.query(
             TASK_INSTANCES_COLLECTION, Filter.of(**{"context.metadata.batch_id": batch_id})
         )
         seen: set[str] = set()
         ids: list[str] = []
-        for doc in docs:
+        for doc in sorted(docs, key=lambda d: (d.get("created_at_utc") or "", d.get("instance_id") or "")):
             uid = _get_path(doc, "context.metadata.file_artifact_universe.id")
             if uid and uid not in seen:
                 seen.add(uid)
@@ -375,6 +378,8 @@ class TaskInstanceStore:
     def seed_context(self, instance_id: str, ops: "ContextUpdateOps") -> None:
         """Apply the run's initial context, then journal it as the replay base (even when empty)."""
         store = self._doc_store
+        # One entry per deployment, as completions and the replay of this seed write them.
+        ops = dataclasses.replace(ops, add_to_sets={p: _union([], items, path=p) for p, items in ops.add_to_sets.items()})
         if not ops.is_empty():
             store.update(
                 TASK_INSTANCES_COLLECTION, Filter.of(instance_id=instance_id), ops.to_update_spec()
@@ -658,7 +663,7 @@ class TaskInstanceStore:
             rerecorded = any(c.get("step_id") == step_id for c in doc.get("completed_steps", []))
             set_fields: dict = dict(ops.sets)
             for path, items in ops.add_to_sets.items():
-                set_fields[path] = _union(_get_path(doc, path) or [], items, move_to_end=rerecorded)
+                set_fields[path] = _union(_get_path(doc, path) or [], items, move_to_end=rerecorded, path=path)
             completed = [c for c in doc.get("completed_steps", []) if c.get("step_id") != step_id] + [entry]
             set_fields["completed_steps"] = completed
             set_fields["current_step"] = len(completed)
@@ -714,6 +719,17 @@ class TaskInstanceStore:
             TASK_INSTANCES_COLLECTION,
             Filter.of(instance_id=instance_id).where("status", Ne("completed")),
             spec,
+        )
+
+    def record_task_cancelled_sync(self, instance_id: str, reason: str, completed_at_utc: str) -> None:
+        """Mark a run cancelled, over the ``failed`` its unwinding recorded, but never a completed one."""
+        self._doc_store.update(
+            TASK_INSTANCES_COLLECTION,
+            Filter.of(instance_id=instance_id).where("status", Ne("completed")),
+            UpdateSpec(
+                set={"status": "cancelled", "error": reason, "completed_at_utc": completed_at_utc},
+                inc={"rev": 1},
+            ),
         )
 
     def append_step_attempt_failure_sync(self, instance_id: str, failure: "StepAttemptFailure") -> None:
@@ -879,11 +895,31 @@ async def record_task_failure(
             if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
                 await asyncio.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
     logger.warning(
-        "Failed to record task failure after %d attempts; the reason will be "
-        "backfilled from Temporal history",
+        "Failed to record task failure after %d attempts; the task instance record "
+        "will not show it",
         _FAILURE_WRITE_MAX_ATTEMPTS, exc_info=last_exc,
     )
 
+
+
+
+def record_task_cancelled(instance_id: str, reason: str, completed_at_utc: str) -> None:
+    """Write a cancelled run's terminal state, retried like ``record_task_failure``. It logs a write that keeps
+    failing rather than raising. Synchronous: ``run_bundle`` calls it once its event loop has closed."""
+    store = get_task_instance_store()
+    last_exc: BaseException | None = None
+    for attempt in range(_FAILURE_WRITE_MAX_ATTEMPTS):
+        try:
+            store.record_task_cancelled_sync(instance_id, reason, completed_at_utc)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt + 1 < _FAILURE_WRITE_MAX_ATTEMPTS:
+                time.sleep(_FAILURE_WRITE_BACKOFF_SECONDS * (2**attempt))
+    logger.warning(
+        "Failed to record the cancellation of instance_id=%s after %d attempts",
+        instance_id, _FAILURE_WRITE_MAX_ATTEMPTS, exc_info=last_exc,
+    )
 
 # Best-effort, diagnostic-only wrapper around ``append_step_attempt_failure_sync``: retries a
 # transient write (like ``record_task_failure``), then logs and swallows — never raises.

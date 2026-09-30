@@ -14,14 +14,19 @@ AsyncMock sandbox for the loader — so nothing touches S3 or a real sandbox.
 """
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent_env.task_step.context import PromptResponse, TaskStepContext
+from agent_env.task_step.task_steps.verifiers import rubrics_verifier
 from agent_env.task_step.task_steps.verifiers.rubrics_verifier import RubricsVerifierTaskStep
+from agent_env.config import set_object_store
 from agent_env.task_step.task_steps.verifiers.judge_utils.trajectory_filter import CompactionType, TrajectoryFilter
+from tst.unit.event_loop_probe import on_event_loop
 
 
 def _verifier(**kw) -> RubricsVerifierTaskStep:
@@ -211,3 +216,142 @@ async def test_load_per_turn_trajectories_default_filter_compacts_and_namespaces
     assert any("turn_01_tool_call_result" in d for d in tool_dests)
     assert any("turn_02_tool_call_result" in d for d in tool_dests)
     assert len(set(tool_dests)) == len(tool_dests)          # no cross-turn collisions
+
+
+# --- trajectory reads and writes run off the event loop -----------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turns", [1, 2], ids=["single-turn", "multi-turn"])
+async def test_the_direct_judge_reads_trajectories_off_the_event_loop(monkeypatch, turns):
+    reads: list[bool] = []
+    v = _verifier()
+
+    def read(uri):
+        reads.append(on_event_loop())
+        return "EVENTS"
+
+    monkeypatch.setattr(v, "_read_trajectory_text", read)
+    _capture_judge(monkeypatch, v)
+    uris = [f"s3://t/{i}.json" for i in range(1, turns + 1)]
+    ctx = TaskStepContext(prompt_responses=[_pr(target_agent_per_turn_trajectory_s3_uris=uris, agent_trajectory_s3_uri=uris[-1])])
+
+    await v.execute(ctx)
+
+    assert len(reads) == turns and not any(reads)
+
+
+class _LoopCheckingStore:
+    """Serves one trajectory and records, per call, whether it ran on the event loop's thread."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body, self.on_loop = body, []
+
+    def get(self, object_url):
+        self.on_loop.append(on_event_loop())
+        return self.body
+
+    def put(self, key, data, content_type=None, allow_overwrite=False):
+        self.on_loop.append(on_event_loop())
+        return f"s3://t/{key}"
+
+    def object_url(self, key):
+        return f"s3://t/{key}"
+
+
+def _recording(monkeypatch, name, calls):
+    """Patch ``rubrics_verifier.<name>`` to record whether each call ran on the loop's thread."""
+    original = getattr(rubrics_verifier, name)
+
+    def record(*args, **kwargs):
+        calls.append(on_event_loop())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rubrics_verifier, name, record)
+
+
+@pytest.mark.asyncio
+async def test_default_compaction_reads_compacts_and_rewrites_off_the_event_loop(monkeypatch):
+    store = _LoopCheckingStore(json.dumps([_tool_span("t", {"result": "x" * 2000})]).encode())
+    set_object_store(store)
+    compactions: list[bool] = []
+    _recording(monkeypatch, "compact_otel_trajectory", compactions)
+    v = _verifier(trajectory_filter=TrajectoryFilter())
+    _capture_judge(monkeypatch, v)
+
+    await v.execute(TaskStepContext(prompt_responses=[_pr(agent_trajectory_s3_uri="s3://t/raw.json")]))
+
+    assert len(store.on_loop) >= 2 and not any(store.on_loop)
+    assert compactions == [False]
+
+
+@pytest.mark.asyncio
+async def test_screenshot_compaction_reads_and_parses_off_the_event_loop(monkeypatch):
+    shot = {"result": "ok", "screenshot": "/9j/" + "A" * 200}
+    span = {**_tool_span("gui_screenshot", None), "attributes": {
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.prompt": json.dumps({"tool": "gui_screenshot", "input": {}}),
+        "gen_ai.completion": json.dumps(shot),
+    }}
+    store = _LoopCheckingStore(json.dumps([span]).encode())
+    set_object_store(store)
+    parses: list[bool] = []
+    _recording(monkeypatch, "final_image_frames", parses)
+    v = _verifier(trajectory_filter=TrajectoryFilter(compaction_type=CompactionType.SCREENSHOT, screenshot_last_n=1))
+    _capture_judge(monkeypatch, v)
+
+    await v.execute(TaskStepContext(prompt_responses=[_pr(agent_trajectory_s3_uri="s3://t/raw.json")]))
+
+    assert store.on_loop == [False] and parses == [False]
+
+
+@pytest.mark.asyncio
+async def test_per_turn_compaction_for_the_agent_judge_reads_and_compacts_off_the_event_loop(monkeypatch):
+    reads: list[bool] = []
+    compactions: list[bool] = []
+    spans = json.dumps([_tool_span("t", {"result": "x" * 2000})])
+    v = _verifier()
+
+    def read(uri):
+        reads.append(on_event_loop())
+        return spans
+
+    monkeypatch.setattr(v, "_read_trajectory_text", read)
+    _recording(monkeypatch, "compact_otel_trajectory", compactions)
+    sandbox = MagicMock()
+    sandbox.write_file_from_text = AsyncMock()
+
+    await v._load_per_turn_trajectories(sandbox, ["u1", "u2"], "/tmp/d", TrajectoryFilter())
+
+    assert reads == [False, False] and compactions == [False, False]
+
+
+class _Files(list):
+    """A list a test can hold a weak reference to."""
+
+
+@pytest.mark.asyncio
+async def test_the_direct_judge_does_not_hold_the_externalized_tool_results_through_its_call(monkeypatch):
+    set_object_store(_LoopCheckingStore(json.dumps([_tool_span("t", {"result": "x" * 2000})]).encode()))
+    held: list[weakref.ref] = []
+    compact = rubrics_verifier.compact_otel_trajectory
+
+    def compact_recording(*args, **kwargs):
+        filtered, files = compact(*args, **kwargs)
+        files = _Files(files)
+        held.append(weakref.ref(files))
+        return filtered, files
+
+    monkeypatch.setattr(rubrics_verifier, "compact_otel_trajectory", compact_recording)
+    v = _verifier(trajectory_filter=TrajectoryFilter())
+    alive: list[bool] = []
+
+    async def judge(*, eval_prompt, **kwargs):
+        gc.collect()
+        alive.append(held[0]() is not None)
+        return ([{**v.criteria[0], "score": 1.0, "result": True}], 0, [], None)
+
+    monkeypatch.setattr(v, "_run_judge_with_output_retries", judge)
+
+    await v.execute(TaskStepContext(prompt_responses=[_pr(agent_trajectory_s3_uri="s3://t/raw.json")]))
+
+    assert held and alive == [False]

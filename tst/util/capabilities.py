@@ -80,7 +80,7 @@ def remote_sandbox_is_available(provider: str) -> bool:
         raise ValueError(f"unknown remote sandbox provider {provider!r}")
     if provider == "e2b":
         from agent_env.config.errors import ConfigError
-        from agent_env.providers.sandbox_provider import build_sandbox_provider
+        from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider
 
         try:
             build_sandbox_provider("e2b")

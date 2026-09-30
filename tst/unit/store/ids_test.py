@@ -9,6 +9,8 @@ import re
 import pytest
 
 from agent_env.store.ids import (
+    LOCAL_PREFIX,
+    MAX_AUTHORED_LOCAL_ID_BYTES,
     derive_id,
     fs_safe,
     image_repository,
@@ -34,6 +36,10 @@ GOLDEN = [
     ("@local/~/Straße/Ångström", "local/strasse-angstrom-2c208f63f689"),
     ("@local/~/ＡＢＣ/ﬁle", "local/abc-file-8652699b786c"),
     ("@local/~/परियोजना/env", "local/env-894f55d4f6c0"),
+    ("@local/~/Dropbox (Personal)/tickets", "local/dropbox-personal-tickets-ba7c1450dae3"),
+    ("@local/~/Library/CloudStorage/GoogleDrive-a.b@example.com/My Drive/triage/tickets",
+     "local/library-cloudstorage-googledrive-a-b-example-com-656d87047b33"),
+    ("@local/~/C++/R&D/a,b", "local/c-r-d-a-b-8daef6df1655"),
 ]
 
 LEGACY = [
@@ -104,6 +110,10 @@ def test_a_malformed_local_id_is_not_encoded_as_one():
     "@local/~/cafe\u0301/nai\u0308ve",
     "@local/" + "x" * 4089,
     "@local/" + "é" * 2044,
+    "@local/~/Library/CloudStorage/GoogleDrive-a.b@example.com/My Drive/triage",
+    "@local/~/Dropbox (Personal)/triage copy (2)",
+    "@local/~/C++/R&D/a,b+c",
+    "@local/~/node_modules/@types/x",
 ])
 def test_well_formed_local_ids_validate(entity_id):
     validate_local_id(entity_id)
@@ -124,14 +134,15 @@ def test_well_formed_local_ids_validate(entity_id):
     ("@local/a\x7f", "contains '\\x7f'"),
     ("@local/a\ud800", "contains '\\ud800'"),
     ("@local/a#b", "contains '#'"),
-    ("@local/$(rm)", "contains '$()'"),
+    ("@local/$(rm)", "contains '$'"),
     ("@local/a`b`", "contains '`'"),
     ("@local/a\\b", "contains '\\\\'"),
     ("@local/a\"b", "contains '\"'"),
     ("@local/it's", "contains \"'\""),
-    ("@local/a;b|c&d", "contains '&;|'"),
+    ("@local/a;b|c&d", "contains ';|'"),
+    ("@local/a:b", "contains ':'"),
     ("@local/a?b%c", "contains '%?'"),
-    ("@local/a*b", "only letters, digits, spaces and . _ - ~ /"),
+    ("@local/a*b", "only letters, digits, spaces and . _ - ~ / @ ( ) + , &"),
     ("@local/a\u3164b", "contains '\\u3164'"),
     ("@local/a\ufe0fb", "contains '\\ufe0f'"),
     ("@local/a\u034fb", "contains '\\u034f'"),
@@ -154,3 +165,10 @@ def test_a_derived_id_keeps_its_base_namespace():
     assert derive_id("@local/~/work/triage/tickets", "image") == "@local/~/work/triage/tickets__image"
     assert is_local_id(derive_id("@local/~/a", "files"))
     assert derive_id("tickets", "files") == "tickets__files"
+
+
+def test_authored_cap_leaves_room_for_the_longest_derived_id():
+    at_cap = LOCAL_PREFIX + "a" * (MAX_AUTHORED_LOCAL_ID_BYTES - len(LOCAL_PREFIX))
+    validate_local_id(derive_id(derive_id(at_cap, "files"), "0" * 16))
+    with pytest.raises(ValueError, match="bytes"):
+        validate_local_id(derive_id(derive_id(at_cap + "a", "files"), "0" * 16))

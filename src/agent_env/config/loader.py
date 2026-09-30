@@ -10,16 +10,24 @@ README for the schema and examples.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
+import re
 import tomllib
+from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from packaging.requirements import Requirement
 
 from agent_env.config.errors import ConfigError
 
 logger = logging.getLogger(__name__)
 
+DISTRIBUTION = "agentenv-framework"
+_CANNOT_IMPORT_NAME = re.compile(r"cannot import name '([\w.]+)' from '([\w.]+)'")
+_NAME_SEPARATORS = re.compile(r"[-_.]+")
 _CONFIG_DIR = ".agentenv"
 _CONFIG_FILE = "config.toml"
 ENV_CONFIG_PATH = "AGENT_ENV_CONFIG"
@@ -28,6 +36,9 @@ SecretResolver = Callable[[str], Optional[str]]
 
 ENV_REF_PREFIX = "env:"
 SECRET_REF_PREFIX = "secret:"
+
+# The keys a seam table may hold: the class, and the kwargs it is built with.
+SEAM_KEYS = ("impl", "config")
 
 
 def discover_config_path(start: Optional[Path] = None) -> Optional[Path]:
@@ -147,11 +158,51 @@ def load_impl(impl: str | type, abc: type) -> type:
         raise ConfigError(f"impl must be 'module.path:ClassName', got {impl!r}")
     try:
         cls = getattr(importlib.import_module(module_path), attr)
-    except (ImportError, AttributeError) as e:
+    except ImportError as e:
+        raise ConfigError(f"Cannot import impl {impl!r}: {e}{_install_hint(_missing_module(e))}") from e
+    except AttributeError as e:
         raise ConfigError(f"Cannot import impl {impl!r}: {e}") from e
     if not (isinstance(cls, type) and issubclass(cls, abc)):
         raise ConfigError(f"impl {impl!r} is not a subclass of {abc.__name__}")
     return cls
+
+
+def _missing_module(error: ImportError) -> str | None:
+    """The module an import failed to find. ``from pkg import mod`` on an absent ``mod`` names
+    ``pkg``, and ``mod`` only as ``name_from`` (3.12+) or in the message (3.11)."""
+    name_from = getattr(error, "name_from", None)
+    if name_from is None and (match := _CANNOT_IMPORT_NAME.match(str(error))):
+        return f"{match[2]}.{match[1]}"
+    return f"{error.name}.{name_from}" if error.name and name_from else error.name
+
+
+def _install_hint(module: str | None) -> str:
+    """Name the smallest extra of this distribution with a requirement named for the missing
+    ``module``: by name, because the missing distribution's files are not installed to read.
+    Separators are dropped before comparing, as ``google-cloud-secret-manager`` installs
+    ``google.cloud.secretmanager``."""
+    if not module:
+        return ""
+    try:
+        package = metadata(DISTRIBUTION)
+    except PackageNotFoundError:
+        return ""
+    wanted = _NAME_SEPARATORS.sub("", module).lower()
+    sizes: dict[str, int] = {}
+    matches: set[str] = set()
+    for line in package.get_all("Requires-Dist") or []:
+        requirement = Requirement(line)
+        if requirement.marker is None:
+            continue
+        for extra in package.get_all("Provides-Extra") or []:
+            if requirement.marker.evaluate({"extra": extra}):
+                sizes[extra] = sizes.get(extra, 0) + 1
+                if _NAME_SEPARATORS.sub("", requirement.name).lower() == wanted:
+                    matches.add(extra)
+    if not matches:
+        return ""
+    extra = min(matches, key=lambda e: (sizes[e], e))
+    return f"; it needs the {extra!r} extra, as in pip install '{DISTRIBUTION}[{extra}]'"
 
 
 def build_store(section: dict, abc: type, *, secret_resolver: Optional[SecretResolver] = None):
@@ -161,8 +212,34 @@ def build_store(section: dict, abc: type, *, secret_resolver: Optional[SecretRes
     if not impl:
         raise ConfigError(f"Store section is missing an 'impl' dotted path: {section!r}")
     for key in section:
-        if key not in ("impl", "config"):
+        if key not in SEAM_KEYS:
             logger.warning("Ignoring unknown key %r in store section (expected 'impl'/'config')", key)
     cls = load_impl(impl, abc)
     config = interpolate(section.get("config", {}), secret_resolver=secret_resolver)
+    _check_config_keys(cls, abc, config, impl)
     return cls.from_config(**config)
+
+
+def _check_config_keys(cls: type, abc: type, config: dict, impl: str | type) -> None:
+    """Refuse a config table the store can't take as a ConfigError naming the keys, where Python
+    would raise a TypeError that reads as a bug in the store. A class on its interface's default
+    ``from_config`` hands the table to its constructor, so that is what the table is checked
+    against; any other ``from_config`` is checked against its own parameters."""
+    target = cls if getattr(cls.from_config, "__func__", None) is getattr(abc.from_config, "__func__", ...) else cls.from_config
+    try:
+        parameters = inspect.signature(target).parameters.values()
+    except (TypeError, ValueError):
+        return
+    named = [p for p in parameters if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+    takes_any = any(p.kind is p.VAR_KEYWORD for p in parameters)
+    unknown = [] if takes_any else sorted(set(config) - {p.name for p in named})
+    missing = [p.name for p in named if p.default is p.empty and p.name not in config]
+    if not unknown and not missing:
+        return
+    name = impl if isinstance(impl, str) else impl.__qualname__
+    problems = [f"unknown key {', '.join(map(repr, unknown))}"] if unknown else []
+    problems += [f"no value for {', '.join(map(repr, missing))}"] if missing else []
+    raise ConfigError(
+        f"The config table for {name!r} has {' and '.join(problems)}; "
+        f"it takes {', '.join(p.name for p in named) or 'no keys'}"
+    )

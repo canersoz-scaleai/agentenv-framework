@@ -2,8 +2,9 @@ import asyncio
 
 import click
 
-from agent_env.env import Env
+from agent_env.env import DeployedGatewayEnv, Env
 from agent_env.env.gateway import GatewayMode
+from agent_env.store.routing import run_scope
 
 MIN_TTL_SECONDS = 60  # 1 minute
 MAX_TTL_SECONDS = 1209600  # 2 weeks
@@ -22,7 +23,7 @@ DEFAULT_TTL_SECONDS = 10800  # 3 hours
                    "or a name from [sandbox.providers] in .agentenv/config.toml; comma-separated for a "
                    "fallback chain. Defaults to [sandbox].default (else local) when omitted.")
 @click.option("--service-db", "service_db_env_id", default=None,
-              help="Override default_service_db_env_id (use 'default-db-modal' for ECR-backed pgweb/db-mcp images on Modal)")
+              help="Override default_service_db_env_id (on Modal its images must be in the configured image store)")
 @click.option("--gateway", "gateway_env_id", default=None,
               help="Override default_gateway_env_id")
 @click.option("--priority", type=int, default=0, show_default=True,
@@ -86,7 +87,8 @@ def deploy(env_id: str, env_version: int | None, ttl_seconds: int, gateway_mode:
         deploy_kwargs["env_state_instance_id"] = env_state_instance_id
         click.echo(f"Env state instance id: {env_state_instance_id}")
     try:
-        deployed_env = asyncio.run(env.deploy(**deploy_kwargs))
+        with run_scope(env.id):
+            deployed_env = asyncio.run(env.deploy(**deploy_kwargs))
     except NotImplementedError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
@@ -95,15 +97,16 @@ def deploy(env_id: str, env_version: int | None, ttl_seconds: int, gateway_mode:
     if deployed_env.instance_id:
         click.echo("Instance ID: " + click.style(deployed_env.instance_id, fg="green"))
     click.echo("Env MCP Url: " + click.style(deployed_env.mcp_url, fg="blue"))
-    click.echo("Env Gateway Url: " + click.style(deployed_env.gateway_url, fg="yellow"))
-    if deployed_env.db_web_url:
-        click.echo("Env DB Web Url: " + click.style(deployed_env.db_web_url, fg="yellow"))
-    if deployed_env.db_mcp_url:
-        click.echo("Env DB MCP Url: " + click.style(deployed_env.db_mcp_url, fg="yellow"))
-    if deployed_env.vnc_url:
-        click.echo("VNC Url: " + click.style(deployed_env.vnc_url, fg="yellow"))
-    if deployed_env.website_frontend_urls:
-        for svc_name, url in deployed_env.website_frontend_urls.items():
+    # A record without a gateway has none of the gateway's URLs.
+    if isinstance(deployed_env, DeployedGatewayEnv):
+        click.echo("Env Gateway Url: " + click.style(deployed_env.gateway_url, fg="yellow"))
+        if deployed_env.db_web_url:
+            click.echo("Env DB Web Url: " + click.style(deployed_env.db_web_url, fg="yellow"))
+        if deployed_env.db_mcp_url:
+            click.echo("Env DB MCP Url: " + click.style(deployed_env.db_mcp_url, fg="yellow"))
+        if deployed_env.vnc_url:
+            click.echo("VNC Url: " + click.style(deployed_env.vnc_url, fg="yellow"))
+        for svc_name, url in (deployed_env.website_frontend_urls or {}).items():
             click.echo(f"Website Frontend ({svc_name}): " + click.style(url, fg="yellow"))
     if deployed_env.expires_at_utc:
         click.echo(f"Expires At (UTC): {deployed_env.expires_at_utc}")

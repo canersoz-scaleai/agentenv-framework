@@ -13,15 +13,20 @@ says secrets live behind references, but a report is the wrong place to find out
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Optional, Union
 
+from packaging.utils import canonicalize_name
+
 from agent_env.config import loader as config_loader
+from agent_env.config import plugin_tables
 from agent_env.config.errors import ConfigError
+from agent_env.config.model import ModelConfig
 from agent_env.config.provenance import (
     KIND_DEFAULT,
     KIND_ENV,
@@ -104,6 +109,77 @@ class SectionReport:
 
 
 @dataclass(frozen=True)
+class PluginOwner:
+    """The distribution a ``[plugins.<name>]`` table belongs to, as installed, if it is."""
+
+    name: str
+    installed: Optional[plugin_tables.Installed] = None
+
+    @property
+    def version(self) -> Optional[str]:
+        return self.installed.version if self.installed else None
+
+    @property
+    def plugin(self) -> bool:
+        return bool(self.installed and self.installed.plugin)
+
+    @property
+    def core(self) -> bool:
+        return bool(self.installed and self.installed.core)
+
+    @property
+    def label(self) -> str:
+        if self.installed is None:
+            return f"{self.name} (not installed)"
+        version = f"{self.name} {self.version}".strip()
+        if self.core:
+            return f"{version} (agent-env itself)"
+        return version if self.plugin else f"{version} (declares no agent_env entry point)"
+
+    @property
+    def note(self) -> str:
+        """What core can say about a key in this table: whose it is, never whether it is read."""
+        if self.plugin:
+            return f"in the table of the plugin {self.label}; agent-env does not read or check it"
+        if self.core:
+            return (f"in the table of {self.name} {self.version}, which is agent-env itself, not a plugin; "
+                    "agent-env does not read it")
+        if self.installed:
+            return (f"in the table of {self.name} {self.version}, which is installed but declares no "
+                    "agent_env entry point; agent-env does not read it")
+        return f"in the table of {self.name}, which is not installed; agent-env does not read it"
+
+
+@dataclass(frozen=True)
+class PluginTableReport:
+    """One plugin's own settings table, as written; agent-env does not read it.
+
+    Masked on construction, one table at a time: masking ``[plugins]`` whole would scope on the
+    distribution names, and ``agentenv-oauth-bridge`` would hide its every setting.
+    """
+
+    owner: PluginOwner
+    keys: tuple[str, ...]
+    value: Any = None
+    error: Optional[str] = None
+
+    @property
+    def where(self) -> str:
+        return ", ".join(plugin_tables.where(key) for key in self.keys)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _mask_table(self.value))
+
+
+@dataclass(frozen=True)
+class PluginsReport:
+    """Every ``[plugins.<name>]`` table, or why ``[plugins]`` itself could not be read."""
+
+    tables: tuple[PluginTableReport, ...] = ()
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ConfigReport:
     """The whole resolution chain: the file that won, and each section under it."""
 
@@ -113,6 +189,7 @@ class ConfigReport:
     sections: list[SectionReport] = field(default_factory=list)
     error: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
+    plugins: PluginsReport = field(default_factory=PluginsReport)
 
 
 def _is_secret_key(key: str) -> bool:
@@ -132,7 +209,9 @@ def mask_value(key: str, value: Any, *, secret_scope: bool = False) -> Any:
     if isinstance(value, str) and value.startswith(
         (config_loader.ENV_REF_PREFIX, config_loader.SECRET_REF_PREFIX)
     ):
-        return value
+        # The reference names a secret, but a `?default` after it is a literal like any other.
+        ref, sep, default = value.partition("?")
+        return f"{ref}?{mask_value(key, default, secret_scope=secret_scope)}" if sep else value
     # Before the string check: a secret is no less a secret for being written as a number.
     if secret_scope or _is_secret_key(key):
         return MASK
@@ -158,6 +237,24 @@ def _mask_table(table: Any, *, key: str = "", secret_scope: bool = False) -> Any
     return mask_value(key, table, secret_scope=secret_scope)
 
 
+@dataclass(frozen=True)
+class Named:
+    """A table whose keys the file chooses, such as ``[sandbox.providers]``: each holds ``shape``."""
+
+    shape: "Shape"
+
+
+# The keys a table may hold, each with its own shape. None is a value, or a table of free-form
+# keys, that the unread-key check does not descend into: a seam's `config`, `[model.params]`.
+Shape = Union[Mapping[str, Any], Named, None]
+
+_SEAM: Mapping[str, Shape] = dict.fromkeys(config_loader.SEAM_KEYS)
+
+
+def _resolved_keys(table: str) -> dict[str, Shape]:
+    return dict.fromkeys(key.toml_path[1] for key in RESOLVED_KEYS if key.toml_path[0] == table)
+
+
 # Sections read straight out of the file. Their fallbacks live in the reader, not here, so
 # the report names where to look rather than guessing a value it would have to keep in sync.
 @dataclass(frozen=True)
@@ -165,29 +262,48 @@ class FileSection:
     """A section with no env var and no alias — a table the reader takes as written.
 
     A type rather than a tuple so everything about a section lives on it: without one,
-    its check, its lookup key and its prefix each needed a parallel table to live in.
+    its check, its lookup key, its prefix and its keys each needed a parallel table to live in.
     """
 
     name: str
     toml_path: tuple[str, ...]
     owner: str
+    keys: Mapping[str, Shape]
     check: Optional[Callable[[Mapping[str, Any]], Any]] = None
 
 
 _FILE_SECTIONS: tuple[FileSection, ...] = (
-    FileSection("model", ("model",), "config.runtime"),
-    FileSection("conversations", ("conversations",), "config.runtime"),
-    FileSection("agents", ("agents",), "config.runtime", validated_agents_section),
-    FileSection("sandbox", ("sandbox",), "providers.sandbox_provider"),
-    FileSection("state", ("state",), "providers.state.env_state_provider"),
-    FileSection("envs", ("envs",), "env.registry"),
-    FileSection("artifacts", ("artifacts",), "artifact.registry"),
-    FileSection("task_steps", ("task_steps",), "task_step.registry"),
-    FileSection("explorer", ("explorer",), "explorer.app"),
+    FileSection("model", ("model",), "config.runtime", dict.fromkeys(f.name for f in fields(ModelConfig))),
+    FileSection("conversations", ("conversations",), "config.runtime", _resolved_keys("conversations")),
+    FileSection("agents", ("agents",), "config.runtime", _resolved_keys("agents"), validated_agents_section),
+    FileSection("sandbox", ("sandbox",), "providers.sandbox_providers.sandbox_provider",
+                {"default": None, "agent_default": None, "attribution": None, "providers": Named(_SEAM)}),
+    FileSection("state", ("state",), "providers.env_state.env_state_provider", {"providers": Named(_SEAM)}),
+    FileSection("envs", ("envs",), "env.registry", {"impls": None}),
+    FileSection("artifacts", ("artifacts",), "artifact.registry", {"impls": None, "type_aliases": None}),
+    FileSection("task_steps", ("task_steps",), "task_step.registry", {"impls": None}),
+    FileSection("explorer", ("explorer",), "explorer.app",
+                {**dict.fromkeys(("port", "cors_origins", "allowed_hosts", "static_dir")),
+                 "plugins": {"impls": None}}),
 )
 
 _TOP_LEVEL_SECTIONS = ({s.toml_path[0] for s in _FILE_SECTIONS}
                        | {section.toml_path[0] for section in ALIASED_SECTIONS})
+
+
+# The core tables with a key of their own named `plugins`: [explorer.plugins] lists explorer plugins.
+_OWN_PLUGINS_KEY = frozenset({"explorer"})
+
+
+def _misplaced(table: str, key: str) -> bool:
+    if key == plugin_tables.TABLE:
+        return table not in _OWN_PLUGINS_KEY
+    return key in _TOP_LEVEL_SECTIONS
+
+
+def _table(*path: str) -> str:
+    """A table's header as the file writes it, each part quoted where TOML needs it."""
+    return "[" + ".".join(plugin_tables.toml_key(part) for part in path) + "]"
 
 
 def _misplaced_sections(document: Mapping[str, Any]) -> list[str]:
@@ -200,18 +316,25 @@ def _misplaced_sections(document: Mapping[str, Any]) -> list[str]:
     """
     found = []
     for table, body in document.items():
-        if not isinstance(body, dict):
+        # Every key in [plugins] is a package name, even one spelled like a core section.
+        if not isinstance(body, dict) or table == plugin_tables.TABLE:
             continue
         for key in body:
-            if key in _TOP_LEVEL_SECTIONS:
+            if _misplaced(table, key):
                 found.append(
-                    f"[{table}] has a key named {key!r}, which is also a top-level section — "
+                    f"{_table(table)} has a key named {key!r}, which is also a top-level section — "
                     f"a bare key binds to the table above it. Did you mean [{key}]?"
                 )
     return found
 
 
-def _keys_shadowed_by_config(document: Mapping[str, Any], path: tuple = ()) -> list[str]:
+def _inner(shape: Any, key: str) -> Any:
+    if isinstance(shape, Named):
+        return shape.shape
+    return shape.get(key) if isinstance(shape, Mapping) else None
+
+
+def _keys_shadowed_by_config(document: Mapping[str, Any], path: tuple = (), shape: Any = None) -> list[str]:
     """Keys set both beside a `config` table and inside it.
 
     Every reader takes `config`, so the one beside it is dead — and silently, because the
@@ -222,16 +345,19 @@ def _keys_shadowed_by_config(document: Mapping[str, Any], path: tuple = ()) -> l
         if not isinstance(body, dict):
             continue
         here = path + (key,)
+        inner = _inner(shape, key)
+        if inner is None:
+            continue  # free-form, or a table nothing reads: a `config` in it is just a key
         config = body.get("config")
-        if isinstance(config, dict):
+        if isinstance(config, dict) and isinstance(inner, Mapping) and "config" in inner:
             # not `impl`: the one beside the table names the class, the one inside is a
             # from_config kwarg. Both are read, which is why `lines` excludes it too.
             for duplicate in sorted(set(body) & set(config) - {"impl"}):
                 found.append(
-                    f"[{'.'.join(here)}] sets {duplicate!r} both beside its config table and "
-                    f"inside it; only [{'.'.join(here + ('config',))}] {duplicate} is read."
+                    f"{_table(*here)} sets {duplicate!r} both beside its config table and "
+                    f"inside it; only {_table(*here, 'config')} {duplicate} is read."
                 )
-        found += _keys_shadowed_by_config(body, here)
+        found += _keys_shadowed_by_config(body, here, inner)
     return found
 
 
@@ -363,22 +489,162 @@ def describe_config(config: Optional[Config] = None) -> ConfigReport:
     config_path, config_source, file_error = _classify_file(config)
     if config_source == SOURCE_ERROR:
         return ConfigReport(config_path=None, config_source=SOURCE_ERROR,
-                            search_root=search_root, error=file_error)
+                            search_root=search_root, error=file_error,
+                            plugins=PluginsReport(error=file_error))
 
     document = {} if file_error else config.config_file()
-    warnings = _misplaced_sections(document) + _keys_shadowed_by_config(document)
+    # A plugin's table is the plugin's to read, so no claim is made about a `config` key in it.
+    core = {k: v for k, v in document.items() if k != plugin_tables.TABLE}
+    warnings = (_misplaced_sections(document) + _keys_shadowed_by_config(core, (), _KNOWN)
+                + _misspelled_plugins_table(document) + _unread(document, _KNOWN))
 
     sections = [_describe(config, section) for section in _SECTIONS]
     warnings += _live_store_disagreements(config, sections)
     return ConfigReport(config_path=config_path, config_source=config_source, warnings=warnings,
-                        search_root=search_root, sections=sections, error=file_error)
+                        search_root=search_root, sections=sections, error=file_error,
+                        plugins=_describe_plugins(config))
 
 
-def _rds_admin_env_vars() -> tuple[str, ...]:
-    """Imported lazily: the state provider pulls in psycopg2 and the store layer, and the
-    config package must stay importable without them."""
-    from agent_env.providers.state.env_state_provider import RDS_ADMIN_ENV_VARS
-    return RDS_ADMIN_ENV_VARS
+def _near_plugins(key: str) -> bool:
+    return key != plugin_tables.TABLE and bool(
+        difflib.get_close_matches(key.lower(), [plugin_tables.TABLE], cutoff=0.85))
+
+
+def _misspelled_plugins_table(document: Mapping[str, Any]) -> list[str]:
+    """A top-level table one letter from ``[plugins]``: nothing reads it, and the plugin whose
+    settings it holds silently gets none."""
+    return [
+        f"agent-env does not read {_table(key)}: a plugin's settings go under "
+        f"[{plugin_tables.TABLE}.<package>]. Did you mean [{plugin_tables.TABLE}]?"
+        for key in document
+        if _near_plugins(key)
+    ]
+
+
+# How close a key must be to a known one to be offered as the one meant: `implz` is 0.8 from
+# `impls`, and `export`, 0.71 from `explorer`, gets no advice rather than wrong advice.
+_NEAR = 0.75
+
+
+def _fits(body: Any, shape: Shape) -> bool:
+    """Whether what the file wrote could be what a known key takes: a table where one is taken,
+    sharing a key with it, or for a seam the string that names its class or backend."""
+    if isinstance(shape, Named):
+        return isinstance(body, dict)
+    if shape is _SEAM and isinstance(body, str):
+        return True
+    if isinstance(shape, Mapping):
+        return isinstance(body, dict) and (not body or bool(set(body) & set(shape)))
+    return True
+
+
+def _near(key: str, known: Mapping[str, Any], body: Any = None) -> Optional[str]:
+    folded = {k.lower().replace("-", "_"): k for k in known if _fits(body, known[k])}
+    match = difflib.get_close_matches(key.lower().replace("-", "_"), list(folded), n=1, cutoff=_NEAR)
+    return folded[match[0]] if match else None
+
+
+def _reported_elsewhere(table: Mapping[str, Any], path: tuple[str, ...], key: str,
+                        shape: Mapping[str, Shape]) -> bool:
+    """Whether another warning already names this key, so it is reported once."""
+    if not path:
+        return _near_plugins(key)
+    if len(path) == 1 and _misplaced(path[0], key):
+        return True
+    # the shadowed-by-config warning covers only a table that takes `config`
+    config = table.get("config")
+    return "config" in shape and isinstance(config, dict) and key in config and key != "impl"
+
+
+def _listed(names: list[str]) -> str:
+    quoted = [repr(n) for n in names]
+    if not quoted:
+        return "no keys"
+    return quoted[0] if len(quoted) == 1 else f"{', '.join(quoted[:-1])} and {quoted[-1]}"
+
+
+def _tables_taking(key: str) -> list[str]:
+    """The tables that take a key named ``key``: where a key written above every header belongs."""
+    return [f"[{name}]" for name, shape in _KNOWN.items() if isinstance(shape, Mapping) and key in shape]
+
+
+def _unread_message(path: tuple[str, ...], key: str, shape: Mapping[str, Shape], body: Any = None) -> str:
+    if path and (key in _TOP_LEVEL_SECTIONS or key == plugin_tables.TABLE):
+        return (f"{_table(*path)} has a key named {key!r}, which is also a top-level section — "
+                f"a bare key binds to the table above it. Did you mean [{key}]?")
+    near = _near(key, shape, body)
+    if not path and not isinstance(body, dict):
+        # A bare key above the first header: a key, not a table.
+        if near and near != plugin_tables.TABLE:
+            return f"agent-env does not read the top-level key {key!r}. Did you mean {near!r}?"
+        tables = _tables_taking(key)
+        takes = "takes" if len(tables) == 1 else "take"
+        where = f"; {' and '.join(tables)} {takes} a key of that name" if tables else ""
+        return f"The top-level key {key!r} is outside every table, and agent-env does not read it{where}."
+    if not path:
+        if near:
+            return f"agent-env does not read {_table(key)}: it has no such table. Did you mean [{near}]?"
+        return (f"agent-env does not read {_table(key)}: it has no such table, and a plugin's own settings "
+                f"go under [{plugin_tables.TABLE}.<package>].")
+    table = _table(*path)
+    said = f"{table} has a key named {key!r}, which agent-env does not read"
+    if near:
+        return f"{said}. Did you mean {near!r}?"
+    if shape is _SEAM:
+        return (f"{said}: {table} takes {_listed(list(shape))}, and the class's own settings go "
+                f"under {_table(*path, 'config')}.")
+    return f"{said}: {table} takes {_listed(list(shape))}."
+
+
+def _unread(document: Mapping[str, Any], shape: Mapping[str, Shape], path: tuple[str, ...] = ()) -> list[str]:
+    """Tables and keys no reader takes, checked against the keys each section declares.
+
+    Checks the file rather than what won, since a typo in a table an env var replaces is still
+    a typo. A free-form table is not descended into, and a key another warning names is skipped.
+    """
+    found = []
+    for key, body in document.items():
+        if key not in shape:
+            if not _reported_elsewhere(document, path, key, shape):
+                found.append(_unread_message(path, key, shape, body))
+            continue
+        inner = shape[key]
+        if isinstance(body, dict) and isinstance(inner, Named):
+            for name, entry in body.items():
+                if isinstance(entry, dict):
+                    found += _unread(entry, inner.shape, path + (key, name))
+        elif isinstance(body, dict) and isinstance(inner, Mapping):
+            found += _unread(body, inner, path + (key,))
+    return found
+
+
+def _plugins_table(config: Config) -> tuple[Mapping[str, Any], Optional[str]]:
+    try:
+        return config.section(plugin_tables.TABLE), None
+    except (ConfigError, OSError) as e:
+        return {}, str(e)
+
+
+def _plugin_table(config: Config, owner: PluginOwner, keys: list[str]) -> PluginTableReport:
+    """One plugin's table, found as ``agent_env.plugins.settings`` finds it, so the two agree."""
+    if len(keys) > 1:
+        return PluginTableReport(owner, tuple(keys), error=plugin_tables.duplicate(owner.name, keys))
+    try:
+        return PluginTableReport(owner, tuple(keys), value=config.section(plugin_tables.TABLE, keys[0]))
+    except ConfigError as e:
+        return PluginTableReport(owner, tuple(keys), error=str(e))
+
+
+def _describe_plugins(config: Config) -> PluginsReport:
+    table, error = _plugins_table(config)
+    if error is not None:
+        return PluginsReport(error=error)
+    names = plugin_tables.spellings(table)
+    installed = plugin_tables.installed() if names else {}
+    return PluginsReport(tables=tuple(
+        _plugin_table(config, PluginOwner(name, installed.get(name)), keys)
+        for name, keys in names.items()
+    ))
 
 
 # Every environment variable the config package reads, and the TOML path it shadows.
@@ -393,23 +659,13 @@ class EnvSource:
 
 @lru_cache(maxsize=1)
 def env_sources() -> tuple[EnvSource, ...]:
-    """Every environment variable agent-env reads, and the TOML path it shadows.
-
-    A function, not a module constant: the RDS group is declared by the state provider,
-    and importing that at module scope would drag psycopg2 and the store layer into every
-    import of the config package.
-    """
+    """Every environment variable agent-env reads, and the TOML path it shadows."""
     return tuple(
         [EnvSource(s.env_var, s.toml_path) for s in ALIASED_SECTIONS]
         + [
             EnvSource("LITELLM_API_KEY", ("model", "api_key")),
             EnvSource("LITELLM_BASE_URL", ("model", "base_url")),
             EnvSource("AGENT_ENV_HUMAN_A2A_URL", ("conversations", "default_human_a2a_url")),
-            # Imported from the module that reads them: a hard override of the state
-        # provider's own credential lookup, all-or-nothing, selected by HOST.
-            *[EnvSource(name, ("state", "providers"),
-                        "selects the group" if name.endswith("_HOST") else None)
-              for name in _rds_admin_env_vars()],
         # Read by the resolver but shadowing nothing in the file — listed so the checklist
         # is complete, with no `shadows` because claiming one would be false.
             EnvSource("AGENT_SANDBOX_MODE", None, "no file equivalent"),
@@ -557,6 +813,7 @@ class PathReport:
     section: Optional[str] = None
     error: Optional[str] = None
     file_only: bool = False
+    plugin: Optional[PluginOwner] = None
 
     def __post_init__(self) -> None:
         # Masked on construction, never by remembering: doing it at each call site is what
@@ -592,6 +849,22 @@ _SECTION_BY_KEY = {k: s for s in _SECTIONS
                    for k in (s.name, ".".join(s.toml_path))}
 
 
+def _known_tables() -> dict[str, Shape]:
+    """Every table agent-env reads, nested as the file nests them, plus `[plugins]`, which it
+    reads none of."""
+    known: dict[str, Any] = {plugin_tables.TABLE: None}
+    for section in _SECTIONS:
+        *parents, leaf = section.toml_path
+        node = known
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = section.keys if isinstance(section, FileSection) else _SEAM
+    return known
+
+
+_KNOWN = _known_tables()
+
+
 def _describe(config: Config, section) -> SectionReport:
     """Whichever kind of section it is, described the way that kind resolves."""
     return (_describe_file_section(config, section) if isinstance(section, FileSection)
@@ -610,6 +883,8 @@ def explain_path(path: str, config: Optional[Config] = None) -> Explained:
         return PathReport(path=path, error="empty path")
     key = ".".join(parts)
     config = config if config is not None else Config()
+    if parts[0] == plugin_tables.TABLE:
+        return _explain_plugins(config, path, _segments(path)[1:])
 
     section = _SECTION_BY_KEY.get(key)
     if section is not None:
@@ -635,6 +910,76 @@ def explain_path(path: str, config: Optional[Config] = None) -> Explained:
     if layer.error is not None:
         return PathReport(path=path, winner=layer, error=layer.error, file_only=True)
     return PathReport(path=path, value=layer.raw, winner=layer, file_only=True)
+
+
+def _segments(path: str) -> list[str]:
+    """``path`` split on the dots TOML splits on: a ``"quoted"`` segment is one key, so a table
+    label copied from ``config show``, such as ``plugins."AgentEnv.Toy"``, names that table."""
+    out, current, quoted, escaped = [], "", False, False
+    for char in path:
+        if escaped:
+            current, escaped = current + char, False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == "." and not quoted:
+            out.append(current)
+            current = ""
+        else:
+            current += char
+    return [segment for segment in (*out, current) if segment]
+
+
+def _plugin_named(rest: list[str], *known: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """The distribution a path below ``plugins.`` names, and the key path under its table. The
+    first segment is the table, as TOML reads it; failing that, a dotted name as ``plugin list``
+    prints one (``AgentEnv.Toy``), longest first."""
+    first = canonicalize_name(rest[0])
+    if any(first in names for names in known):
+        return first, rest[1:]
+    for names in known:
+        for end in range(len(rest), 1, -1):
+            if (name := canonicalize_name(".".join(rest[:end]))) in names:
+                return name, rest[end:]
+    return first, rest[1:]
+
+
+def _explain_plugins(config: Config, path: str, rest: list[str]) -> Explained:
+    """A path in ``[plugins]``: the file is its only layer, and agent-env does not read it; the
+    report says whose table it is. Looked up by canonical name, as the plugin's own read is."""
+    table, error = _plugins_table(config)
+    if error is not None:
+        return PathReport(path=path, section=plugin_tables.TABLE, error=error,
+                          winner=Layer(KIND_FILE, f"[{plugin_tables.TABLE}]", error=error))
+    names = plugin_tables.spellings(table)
+    if not rest and not names:
+        return PathReport(path=path, section=plugin_tables.TABLE)
+    installed = plugin_tables.installed()
+    if not rest:
+        return SectionsReport(path=path, children=tuple(
+            _explain_plugin(config, f"{plugin_tables.TABLE}.{name}",
+                            PluginOwner(name, installed.get(name)), keys, [])
+            for name, keys in names.items()))
+    name, below = _plugin_named(rest, names, installed)
+    owner = PluginOwner(name, installed.get(name))
+    return _explain_plugin(config, path, owner, names.get(name, []), below)
+
+
+def _explain_plugin(config: Config, path: str, owner: PluginOwner, keys: list[str],
+                    below: list[str]) -> PathReport:
+    if not keys:
+        return PathReport(path=path, section=plugin_tables.TABLE, plugin=owner)
+    found = _plugin_table(config, owner, keys)
+    if found.error is not None:
+        return PathReport(path=path, section=plugin_tables.TABLE, plugin=owner, error=found.error,
+                          winner=Layer(KIND_FILE, found.where, error=found.error))
+    # Walked in the masked table, so a key beneath a secret-shaped one stays masked.
+    node: Any = found.value
+    for part in below:
+        node = node.get(part) if isinstance(node, dict) else None
+    return PathReport(path=path, value=node, winner=Layer(KIND_FILE, found.where, found.value),
+                      section=plugin_tables.TABLE, plugin=owner)
 
 
 def _explain_resolved_key(config: Config, path: str, key) -> PathReport:
@@ -704,4 +1049,19 @@ def as_dict(report: ConfigReport) -> dict:
             }
             for s in report.sections
         ],
+        "plugins": {
+            "error": report.plugins.error,
+            "tables": [
+                {
+                    "name": t.owner.name,
+                    "installed": t.owner.installed is not None,
+                    "version": t.owner.version,
+                    "plugin": t.owner.plugin,
+                    "keys": list(t.keys),
+                    "value": t.value,
+                    "error": t.error,
+                }
+                for t in report.plugins.tables
+            ],
+        },
     }

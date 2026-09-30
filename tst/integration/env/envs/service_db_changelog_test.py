@@ -16,7 +16,7 @@ import uuid
 import psycopg2
 import pytest
 
-from agent_env.providers.state import LocalPostgresStateProvider
+from agent_env.providers.env_state import LocalPostgresStateProvider
 
 pytestmark = [pytest.mark.integration]
 

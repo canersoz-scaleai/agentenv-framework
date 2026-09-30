@@ -1,10 +1,15 @@
 """Shared pytest fixtures for all tests."""
 
+import shutil
+import signal
 import sys
+import tempfile
 
 import pytest
 
 from agent_env.config import reset_config
+from agent_env.store.document_store import document_store as document_store_module
+from agent_env.store.routing import disable_namespace_routing
 
 
 def _reset_store_singletons() -> None:
@@ -16,6 +21,47 @@ def _reset_store_singletons() -> None:
         for name, value in list(vars(module).items()):
             if name.startswith("reset_") and name.endswith("_store") and callable(value):
                 value()
+
+
+_STATE_DIR = pytest.StashKey[str]()
+_state_home = pytest.MonkeyPatch()
+
+
+def pytest_configure(config):
+    """Point the per-user state root at a fresh directory for the run, so nothing reads or writes
+    the real one. Set here rather than in a fixture because collection already reads the stores
+    (the capability checks behind skip marks)."""
+    config.stash[_STATE_DIR] = tempfile.mkdtemp(prefix="agent-env-state-")
+    _state_home.setenv("XDG_STATE_HOME", config.stash[_STATE_DIR])
+
+
+def pytest_unconfigure(config):
+    _state_home.undo()
+    shutil.rmtree(config.stash[_STATE_DIR], ignore_errors=True)
+
+
+@pytest.fixture
+def sigint_handled():
+    """SIGINT handled as Python handles it by default, for a test that sends it: a CI job started in the background
+    runs with it ignored, and agent-env keeps an ignore it inherits."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous)
+
+
+@pytest.fixture(autouse=True)
+def entity_collections_restored(monkeypatch):
+    """A VersionedEntityStore registers its collection for the whole process; one a test builds on a
+    scratch collection must not make that collection an entity collection for the next test."""
+    monkeypatch.setattr(document_store_module, "_entity_collections", set(document_store_module._entity_collections))
+
+
+@pytest.fixture(autouse=True)
+def namespace_routing_off():
+    """The CLI turns namespace routing on for its whole process; a test that invokes it must not
+    leave it on for the next test."""
+    yield
+    disable_namespace_routing()
 
 
 @pytest.fixture(autouse=True)

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import mimetypes
 import os
-from typing import Literal
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, ClassVar, Literal, Self
 
 from pydantic import Field
 
 from agent_env.artifact.artifact import Artifact
 from agent_env.config import get_config
+
+if TYPE_CHECKING:
+    from agent_env.bundle.authoring import AuthoringContext
 
 
 class FileArtifact(Artifact):
@@ -32,6 +34,7 @@ class FileArtifact(Artifact):
         emails = json.loads(data)  # Client parses as needed
     """
 
+    toml_keys: ClassVar[dict[str, type]] = {"description": str}  # what an artifact.toml may set
     type: Literal["file"] = "file"
     description: str = Field(description="Human-readable description of the artifact contents")
     filename: str = Field(description="Original filename (preserved for reference)")
@@ -45,7 +48,7 @@ class FileArtifact(Artifact):
         *,
         description: str,
         file_path: str,
-    ) -> "FileArtifact":
+    ) -> Self:
         from agent_env.artifact.store import get_artifact_store
 
         store = get_artifact_store()
@@ -89,7 +92,7 @@ class FileArtifact(Artifact):
         filename: str,
         content: bytes,
         content_type: str = "application/octet-stream",
-    ) -> "FileArtifact":
+    ) -> Self:
         """Like ``put``, but takes raw bytes instead of a file path."""
         from agent_env.artifact.store import get_artifact_store
 
@@ -115,10 +118,25 @@ class FileArtifact(Artifact):
         )
         return store.put_document(instance)
 
+    @classmethod
+    def from_toml(cls, data: dict, ctx: AuthoringContext) -> Self:
+        """Write the folder's one file under a prefix of its own (``ArtifactStore.attempt_prefix``);
+        ``description`` defaults to the file's name."""
+        from agent_env.artifact.store import get_artifact_store
+
+        fields = ctx.accept(data, **cls.toml_keys)
+        filename, path = ctx.file()
+        prefix = get_artifact_store().attempt_prefix(cls.model_fields["type"].default, ctx.id)
+        return cls.put_at(ctx.id, description=fields.get("description", filename), file_path=str(path),
+                          object_url=prefix + filename, filename=filename)
+
     def load(self) -> bytes:
         from agent_env.artifact.store import get_artifact_store
 
         return get_artifact_store().get_object(self.object_url)
+
+    def get_file_artifacts(self) -> dict[str, "FileArtifact"]:
+        return {self.filename: self}
 
     @classmethod
     def put_at(
@@ -128,13 +146,15 @@ class FileArtifact(Artifact):
         description: str,
         file_path: str,
         object_url: str,
-    ) -> "FileArtifact":
+        filename: str | None = None,
+    ) -> Self:
         """Upload ``file_path`` to an explicit object_url (write-once) and register it."""
         from agent_env.artifact.store import get_artifact_store
 
-        store = get_config().get_object_store()
+        store = get_config().get_object_store_to_write(object_url, id)
 
-        filename = os.path.basename(file_path)
+        if filename is None:
+            filename = os.path.basename(file_path)
         content_type, _ = mimetypes.guess_type(file_path)
         if content_type is None:
             content_type = "application/octet-stream"
@@ -159,7 +179,7 @@ class FileArtifact(Artifact):
         *,
         description: str,
         object_url: str,
-    ) -> "FileArtifact":
+    ) -> Self:
         """Register an already-uploaded object as a FileArtifact.
 
         Unlike ``put`` and ``put_at``, this does NOT upload bytes; it asserts
@@ -169,15 +189,16 @@ class FileArtifact(Artifact):
         """
         from agent_env.artifact.store import get_artifact_store
 
-        store = get_config().get_object_store()
-        path = urlparse(object_url).path
-        if not path or path.endswith("/"):
+        store = get_config().get_object_store_to_write(object_url, id)
+        location = object_url.partition("://")[2] or object_url
+        if "/" not in location or location.endswith("/"):
             raise ValueError(f"object_url must point at an object, not a prefix: {object_url!r}")
         metadata = store.get_object_metadata_at(object_url)
         if metadata is None:
             raise ValueError(f"Object does not exist at {object_url!r}")
 
-        filename = os.path.basename(path)
+        # The last segment, not urlparse's path, which ends at a "#" or "?" that keys may hold.
+        filename = object_url.rsplit("/", 1)[-1]
         content_type = metadata.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
         artifact_store = get_artifact_store()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import os
@@ -96,7 +97,7 @@ class EnvOutcomeVerifierTaskStep(TaskStep):
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
 
         artifact = FileArtifact.get(self.file_artifact_id, self.file_artifact_version)
-        verifier_bytes = artifact.load()
+        verifier_bytes = await asyncio.to_thread(artifact.load)
 
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py")
         try:

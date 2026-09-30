@@ -4,12 +4,14 @@ Fakes the ``secretsmanager`` client at the ``boto3`` boundary so the same parse 
 cache / validation assertions run without credentials.
 """
 
+import json
 import logging
 
 import pytest
 
 from agent_env.config import Config
 from agent_env.store import AwsSecretsManagerSecretStore
+from tst.store import secret_conformance
 
 
 class _FakeClient:
@@ -18,6 +20,8 @@ class _FakeClient:
 
     def get_secret_value(self, SecretId):  # noqa: N803 (boto3 kwarg name)
         self._backing.fetches += 1
+        if self._backing.secret_string is None:
+            return {"SecretBinary": b"\x00"}
         return {"SecretString": self._backing.secret_string}
 
 
@@ -39,6 +43,11 @@ def store(monkeypatch):
         return s
 
     return _build
+
+
+@pytest.mark.parametrize("case", secret_conformance.CASES, ids=lambda c: c.__name__)
+def test_conformance(case, store):
+    case(store(json.dumps(secret_conformance.FIXTURE)))
 
 
 def test_loads_flat_mapping(store):
@@ -64,8 +73,14 @@ def test_scalar_secret_rejected_at_load_time(store):
         store("just-a-bare-string").get("anything")
 
 
-def test_non_string_values_coerced_to_str(store):
-    assert store("port: 5432\n").get("port") == "5432"
+def test_values_are_read_verbatim(store):
+    s = store("port: 5432\npin: 0123\npassword: no\nwindow: 12:30\n")
+    assert [s.get(k) for k in ("port", "pin", "password", "window")] == ["5432", "0123", "no", "12:30"]
+
+
+def test_binary_secret_rejected_at_load_time(store):
+    with pytest.raises(ValueError, match="binary"):
+        store(None).get("anything")
 
 
 def test_from_config_builds_store():
@@ -163,7 +178,7 @@ def test_refresh_is_rate_limited(store, clock):
 
 def test_first_refresh_always_fetches(store, clock):
     s = store("a: 1\n", min_refresh_interval=3600)
-    assert s.refresh()["a"] == 1
+    assert s.refresh()["a"] == "1"
     assert s.backing.fetches == 1
 
 
@@ -250,7 +265,7 @@ def test_load_returns_a_live_view_that_observes_changes(store, clock):
     s.backing.secret_string = "a: 2\nadded: sk-new\n"
     clock["t"] += 301
     assert view.get("added") == "sk-new"
-    assert view["a"] == 2
+    assert view["a"] == "2"
     assert "added" in view
     assert sorted(view) == ["a", "added"]
     assert len(view) == 2
@@ -390,9 +405,9 @@ def test_bulk_accessors_bind_to_one_snapshot(store, clock):
     s.backing.secret_string = "a: 1\n"  # 'b' deleted in AWS
     clock["t"] += 301
 
-    assert dict(items) == {"a": 1, "b": 2}
-    assert dict(view.items()) == {"a": 1}
-    assert view == {"a": 1}
+    assert dict(items) == {"a": "1", "b": "2"}
+    assert dict(view.items()) == {"a": "1"}
+    assert view == {"a": "1"}
 
 
 def test_invalid_yaml_never_leaks_secret_content(store):

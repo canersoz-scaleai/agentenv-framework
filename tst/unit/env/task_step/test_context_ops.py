@@ -4,7 +4,7 @@ import dataclasses
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv
 from agent_env.task_step.context import DeployedAgent, PromptResponse, TaskStepContext
 from agent_env.task_step.context_ops import (
     ContextUpdateOps,
@@ -13,7 +13,7 @@ from agent_env.task_step.context_ops import (
 
 
 def _env(instance_id: str = "i1") -> DeployedEnv:
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id="e", env_version=1, gateway_url="g", mcp_url="m",
         db_web_url=None, sandbox_id="s", instance_id=instance_id,
     )
@@ -249,7 +249,7 @@ def test_cf_access_secret_redacted_but_url_kept():
     pre = TaskStepContext()
     post = TaskStepContext(metadata={
         "user_overrides": {
-            "computer_server_url": "https://phone-3.example.com",
+            "env_url": "https://env-3.example.com",
             "cf_access_client_id": "client-id",
             "cf_access_client_secret": "shhh",
         },
@@ -257,7 +257,7 @@ def test_cf_access_secret_redacted_but_url_kept():
     ops = build_context_update_ops(pre, post)
     assert "context.metadata.user_overrides.cf_access_client_secret" not in ops.sets
     assert ops.sets == {
-        "context.metadata.user_overrides.computer_server_url": "https://phone-3.example.com",
+        "context.metadata.user_overrides.env_url": "https://env-3.example.com",
         "context.metadata.user_overrides.cf_access_client_id": "client-id",
     }
 

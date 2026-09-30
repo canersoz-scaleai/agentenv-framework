@@ -3,7 +3,7 @@ import asyncio
 import click
 
 from agent_env.artifact import EnvironmentArtifact, EnvironmentUniverseArtifact
-from agent_env.cli.utils import detect_base_metadata
+from agent_env.cli.utils import detect_base_metadata, env_provider_type_option, skips_local_validation
 from agent_env.env import Env, MultiEnv
 
 
@@ -27,8 +27,11 @@ def multi():
 @click.option("--website", "websites", multiple=True, help="WebsiteEnv id[:version]")
 @click.option("--metadata", "metadata_pairs", multiple=True, help="Metadata key=value pair (repeatable)")
 @click.option("--name", default=None, help="Name agents see this env's MCP server under, e.g. crm -> mcp__crm__<tool> (default: env + 4 random digits per deploy)")
-@click.option("--skip-validation", is_flag=True, default=False, help="Skip environment validation after registration")
-def put(env_id: str, mcp_servers: tuple[str, ...], websites: tuple[str, ...], metadata_pairs: tuple[str, ...], name: str | None, skip_validation: bool):
+@env_provider_type_option("What deploys the env: 'gateway' (a gateway in front of its servers and websites, whatever their own "
+                          "env_provider_type), or the type of an installed agent_env.env_providers plugin, which deploys them all", "multi")
+@click.option("--validate", "run_validation", is_flag=True, default=False, help="Validate the environment after registering it")
+def put(env_id: str, mcp_servers: tuple[str, ...], websites: tuple[str, ...], metadata_pairs: tuple[str, ...], name: str | None, env_provider_type: str,
+        run_validation: bool):
     """Create a MultiEnv from MCPServerEnv and/or WebsiteEnv ids."""
 
     if not mcp_servers and not websites:
@@ -66,11 +69,17 @@ def put(env_id: str, mcp_servers: tuple[str, ...], websites: tuple[str, ...], me
     metadata = detect_base_metadata()
     metadata.update(user_metadata)
 
+    refusal = MultiEnv(id=env_id, version=None, mcp_server_envs=mcp_server_envs, website_envs=website_envs, name=name,
+                       env_provider_type=env_provider_type).deploy_refusal()
+    if refusal:
+        click.echo(f"Error: {refusal}", err=True)
+        raise SystemExit(1)
     click.echo(f"Creating MultiEnv...")
-    multi_env = MultiEnv.put(id=env_id, mcp_server_envs=mcp_server_envs, website_envs=website_envs, metadata=metadata if metadata else None, name=name)
-    click.echo(f"Created MultiEnv: id={multi_env.id} version={multi_env.version}")
-    if not skip_validation:
-        click.echo("\nValidating environment (use --skip-validation to skip)...")
+    multi_env = MultiEnv.put(id=env_id, mcp_server_envs=mcp_server_envs, website_envs=website_envs, metadata=metadata if metadata else None, name=name,
+                             env_provider_type=env_provider_type)
+    click.echo(f"Created MultiEnv: id={multi_env.id} version={multi_env.version} env_provider_type={multi_env.env_provider_type}")
+    if run_validation and not skips_local_validation(multi_env.id, "env"):
+        click.echo("\nValidating environment...")
         instance_id = asyncio.run(multi_env.validate(on_progress=click.echo))
         click.echo(f"Validation task: {instance_id}")
 
@@ -96,7 +105,7 @@ def load_environment_universe_artifact(env_instance_id: str, environment_univers
         raise SystemExit(1)
 
     click.echo(f"Instance: {env_instance_id} (env={deployed_env.env_id} v{deployed_env.env_version})")
-    if deployed_env.sandbox_type:
+    if getattr(deployed_env, "sandbox_type", None):
         click.echo(f"Sandbox backend: {deployed_env.sandbox_type}")
     env = Env.get(deployed_env.env_id, deployed_env.env_version)
     env = asyncio.run(type(env).from_deployed_env(deployed_env))

@@ -109,3 +109,17 @@ async def test_export_state_gets_mcp_endpoint_and_returns_json():
     assert r == {"emails": []}
     assert client.get.call_args.args[0] == "http://gw/svc/mcp-email/export-state"
     assert client.get.call_args.kwargs["timeout"] == 60
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_path_without_a_gateway_fails_readably():
+    from agent_env.env.env import DeployedSandboxEnv, EnvNeedsGateway
+
+    record = DeployedSandboxEnv(env_id="e", env_version=1, sandbox_id="srv")
+    message = "Reaching 'slack' here needs a gateway; this env was deployed without one"
+    with pytest.raises(EnvNeedsGateway, match=message):
+        await legacy_protocol.v1_base_url(record, None, "slack")
+    with pytest.raises(EnvNeedsGateway, match=message):
+        await legacy_protocol.child_env_card(record, None, "slack")
+    with pytest.raises(EnvNeedsGateway, match=message):
+        await legacy_protocol.export_state(None, "slack")

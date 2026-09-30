@@ -21,6 +21,7 @@ import pytest
 from agent_env.artifact import DockerImageArtifact
 from agent_env.artifact.store import reset_artifact_store
 from agent_env.config import configure, reset_config, set_image_store
+from agent_env.config.paths import state_root
 from agent_env.store.image_store import LocalRegistryImageStore
 
 pytestmark = pytest.mark.integration
@@ -56,7 +57,7 @@ def all_local(monkeypatch, tmp_path):
     set_image_store(LocalRegistryImageStore(host))
     reset_artifact_store()
     try:
-        yield host, tmp_path
+        yield host
     finally:
         reset_artifact_store()
         reset_config()
@@ -86,7 +87,7 @@ def _build_scratch_image(tag: str) -> None:
 
 
 def test_docker_image_lifecycle_all_local(all_local):
-    host, root = all_local
+    host = all_local
     artifact_id = f"local-img-{uuid.uuid4().hex[:8]}"
     local_tag = f"{artifact_id}-src"
     _build_scratch_image(local_tag)
@@ -98,8 +99,8 @@ def test_docker_image_lifecycle_all_local(all_local):
         # tar.gz landed in the local filesystem object store
         assert artifact.tar_gz_object_url.startswith("file://")
         assert Path(artifact.tar_gz_object_url[len("file://"):]).exists()
-        assert (root / ".agentenv" / "object_store").exists()
-        assert (root / ".agentenv" / "document_store" / "documents.db").exists()
+        assert (state_root() / "object_store").exists()
+        assert (state_root() / "document_store" / "documents.db").exists()
 
         # the image is really pullable from the local registry
         _docker("rmi", "-f", artifact.image_name)

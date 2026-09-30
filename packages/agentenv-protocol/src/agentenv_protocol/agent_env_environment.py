@@ -124,10 +124,10 @@ def tool(name: str | None = None, *, description: str | None = None) -> Callable
 def environment_card(_cls: type | None = None, **config: Any) -> Callable:
     """Configure the class's EnvironmentCard; kwargs are EnvironmentCard fields.
 
-    The SDK assembles the card at mount: a card-declared name wins, then ENVIRONMENT_NAME,
+    The SDK assembles the card at mount: ENVIRONMENT_NAME wins, then a card-declared name,
     then the class name; decorator-discovered tools/extensions/operations are merged in.
-    SERVICE_NAME is no longer consulted — agent-env injects ENVIRONMENT_NAME everywhere it
-    used to inject SERVICE_NAME, and every server declares @environment_card(name=...).
+    agent-env injects ENVIRONMENT_NAME as the env's registered name, so the card follows a
+    registration that overrides the code's name. SERVICE_NAME is no longer consulted.
     """
     if _cls is not None:
         raise TypeError("use @environment_card(...) with parentheses")
@@ -232,7 +232,7 @@ class AgentEnvEnvironment:
 
     def _build_card(self) -> EnvironmentCard:
         config = dict(getattr(self, _CARD_CONFIG_ATTR, None) or {})
-        name = config.get("name") or os.environ.get("ENVIRONMENT_NAME") or type(self).__name__
+        name = os.environ.get("ENVIRONMENT_NAME") or config.get("name") or type(self).__name__
         return EnvironmentCard(**{**config, "name": name})
 
     def create_app(self) -> Any:

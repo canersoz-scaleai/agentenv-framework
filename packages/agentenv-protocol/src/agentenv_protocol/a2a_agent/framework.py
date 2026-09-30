@@ -38,6 +38,7 @@ from .extensions import (
     ImplementationOwner,
     McpAddRequest,
     OperationReference,
+    TaskObjectTrajectoryRequest,
     TaskTrajectoryRequest,
     TriggerDecideRequest,
     TriggerRegisterRequest,
@@ -61,6 +62,7 @@ from .tasks.v1 import (
 from .tasks.v1 import (
     TextPart as TaskTextPart,
 )
+from ..transfers import TransferError, upload
 
 logger = logging.getLogger(__name__)
 
@@ -559,9 +561,17 @@ class _SdkServices:
         self.identity_skills = {skill.name: skill.description for skill in card.skills}
 
     def record_skill(self, registration: Mapping[str, Any]) -> None:
-        """Record a successfully installed skill for subsequent task executions."""
+        """Record a successfully installed skill for subsequent task executions.
+
+        A bundle's read grants are secret and short-lived, so they are not kept."""
         name = str(registration["name"])
-        self.skills.append(dict(registration))
+        self.skills.append(
+            {
+                key: registration[key]
+                for key in ("name", "description", "skill_md")
+                if key in registration
+            }
+        )
         if self.card is not None:
             from a2a.types import AgentSkill
 
@@ -716,7 +726,9 @@ class _SdkServices:
         )
         return {"skills": skills}
 
-    async def trajectory_get(self, request: TaskTrajectoryRequest) -> dict[str, Any]:
+    async def trajectory_get(
+        self, request: TaskTrajectoryRequest | TaskObjectTrajectoryRequest
+    ) -> dict[str, Any]:
         task_id = request.task_id
         trajectory = self.task_trajectories.get(task_id)
         if trajectory is None:
@@ -724,40 +736,17 @@ class _SdkServices:
                 status_code=404,
                 detail=f"No completed trajectory available for task '{task_id}'",
             )
-        if request.trajectory_s3_prefix:
-            location = request.trajectory_s3_prefix
-            parsed = urlparse(location)
-            if parsed.scheme != "s3" or not parsed.netloc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="trajectory_s3_prefix must be of the form s3://bucket/key",
-                )
-            prefix = parsed.path.lstrip("/")
-            if prefix and not prefix.endswith("/"):
-                prefix += "/"
-            key = f"{prefix}trajectory-{uuid.uuid4().hex[:12]}.json"
-            try:
-                import boto3
-            except ImportError as exc:  # pragma: no cover - installation error
-                raise RuntimeError(
-                    "trajectory upload requires the agentenv-protocol[agent] extra"
-                ) from exc
-            body = json.dumps(_thaw(trajectory.payload), indent=2, default=str).encode()
-            await asyncio.to_thread(
-                boto3.client("s3").put_object,
-                Bucket=parsed.netloc,
-                Key=key,
-                Body=body,
-                ContentType="application/json",
-            )
-            # Reads stay non-destructive so callers can safely retry after an
-            # ambiguous network failure without losing the completed trajectory.
-            # ``parsed.netloc`` is an S3 bucket identifier, not a request host.
-            # boto3 targets the configured AWS S3 endpoint and IAM determines
-            # which buckets are writable.
-            # nosemgrep: tainted-url-host
-            return {"trajectory_s3_prefix": f"s3://{parsed.netloc}/{key}"}
-        return {"trajectory": _thaw(trajectory.payload)}
+        if isinstance(request, TaskTrajectoryRequest):
+            return {"trajectory": _thaw(trajectory.payload)}
+        body = json.dumps(
+            _thaw(trajectory.payload), separators=(",", ":"), default=str
+        ).encode()
+        uploaded = await upload(request.objects.trajectory, body)
+        return {
+            "objects": {
+                "trajectory": uploaded.model_dump(mode="json"),
+            }
+        }
 
     async def triggers_register(
         self, request: TriggerRegisterRequest
@@ -1032,6 +1021,11 @@ class A2AAgentApplication:
                             raise RuntimeError(
                                 "operation response must be a JSON object"
                             )
+                        response_model = operation.definition.response_model
+                        if response_model is not None:
+                            return response_model.model_validate(result).model_dump(
+                                mode="json", by_alias=True, exclude_none=True
+                            )
                         missing = set(operation.definition.response.required) - set(
                             result
                         )
@@ -1057,6 +1051,8 @@ class A2AAgentApplication:
                 raise HTTPException(
                     status_code=exc.status_code, detail=str(exc)
                 ) from exc
+            except TransferError as exc:
+                return JSONResponse(exc.body(), status_code=exc.status_code)
             except Exception as exc:
                 raise _opaque_extension_error("invocation") from exc
 

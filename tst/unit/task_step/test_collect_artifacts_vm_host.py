@@ -64,7 +64,7 @@ class _VmSandbox:
 @pytest.fixture
 def vm(monkeypatch):
     sandbox = _VmSandbox()
-    from agent_env.providers import sandbox_provider as sp_mod
+    from agent_env.providers.sandbox_providers import sandbox_provider as sp_mod
 
     async def _get_sandbox(sandbox_id):
         return sandbox

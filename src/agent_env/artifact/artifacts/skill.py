@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal, Optional
 
 import yaml
-from botocore.exceptions import ClientError
 from pydantic import Field
 
 from agent_env.artifact.artifact import Artifact
 from agent_env.config import get_config
+from agent_env.store.base import ObjectNotFoundError
 from agent_env.store.ids import derive_id, key_segment
 
 if TYPE_CHECKING:
@@ -83,7 +83,8 @@ class SkillArtifact(Artifact):
 
         store = get_artifact_store()
         version = store.next_version(id)
-        skill_s3_url = get_config().get_object_store().object_url(f"artifacts/skill/{key_segment(id)}/{version}/")
+        key = f"{get_config().get_artifact_key_prefix()}artifacts/skill/{key_segment(id)}/{version}/"
+        skill_s3_url = get_config().get_object_store_for(id).object_url(key)
 
         universe = FileArtifactUniverse.put_bundled(
             id=derive_id(id, "files"),
@@ -181,19 +182,15 @@ def _fetch_skill_md(object_url: str) -> bytes:
     prefix = object_url if object_url.endswith("/") else object_url + "/"
     skill_md_url = prefix + _SKILL_MD_FILENAME
     try:
-        return get_config().get_object_store().get(skill_md_url)
-    except FileNotFoundError as e:
+        return get_config().get_object_store_at(skill_md_url).get(skill_md_url)
+    except ObjectNotFoundError as e:
         raise ValueError(f"{_SKILL_MD_FILENAME} not found at {object_url}") from e
-    except ClientError as e:
-        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-            raise ValueError(f"{_SKILL_MD_FILENAME} not found at {object_url}") from e
-        raise
 
 
 @contextlib.contextmanager
 def download_skill(object_url: str) -> Iterator[Path]:
     """Download an object-store prefix into a local tempdir; yields the dir, cleans up on exit."""
-    store = get_config().get_object_store()
+    store = get_config().get_object_store_at(object_url)
     prefix = object_url if object_url.endswith("/") else object_url + "/"
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)

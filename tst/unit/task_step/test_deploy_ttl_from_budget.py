@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
@@ -15,7 +15,7 @@ from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
 
 async def _env_deploy_ttl(step_ttl, overrides) -> int:
     env = MagicMock()
-    env.deploy = AsyncMock(return_value=DeployedEnv(
+    env.deploy = AsyncMock(return_value=DeployedGatewayEnv(
         env_id="art-1", env_version=2, gateway_url="http://gw", mcp_url="http://mcp",
         db_web_url=None, sandbox_id="s1", metadata=None,
     ))
@@ -46,7 +46,7 @@ async def test_deploy_sandbox_uses_budget_override():
         id="d", version=None, sandbox_name="sbx", sandbox_mode="vm", image="img", ttl_seconds=1800,
     )
     ctx = TaskStepContext(metadata={"user_overrides": {"ttl_seconds": 30600}})
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(ctx)
     assert provider.create_vm.await_args.kwargs["timeout"] == 30600
 
@@ -61,7 +61,7 @@ async def test_deploy_sandbox_container_mode_uses_budget_override():
         image="img", port=8080, ttl_seconds=1800,
     )
     ctx = TaskStepContext(metadata={"user_overrides": {"ttl_seconds": 30600}})
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(ctx)
     assert provider.create_sandbox.await_args.kwargs["timeout"] == 30600
 
@@ -75,6 +75,6 @@ async def test_deploy_sandbox_keeps_step_ttl_without_override():
         id="d", version=None, sandbox_name="sbx", sandbox_mode="vm", image="img", ttl_seconds=1800,
     )
     ctx = TaskStepContext(metadata={"user_overrides": {}})
-    with patch("agent_env.providers.sandbox_provider.get_sandbox_provider", return_value=provider):
+    with patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider):
         await step.execute(ctx)
     assert provider.create_vm.await_args.kwargs["timeout"] == 1800

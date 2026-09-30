@@ -309,6 +309,50 @@ def test_store_get_reads_a_doc_stored_under_the_legacy_spelling(monkeypatch, tmp
     assert doc_store.docs[0]["type"] == "legacy_renamed"
 
 
+def test_a_subclass_get_reads_a_legacy_spelling_as_itself(monkeypatch, tmp_path):
+    """The class check runs after the alias resolves, so an old row still passes."""
+    _alias_config(tmp_path, monkeypatch)
+    doc_store = FakeDocumentStore()
+    doc_store.docs.append({"id": "r1", "version": 1, "type": "legacy_renamed"})
+    set_document_store(doc_store)
+    reset_artifact_store()
+
+    assert type(_RenamedArtifact.get("r1")) is _RenamedArtifact
+
+
+def test_a_subclass_get_returns_its_own_type(monkeypatch, tmp_path):
+    cfg = _write_config(tmp_path, f"""
+        [artifacts]
+        impls = ["{_HERE}:_CustomArtifact"]
+    """)
+    monkeypatch.setenv("AGENT_ENV_CONFIG", str(cfg))
+    doc_store = FakeDocumentStore()
+    doc_store.docs.append({"id": "cw1", "version": 1, "type": "custom_test_artifact", "payload": "mine"})
+    set_document_store(doc_store)
+    reset_artifact_store()
+
+    assert _CustomArtifact.get("cw1").payload == "mine"
+
+
+def test_a_subclass_get_refuses_an_id_that_holds_another_type(monkeypatch, tmp_path):
+    """Its return type says ``cls``, so an id of another type fails here, not at its first
+    attribute."""
+    cfg = _write_config(tmp_path, f"""
+        [artifacts]
+        impls = ["{_HERE}:_CustomArtifact"]
+    """)
+    monkeypatch.setenv("AGENT_ENV_CONFIG", str(cfg))
+    doc_store = FakeDocumentStore()
+    doc_store.docs.append({"id": "f1", "version": 1, "type": "file", "description": "d", "filename": "a.txt",
+                           "content_type": "text/plain", "s3_url": "file:///tmp/a.txt"})
+    set_document_store(doc_store)
+    reset_artifact_store()
+
+    with pytest.raises(TypeError, match="artifact 'f1' is a 'file' artifact, not a _CustomArtifact"):
+        _CustomArtifact.get("f1")
+    assert Artifact.get("f1").type == "file"
+
+
 def test_store_get_still_raises_for_a_type_that_is_neither_spelling(monkeypatch, tmp_path):
     """The control: aliasing one type must not make every unknown type resolve."""
     _alias_config(tmp_path, monkeypatch)

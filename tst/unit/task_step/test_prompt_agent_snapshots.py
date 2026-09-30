@@ -12,6 +12,8 @@ import time
 
 import pytest
 
+from agent_env.config import set_object_store
+from agent_env.store.object_store import S3ObjectStore
 from agent_env.task_step.context import PromptResponse, TaskStepContext
 from agent_env.task_step.snapshot_utils import agent_state_capture as mod
 from agent_env.task_step.snapshot_utils import snapshot_series as ps
@@ -24,12 +26,10 @@ TRAJ_PREFIX = f"s3://{BUCKET}/traj/"
 
 
 @pytest.fixture(autouse=True)
-def _s3_bucket_backs_prefix_minting(monkeypatch):
-    # get_s3_bucket() re-sources from the configured object store; these tests
-    # run without one, so pin the bucket the trajectory prefixes are minted in.
-    from agent_env.config import Config
-
-    monkeypatch.setattr(Config, "get_s3_bucket", lambda self: BUCKET)
+def _s3_store_backs_prefix_minting():
+    # Trajectory prefixes are minted by the configured object store; pin an S3 one so
+    # they stay s3://BUCKET/... instead of resolving a filesystem path under cwd.
+    set_object_store(S3ObjectStore(client=object(), bucket=BUCKET))
 INSTANCE_ID = "solve-run-0123456789abcdef"
 # `INSTANCE_ID`'s tail, capped at 16 — what every artifact id is scoped by.
 DISCRIMINATOR = "0123456789abcdef"
@@ -133,6 +133,27 @@ def _rows(ctx: TaskStepContext) -> list[dict]:
 def _pending(series: ps.SnapshotSeries) -> list[dict]:
     """Rows collected on the series so far, before teardown publishes them."""
     return series._rows
+
+
+@pytest.mark.asyncio
+async def test_object_mode_trajectory_is_not_uploaded_twice(monkeypatch):
+    _install(monkeypatch)
+    direct_url = f"s3://{BUCKET}/prompt_agent_trajectories/direct.json"
+
+    async def direct_trajectory(**kwargs):
+        assert kwargs["trajectory_output_prefix"].startswith(f"s3://{BUCKET}/")
+        return mod.TrajectoryCapture(object_url=direct_url)
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("object-mode trajectory is already durable")
+
+    monkeypatch.setattr(mod, "read_partial_trajectory", direct_trajectory)
+    monkeypatch.setattr(mod, "upload_trajectory", unexpected_upload)
+
+    row = await _series()._capture_never_raising(context(), is_final=False)
+
+    assert row["capture_status"] == "ok"
+    assert row["trajectory_s3_uri"] == direct_url
 
 
 async def _until(pred, timeout=2.0, what="condition"):
@@ -481,7 +502,7 @@ async def test_a_failure_after_the_bundle_landed_degrades_to_partial(monkeypatch
 
     # The bundle is what makes a point gradable, so a lost auxiliary read must
     # degrade rather than discard — reporting `failed` here once failed the FINAL
-    # capture and made Temporal re-run an already-completed agent run.
+    # capture and made the runner re-run an already-completed agent run.
     assert row["capture_status"] == "partial"
     assert row["capture_reason"] == "trajectory_upload_failed"
     assert row["bundle_object_url"]
@@ -547,8 +568,8 @@ async def test_the_final_row_falls_back_to_the_recorded_uri(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_sibling_attempts_trajectory_is_never_borrowed(monkeypatch):
-    """A Temporal retry restores the context from the last heartbeat, so an
-    earlier attempt's response for the same prompt_id can still be in the list."""
+    """A retry can restore a context snapshot taken during an earlier attempt, so
+    that attempt's response for the same prompt_id can still be in the list."""
     _install(monkeypatch, trajectory_reason="trajectory_session_missing")
     ctx = context()
     ctx.prompt_responses.append(
@@ -1261,9 +1282,6 @@ class _Conversation:
         class _Cfg:
             def get_model_params(self, overrides=None):
                 return {}
-
-            def get_s3_bucket(self):
-                return BUCKET
 
             # Unreached while a user sim is deployed, but the loop falls back to it
             # when one is not — so the stub tracks the real API.

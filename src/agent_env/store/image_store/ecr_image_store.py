@@ -49,9 +49,9 @@ class EcrCredentials(OciRegistryCredentials):
     ) -> EcrCredentials:
         """Build explicitly configured ECR credentials.
 
-        The no-argument constructor remains available only for the legacy
-        ``EcrImageStore`` defaults; generic OCI configuration must name its
-        credential inputs instead of relying on the secret bundle's export keys.
+        The keyless constructor (the legacy ``EcrImageStore`` default) resolves
+        the AWS default credential chain; generic OCI configuration must name its
+        credential inputs.
         """
         if not region or not access_key or not secret_key:
             raise ValueError("region, access_key, and secret_key must be configured")
@@ -66,9 +66,7 @@ class EcrCredentials(OciRegistryCredentials):
                     "credentials (e.g. [stores.image.config] region)."
                 )
             if self._access_key is None:
-                from agent_env.config import get_config
-
-                self._client = get_config().build_ecr_client(self._region)
+                self._client = boto3.client("ecr", region_name=self._region)
             else:
                 self._client = boto3.client(
                     "ecr",

@@ -1,5 +1,5 @@
 """Unit tests for the typed-stakeholder helpers added to PromptAgentTaskStep:
-_read_env_triggers (env-trigger snapshot; fail-closed; 404->{}) and _decide (the /decide call).
+_read_env_triggers (env-trigger snapshot; fail-closed; {} for a card without triggers state) and _decide (the /decide call).
 Only the HTTP boundary is mocked; the loop routing itself is covered by the dev e2e."""
 
 from __future__ import annotations
@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
-from agent_env.env.gateway.constants import TRIGGER_IN_FLIGHT_STATUSES, TRIGGER_STATUSES
+from agent_env.env.gateway.constants import (
+    EXT_CLOCK_URI, EXT_TRIGGERS_URI, GATEWAY_EXTENSIONS, TRIGGER_IN_FLIGHT_STATUSES, TRIGGER_STATUSES, WELL_KNOWN_PATH,
+)
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
 
 
@@ -23,9 +25,12 @@ def _step(timeout: float = 30):
     return s
 
 
-def _env(env_id: str, gateway_url: str):
-    return DeployedEnv(env_id=env_id, env_version=1, gateway_url=gateway_url, mcp_url="",
-                       db_web_url=None, sandbox_id="sb")
+def _env(env_id: str, gateway_url: str, *uris: str):
+    """A record whose stored card is the gateway's, offering only `uris` when given."""
+    extensions = [e for e in GATEWAY_EXTENSIONS if not uris or e["uri"] in uris]
+    return DeployedGatewayEnv(env_id=env_id, env_version=1, gateway_url=gateway_url, mcp_url="",
+                       db_web_url=None, sandbox_id="sb", environment_card_url=f"{gateway_url}{WELL_KNOWN_PATH}",
+                       environment_card={"capabilities": {"extensions": extensions}})
 
 
 def _ctx(*envs):
@@ -40,7 +45,10 @@ def _resp(status: int, body: dict, method: str = "GET") -> httpx.Response:
 
 @pytest.mark.asyncio
 async def test_snapshot_shape_multi_env():
-    async def fake_get(self, url, timeout):
+    sent = []
+
+    async def fake_get(self, url, timeout, params=None):
+        sent.append((url, params, timeout))
         return _resp(200, {"triggers": [{"id": "v6-rate", "status": "fired"},
                                         {"id": "v6-accept", "status": "armed"}]})
 
@@ -50,14 +58,15 @@ async def test_snapshot_shape_multi_env():
 
     assert snap == {"env-a": {"v6-rate": "fired", "v6-accept": "armed"},
                     "env-b": {"v6-rate": "fired", "v6-accept": "armed"}}
+    assert sent == [("http://gw-a/triggers/state", {}, 15), ("http://gw-b/triggers/state", {}, 15)]
 
 
 @pytest.mark.asyncio
-async def test_404_maps_to_empty():
-    async def fake_get(self, url, timeout):
-        return _resp(404, {})
+async def test_an_env_whose_card_offers_no_triggers_state_reads_as_empty_with_no_request():
+    async def fake_get(self, url, timeout, params=None):
+        raise AssertionError("no request for an env whose card offers no triggers state")
 
-    ctx = _ctx(_env("env-x", "http://gw-x"))
+    ctx = _ctx(_env("env-x", "http://gw-x", EXT_CLOCK_URI))
     with patch.object(httpx.AsyncClient, "get", fake_get):
         snap = await _step()._read_env_triggers(ctx)
 
@@ -65,8 +74,20 @@ async def test_404_maps_to_empty():
 
 
 @pytest.mark.asyncio
+async def test_a_404_from_an_advertised_triggers_state_fails_closed():
+    async def fake_get(self, url, timeout, params=None):
+        return _resp(404, {})
+
+    ctx = _ctx(_env("env-x", "http://gw-x"))
+    with patch.object(httpx.AsyncClient, "get", fake_get), \
+         patch("agent_env.task_step.task_steps.prompt_agent.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(RuntimeError, match="fail-closed: could not read /triggers/state for env 'env-x'"):
+            await _step()._read_env_triggers(ctx)
+
+
+@pytest.mark.asyncio
 async def test_fail_closed_raises_on_persistent_error():
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         raise httpx.ConnectError("gateway down")
 
     ctx = _ctx(_env("env-x", "http://gw-x"))
@@ -80,7 +101,7 @@ async def test_fail_closed_raises_on_persistent_error():
 async def test_retries_then_succeeds():
     calls = {"n": 0}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectError("transient")
@@ -92,6 +113,22 @@ async def test_retries_then_succeeds():
         snap = await _step()._read_env_triggers(ctx)
 
     assert snap == {"env-x": {"t": "fired"}} and calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_triggers_state_is_read_at_the_stored_cards_address():
+    sent = []
+
+    async def fake_get(self, url, timeout, params=None):
+        sent.append(url)
+        return _resp(200, {"triggers": []})
+
+    env = _env("env-x", "http://gw-x")
+    env.environment_card_url = f"https://sandbox.example/sb-1{WELL_KNOWN_PATH}"
+    with patch.object(httpx.AsyncClient, "get", fake_get):
+        await _step()._read_env_triggers(_ctx(env))
+
+    assert sent == ["https://sandbox.example/sb-1/triggers/state"]
 
 
 # ---- _decide ----------------------------------------------------------------
@@ -172,10 +209,10 @@ def _capture_step():
     return s
 
 
-def _patched_store(store=None):
+def _patched_store(store=None, *, key_prefix=""):
     from types import SimpleNamespace
     store = store if store is not None else _FakeStore()
-    cfg = SimpleNamespace(get_object_store=lambda: store)
+    cfg = SimpleNamespace(get_object_store=lambda: store, get_artifact_key_prefix=lambda: key_prefix)
     return store, patch("agent_env.task_step.task_steps.prompt_agent.get_config", return_value=cfg)
 
 
@@ -183,7 +220,7 @@ def _patched_store(store=None):
 async def test_capture_uploads_state_and_records_summary():
     calls = {"n": 0}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         if url.endswith("/clock/state"):
             return _resp(200, _CLOCK)
         calls["n"] += 1
@@ -218,9 +255,26 @@ async def test_capture_uploads_state_and_records_summary():
 
 
 @pytest.mark.asyncio
+async def test_capture_is_kept_under_the_fixture_prefix():
+    async def fake_get(self, url, timeout, params=None):
+        return _resp(200, _CLOCK if url.endswith("/clock/state") else _STATE)
+
+    ctx = TaskStepContext(
+        deployed_envs=[_env("env-a", "http://gw-a")], deployed_agents=[], instance_id="inst-1",
+        metadata={"env_trigger_registrations": [
+            {"step_id": "reg-1", "env_id": "env-a", "added": ["v6-rate"], "executor_agent_name": None}]})
+
+    store, cfg_patch = _patched_store(key_prefix="fx/")
+    with patch.object(httpx.AsyncClient, "get", fake_get), cfg_patch:
+        await _capture_step()._persist_env_trigger_state(ctx)
+
+    assert store.puts[0]["key"].startswith("fx/env_trigger_state/instance_id=inst-1/env-a-")
+
+
+@pytest.mark.asyncio
 async def test_capture_records_clock_context_and_per_trigger_detail():
     """A recurrence reads "armed" forever, so only fire_count shows it fired."""
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         return _resp(200, _CLOCK if url.endswith("/clock/state") else _CLOCK_STATE)
 
     ctx = TaskStepContext(
@@ -259,7 +313,7 @@ async def test_capture_distinguishes_a_failed_coupling_from_one_that_never_fired
          "failure_count": 2, "last_failure_at": "2026-06-01T12:00:00Z"},
     ]}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         return _resp(200, _CLOCK if url.endswith("/clock/state") else failed)
 
     ctx = TaskStepContext(
@@ -289,7 +343,7 @@ async def test_capture_does_not_wait_on_a_firing_recurring_clock_trigger():
          "status": "firing", "fire_count": 3, "next_mark": "2026-06-03T00:00:00Z"}]}
     calls = {"n": 0}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         if url.endswith("/clock/state"):
             return _resp(200, _CLOCK)
         calls["n"] += 1
@@ -311,8 +365,8 @@ async def test_capture_does_not_wait_on_a_firing_recurring_clock_trigger():
 
 @pytest.mark.asyncio
 async def test_capture_tolerates_a_gateway_without_clock_state():
-    """No clock/v1: capture still succeeds, clock recorded as None."""
-    async def fake_get(self, url, timeout):
+    """An unreachable clock state: capture still succeeds, clock recorded as None."""
+    async def fake_get(self, url, timeout, params=None):
         if url.endswith("/clock/state"):
             raise httpx.ConnectError("no clock route")
         return _resp(200, _STATE)
@@ -337,6 +391,50 @@ async def test_capture_tolerates_a_gateway_without_clock_state():
                                             "failure_count": None, "last_failure_at": None}
     # ...and finality is UNKNOWN, never a false "complete" claim (no `type` to reason from)
     assert entry["capture_is_final"] is None
+
+
+@pytest.mark.asyncio
+async def test_capture_records_no_clock_with_no_request_when_the_card_offers_no_clock_state():
+    sent = []
+
+    async def fake_get(self, url, timeout, params=None):
+        sent.append(url)
+        return _resp(200, _STATE)
+
+    ctx = TaskStepContext(
+        deployed_envs=[_env("env-a", "http://gw-a", EXT_TRIGGERS_URI)], deployed_agents=[], instance_id="inst-1",
+        metadata={"env_trigger_registrations": [
+            {"step_id": "reg-1", "env_id": "env-a", "added": ["v6-rate"], "executor_agent_name": None}]})
+
+    store, cfg_patch = _patched_store()
+    with patch.object(httpx.AsyncClient, "get", fake_get), cfg_patch:
+        await _capture_step()._persist_env_trigger_state(ctx)
+
+    import json as _json
+    assert _json.loads(store.puts[0]["data"])["clock"] is None
+    assert sent == ["http://gw-a/triggers/state"]
+
+
+@pytest.mark.asyncio
+async def test_capture_reads_triggers_and_clock_at_the_stored_cards_address():
+    sent = []
+
+    async def fake_get(self, url, timeout, params=None):
+        sent.append((url, timeout))
+        return _resp(200, _CLOCK if url.endswith("/clock/state") else _STATE)
+
+    env = _env("env-a", "http://gw-a")
+    env.environment_card_url = f"https://sandbox.example/sb-1{WELL_KNOWN_PATH}"
+    ctx = TaskStepContext(
+        deployed_envs=[env], deployed_agents=[], instance_id="inst-1",
+        metadata={"env_trigger_registrations": [
+            {"step_id": "reg-1", "env_id": "env-a", "added": ["v6-rate"], "executor_agent_name": None}]})
+
+    store, cfg_patch = _patched_store()
+    with patch.object(httpx.AsyncClient, "get", fake_get), cfg_patch:
+        await _capture_step()._persist_env_trigger_state(ctx)
+
+    assert sent == [("https://sandbox.example/sb-1/triggers/state", 15), ("https://sandbox.example/sb-1/clock/state", 5)]
 
 
 # ---- back-compat: a new worker routinely talks to an env on an older gateway image ------------
@@ -383,7 +481,7 @@ def test_settle_poll_still_waits_for_a_bounded_recurrence():
 async def test_capture_noop_without_registrations():
     calls = {"n": 0}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         calls["n"] += 1
         return _resp(200, _STATE)
 
@@ -397,7 +495,7 @@ async def test_capture_noop_without_registrations():
 
 @pytest.mark.asyncio
 async def test_capture_fail_open_records_error():
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         raise httpx.ConnectError("gateway gone")
 
     ctx = TaskStepContext(
@@ -421,7 +519,7 @@ async def test_capture_grace_polls_until_settled():
     responses = [firing, _STATE]
     calls = {"n": 0}
 
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         if url.endswith("/clock/state"):
             return _resp(200, _CLOCK)
         body = responses[min(calls["n"], len(responses) - 1)]
@@ -467,7 +565,7 @@ async def test_capture_budget_bounds_total_time():
 
 @pytest.mark.asyncio
 async def test_capture_put_failure_keeps_inline_summary():
-    async def fake_get(self, url, timeout):
+    async def fake_get(self, url, timeout, params=None):
         return _resp(200, _STATE)
 
     class _FailingStore(_FakeStore):

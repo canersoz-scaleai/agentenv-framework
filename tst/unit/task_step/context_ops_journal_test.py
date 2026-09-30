@@ -4,6 +4,7 @@ context rebuilt from the store gets its secrets regrafted."""
 
 from __future__ import annotations
 
+from agent_env.task.task import _rebuild_context
 from agent_env.task_step.context import TaskStepContext, regraft_redacted_keys
 from agent_env.task_step.context_ops import ContextUpdateOps, build_context_update_ops
 
@@ -73,3 +74,12 @@ def test_regraft_never_overwrites_a_value_the_rebuild_did_write():
     stored = {"auth": "a-real-scalar"}
     regraft_redacted_keys(live, stored)
     assert stored == {"auth": "a-real-scalar"}
+
+
+def test_the_judge_key_never_reaches_the_store_but_survives_a_rebuild():
+    live = TaskStepContext(metadata={"user_overrides": {"judge_litellm_api_key": "sk-judge", "priority": 1}})
+    stored = live.to_safe_dict()
+    assert stored["metadata"]["user_overrides"] == {"priority": 1}
+    assert "sk-judge" not in repr(build_context_update_ops(None, live).to_journal_dict())
+    _rebuild_context(live, stored)
+    assert live.metadata["user_overrides"] == {"judge_litellm_api_key": "sk-judge", "priority": 1}

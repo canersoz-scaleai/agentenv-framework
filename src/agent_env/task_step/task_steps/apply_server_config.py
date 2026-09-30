@@ -6,11 +6,11 @@ gateway. Extensions are advertised on the server's ``EnvironmentCard`` (served a
 ``/.well-known/agent-env.json``) under ``capabilities.extensions[]`` and invoked
 at their advertised REST endpoint (e.g. ``/agentenv/ext/set_errors``).
 
-Config lives on the backing server, not on the gateway itself, so each server is
-addressed through the gateway's REST reverse-proxy prefix
-``{gateway_url}/svc/mcp-{service}`` (the same ``mcp-<service>`` key the gateway
-registers in ``REST_PROXY_URLS``). The agent never sees the card or these
-endpoints; only this harness step invokes them.
+Config lives on the backing server, not on the gateway itself. Each server's card
+comes from the env card stored on the deployed record, whose extension endpoints the
+gateway has already rewritten to its ``/svc/mcp-{service}`` proxy; a record without a
+stored card reads it live there. The agent never sees the card or these endpoints;
+only this harness step invokes them.
 """
 
 from __future__ import annotations
@@ -26,11 +26,6 @@ from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
 logger = logging.getLogger(__name__)
-
-# Prefix the gateway registers per backing MCP server in REST_PROXY_URLS
-# (gateway_provider.py: ``mcp-{environment_name}=...``). The server's card + extension
-# endpoints are reached through the gateway proxy at this prefix.
-_SVC_PROXY_PREFIX = "svc/mcp-"
 
 
 class ApplyServerConfigError(RuntimeError):
@@ -114,8 +109,9 @@ class ApplyServerConfigStep(TaskStep):
         # server's card is skipped (recorded) instead of failing the step. Use
         # for broadcast directives applied across every service in an env (e.g.
         # set_acting_user), where some services may not opt into the extension.
-        # A card-fetch failure or an extension that IS advertised but rejects
-        # the args (e.g. unresolvable persona) still fails loud regardless.
+        # A failing live card read or an extension that IS advertised but rejects
+        # the args (e.g. unresolvable persona) still fails loud regardless; a child
+        # env missing from the stored card is skipped (no_env_card).
         self.tolerate_unadvertised = tolerate_unadvertised
 
     def to_dict(self) -> dict:
@@ -175,13 +171,6 @@ class ApplyServerConfigStep(TaskStep):
                 expanded.append(ConfigDirective(service=svc, uri=d.uri, args=d.args))
         return expanded
 
-    def _service_base_url(self, gateway_url: str, service: str) -> str:
-        """Base URL for a backing server's card + extension endpoints, reached
-        through the gateway REST proxy. ``invoke_extension``/``get_card`` append
-        the card path and the advertised endpoint (both leading-slash), so no
-        trailing slash here."""
-        return f"{gateway_url.rstrip('/')}/{_SVC_PROXY_PREFIX}{service}"
-
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
@@ -208,30 +197,27 @@ class ApplyServerConfigStep(TaskStep):
                 f"Failed to expand broadcast directives for env {self.env_id!r}: "
                 f"{type(e).__name__}: {e}"
             ) from e
-        # Cache one card fetch per service — a task typically sets several
-        # directives (e.g. errors on multiple tools) against the same server.
-        # A cached None marks a service that serves no card (404 on the
-        # well-known path): a server predating env-card support.
-        cards: dict[str, Optional[dict]] = {}
+        from agent_env.env import legacy_protocol
+        from agent_env.env.env import gateway_url_of
+
+        # One card per service — a task typically sets several directives (e.g. errors on
+        # multiple tools) against the same server. A None card marks a child env with no
+        # card: a server predating env-card support, one whose card name differs, or one
+        # whose card the deploy couldn't read.
+        cards: dict[str, tuple[str, Optional[dict]]] = {}
         for directive in directives:
-            base_url = self._service_base_url(deployed.gateway_url, directive.service)
             try:
                 if directive.service not in cards:
-                    try:
-                        cards[directive.service] = await protocol_v1.get_card(
-                            base_url, timeout=self.timeout_seconds
-                        )
-                    except httpx.HTTPStatusError as e:
-                        # 404 = no card served: the "hasn't opted in" case
-                        # tolerate_unadvertised covers for a missing extension
-                        # (cf. protocol_v1.supports_v1). Skip under the flag;
-                        # other statuses are real faults and still fail.
-                        if e.response.status_code == 404 and self.tolerate_unadvertised:
-                            cards[directive.service] = None
-                        else:
-                            raise
-                card = cards[directive.service]
+                    cards[directive.service] = await legacy_protocol.child_env_card(
+                        deployed, gateway_url_of(deployed), directive.service, timeout=self.timeout_seconds
+                    )
+                base_url, card = cards[directive.service]
                 if card is None:
+                    if not self.tolerate_unadvertised:
+                        raise ApplyServerConfigError(
+                            f"Service {directive.service!r} has no env card (env={self.env_id}), so {directive.uri!r} "
+                            f"can't be applied: it serves none, its card isn't named {directive.service!r}, or the deploy couldn't read it"
+                        )
                     logger.warning(
                         f"apply_server_config: service {directive.service!r} serves no "
                         f"environment card (env={self.env_id}); skipping {directive.uri!r} "

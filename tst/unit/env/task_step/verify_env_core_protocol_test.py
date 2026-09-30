@@ -1,9 +1,14 @@
 """Unit tests for VerifyCoreEnvironmentProtocolStep."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agent_env.env.env import DeployedEnv
+import httpx
+import pytest
+
+from agent_env.env.env import DeployedGatewayEnv
+from agent_env.env.gateway.constants import WELL_KNOWN_PATH
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.env_card_validator.verify_env_core_protocol import VerifyCoreEnvironmentProtocolStep
 
@@ -21,9 +26,9 @@ def _make_step():
 
 def _make_context():
     ctx = TaskStepContext()
-    ctx.deployed_envs = [DeployedEnv(
+    ctx.deployed_envs = [DeployedGatewayEnv(
         env_id="e1", env_version=3, gateway_url="https://gw", mcp_url="https://gw/mcp",
-        db_web_url=None, sandbox_id="sb",
+        db_web_url=None, sandbox_id="sb", environment_card_url=f"https://gw{WELL_KNOWN_PATH}",
     )]
     return ctx
 
@@ -137,6 +142,36 @@ class TestProbeOperation:
 
     def test_result_means_registered(self):
         assert _probe({"jsonrpc": "2.0", "id": 1, "result": {"parts": []}}) is True
+
+
+class TestWire:
+    @pytest.mark.parametrize("gateway_url", ["https://gw", "https://gw/", "https://sandbox.example.com/sandbox/sandbox-vm-1-18765"])
+    def test_reads_the_card_and_probes_the_data_plane_at_the_cards_address(self, gateway_url):
+        base = gateway_url.rstrip("/")
+        ctx = TaskStepContext(deployed_envs=[DeployedGatewayEnv(
+            env_id="e1", env_version=3, gateway_url=gateway_url, mcp_url=f"{base}/mcp", db_web_url=None, sandbox_id="sb",
+            environment_card_url=f"{gateway_url}{WELL_KNOWN_PATH}",
+        )])
+        sent = []
+
+        def handle(request):
+            sent.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json=CARD)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"parts": []}})
+
+        real = httpx.AsyncClient
+        fake_env = MagicMock(metadata={})
+        with patch.object(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle))), \
+             patch("agent_env.env.env.Env.get", return_value=fake_env):
+            asyncio.run(_make_step().execute(ctx))
+        assert [(r.method, str(r.url)) for r in sent] == [
+            ("GET", f"{base}{WELL_KNOWN_PATH}"), ("POST", f"{base}/agentenv"), ("POST", f"{base}/agentenv"),
+        ]
+        assert [(b["method"], b["params"]) for b in (json.loads(r.content) for r in sent[1:])] == [("data/add", {"parts": []}), ("data/get", {})]
+        assert fake_env.update_metadata.call_args[0][0]["validated_environment_protocol"] == {
+            "data/reset": {"supported": True}, "data/add": {"supported": True}, "data/get": {"supported": True},
+        }
 
 
 class TestSerialization:

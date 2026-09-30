@@ -6,13 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 
 
 def _deployed_env(metadata):
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id="art-1",
         env_version=2,
         gateway_url="http://gw",
@@ -82,7 +82,7 @@ def test_env_state_type_roundtrips_through_serialization():
 
 @pytest.mark.asyncio
 async def test_execute_threads_env_state_type_to_deploy():
-    """The step's env_state_type reaches env.deploy — so Temporal/Task.run deploys can target
+    """The step's env_state_type reaches env.deploy — so Task.run deploys can target
     remote_postgres, not just the CLI."""
     env = _fake_env(_deployed_env(None))
     step = DeployEnvTaskStep(
@@ -131,7 +131,7 @@ def test_env_state_instance_id_roundtrips_through_serialization():
 
 @pytest.mark.asyncio
 async def test_execute_threads_env_state_instance_id_to_deploy():
-    """The step's env_state_instance_id reaches env.deploy — so Temporal/Task.run can deploy the
+    """The step's env_state_instance_id reaches env.deploy — so Task.run can deploy the
     persistent backend (which requires it), at parity with `env deploy --env-state-instance-id`."""
     env = _fake_env(_deployed_env(None))
     step = DeployEnvTaskStep(
@@ -170,13 +170,8 @@ async def test_execute_omits_env_state_instance_id_when_unset():
 
 
 # --- Instance-record annotations ---------------------------------------------
-# create_instance runs INSIDE env.deploy(), so assigning to deployed_env.metadata
-# after deploy() returns lands on the in-memory object only and never reaches
-# Mongo — which is why instance records showed metadata=null even though
-# deploy_step_id was always set. These pin that annotations are persisted, and
-# that the deploying identity is among them: env-scoped destructive operations
-# (a universe load) authorize against it, so it must be on the record itself
-# rather than reconstructed later from run documents.
+# create_instance runs inside env.deploy(), so an annotation assigned to
+# deployed_env.metadata afterwards reaches the record only if it is persisted.
 
 _UPDATE_TARGET = "agent_env.task_step.task_steps.deploy_env.update_env_instance_metadata"
 
@@ -186,40 +181,29 @@ async def test_execute_persists_annotations_to_the_instance_record():
     deployed_env = _deployed_env(None)
     deployed_env.instance_id = "art-1-abcd1234"
     step = DeployEnvTaskStep(id="t-1.deploy_env", version=None, env_id="art-1", env_version=2)
-    context = TaskStepContext(
-        metadata={"agent_env_hub": {"caller": "copilot", "oauth_subject": "sub-42"}}
-    )
 
     with patch("agent_env.env.env.Env") as Env, patch(_UPDATE_TARGET) as update:
         Env.get.return_value = _fake_env(deployed_env)
-        await step.execute(context)
+        await step.execute(TaskStepContext())
 
-    update.assert_called_once()
-    instance_id, values = update.call_args.args
-    assert instance_id == "art-1-abcd1234"
-    assert values["deployed_by_oauth_subject"] == "sub-42"
-    assert values["deploy_step_id"] == "t-1.deploy_env"
-    # Still on the in-memory object too, for same-run consumers.
-    assert deployed_env.metadata["deployed_by_oauth_subject"] == "sub-42"
+    update.assert_called_once_with("art-1-abcd1234", {"deploy_step_id": "t-1.deploy_env"})
+    assert deployed_env.metadata["deploy_step_id"] == "t-1.deploy_env"
 
 
 @pytest.mark.asyncio
-async def test_execute_omits_the_owner_when_no_subject_was_carried():
-    # A run started without a verified subject (an S2S caller, or a non-hub entry
-    # point) must not stamp a bogus owner: a wrong owner is worse than none, since
-    # it would refuse the person who actually deployed the env.
+async def test_execute_copies_no_run_metadata_onto_the_instance_record():
     deployed_env = _deployed_env(None)
     deployed_env.instance_id = "art-1-abcd1234"
     step = DeployEnvTaskStep(id="t-1.deploy_env", version=None, env_id="art-1", env_version=2)
-    context = TaskStepContext(metadata={"agent_env_hub": {"caller": "copilot"}})
+    context = TaskStepContext(metadata={"platform": {"caller": "c", "subject": "sub-42"}})
 
     with patch("agent_env.env.env.Env") as Env, patch(_UPDATE_TARGET) as update:
         Env.get.return_value = _fake_env(deployed_env)
         await step.execute(context)
 
     _, values = update.call_args.args
-    assert "deployed_by_oauth_subject" not in values
-    assert values["deploy_step_id"] == "t-1.deploy_env"
+    assert values == {"deploy_step_id": "t-1.deploy_env"}
+    assert deployed_env.metadata == {"deploy_step_id": "t-1.deploy_env"}
 
 
 @pytest.mark.asyncio
@@ -245,13 +229,96 @@ async def test_execute_merges_annotations_into_metadata_deploy_set():
     deployed_env = _deployed_env({"deployed_agent_hint": "keep-me"})
     deployed_env.instance_id = "art-1-abcd1234"
     step = DeployEnvTaskStep(id="t-1.deploy_env", version=None, env_id="art-1", env_version=2)
-    context = TaskStepContext(metadata={"agent_env_hub": {"oauth_subject": "sub-42"}})
 
     with patch("agent_env.env.env.Env") as Env, patch(_UPDATE_TARGET):
         Env.get.return_value = _fake_env(deployed_env)
-        await step.execute(context)
+        await step.execute(TaskStepContext())
 
-    assert deployed_env.metadata["deployed_agent_hint"] == "keep-me"
-    assert deployed_env.metadata["deployed_by_oauth_subject"] == "sub-42"
+    assert deployed_env.metadata == {
+        "deployed_agent_hint": "keep-me",
+        "deploy_step_id": "t-1.deploy_env",
+    }
 
 
+
+
+# --- preflight: an option the step's env would refuse at deploy is a save-time problem ---
+
+
+@pytest.mark.parametrize("options, refused", [
+    ({"gateway_mode": "consistent"}, "gateway_mode"),
+    ({"env_state_type": "remote_postgres"}, "env_state_type"),
+    ({"env_state_instance_id": "st-1"}, "env_state_instance_id"),
+    ({"gateway_mode": "consistent", "env_state_type": "remote_postgres"}, "gateway_mode, env_state_type"),
+], ids=["consistent", "state-type", "state-instance", "both"])
+def test_preflight_reports_an_option_a_server_env_would_refuse(options, refused):
+    # The same words deploy() raises, so a save-time problem reads like the deploy-time one.
+    assert _preflight(_mcp_env("server"), **options) == [
+        f"deploy_env 'd': env 'mcp-email' has env_provider_type 'server', which doesn't take {refused}"]
+
+
+@pytest.mark.parametrize("kind, options", [
+    ("server", {"sandbox_type": "modal", "ttl_seconds": 60, "cpu": 2.0, "memory_mb": 4096, "disk_size_gb": 40, "priority": 1}),
+    ("gateway", {"gateway_mode": "consistent", "env_state_type": "remote_postgres", "env_state_instance_id": "st-1"}),
+    ("other", {"gateway_mode": "consistent", "env_state_type": "remote_postgres"}),
+], ids=["server-sizing", "gateway-env", "other-env-type"])
+def test_preflight_passes_what_the_env_takes(kind, options):
+    env = MagicMock() if kind == "other" else _mcp_env(kind)
+    assert _preflight(env, **options) == []
+
+
+@pytest.mark.parametrize("kind", ["server", "gateway", "other"])
+@pytest.mark.parametrize("mode", ["bogus", "Performance", None])
+def test_preflight_reports_an_invalid_gateway_mode_for_every_env(kind, mode):
+    env = MagicMock() if kind == "other" else _mcp_env(kind)
+    assert _preflight(env, gateway_mode=mode) == [f"deploy_env 'd': {mode!r} is not a valid GatewayMode"]
+
+
+def test_preflight_reports_a_missing_env():
+    from agent_env.store.base import NotFoundError
+
+    with patch("agent_env.env.env.Env.get", side_effect=NotFoundError("Env gone not found")):
+        assert DeployEnvTaskStep(id="d", version=None, env_id="gone").preflight() == ["deploy_env 'd': env 'gone' can't be loaded: Env gone not found"]
+
+
+@pytest.mark.parametrize("doc", [
+    {"id": "e", "version": 1, "type": "coding_task_harbor", "metadata": {}},
+    {"id": "e", "version": 1, "type": "mcp_server", "docker_image_artifact": {"id": "img", "version": 1}, "environment_name": "email",
+     "env_provider_type": "sidecar", "metadata": {}},
+], ids=["unregistered-type", "unknown-env-provider-type"])
+def test_preflight_reports_an_env_this_process_cannot_load(doc):
+    from agent_env.env.store import get_env_store
+
+    # The store's own loader, so the error is the one a real save meets.
+    with patch("agent_env.env.env.Env.get", side_effect=lambda *_: get_env_store()._deserialize(dict(doc))), \
+            patch("agent_env.artifact.Artifact.get", return_value=MagicMock()):
+        [problem] = DeployEnvTaskStep(id="d", version=None, env_id="e").preflight()
+    assert problem.startswith("deploy_env 'd': env 'e' can't be loaded: ")
+
+
+def test_preflight_lets_infrastructure_errors_propagate():
+    with patch("agent_env.env.env.Env.get", side_effect=RuntimeError("store down")), pytest.raises(RuntimeError, match="store down"):
+        DeployEnvTaskStep(id="d", version=None, env_id="mcp-email").preflight()
+
+
+def test_a_task_reports_only_its_refused_deploy_step():
+    from agent_env.task import Task
+
+    task = Task(id="t", version=None, steps=[
+        DeployEnvTaskStep(id="ok", version=None, env_id="mcp-email"),
+        DeployEnvTaskStep(id="bad", version=None, env_id="mcp-email", gateway_mode="consistent"),
+    ])
+    with patch("agent_env.env.env.Env.get", return_value=_mcp_env("server")):
+        assert task.preflight() == ["deploy_env 'bad': env 'mcp-email' has env_provider_type 'server', which doesn't take gateway_mode"]
+
+
+def _mcp_env(env_provider_type: str):
+    from agent_env.env.envs.mcp_server import MCPServerEnv
+
+    return MCPServerEnv(id="mcp-email", version=1, docker_image_artifact=MagicMock(), environment_name="email",
+                        env_provider_type=env_provider_type)
+
+
+def _preflight(env, **options) -> list[str]:
+    with patch("agent_env.env.env.Env.get", return_value=env):
+        return DeployEnvTaskStep(id="d", version=None, env_id="mcp-email", **options).preflight()

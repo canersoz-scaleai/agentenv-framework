@@ -1,46 +1,38 @@
 """Deploy A2A agent task step."""
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import ClassVar, Optional
-from urllib.parse import parse_qs, urlparse
 
 import httpx
+from agentenv_protocol.a2a_agent import (
+    NamespaceChangelogEnableResponse,
+    ObjectChangelogApplyResponse,
+    ObjectSnapshotLoadResponse,
+)
 
 from agent_env.a2a_agent import protocol
-from agent_env.env.env import DeployedEnv, Env
-from agent_env.providers.sandbox_provider import reachable_url, sandbox_request_headers_for_url
-from agent_env.providers.sandbox import NetworkPolicy
+from agent_env.a2a_agent.object_transfer import (
+    REPLY_TIMEOUT_SECONDS,
+    TRANSFER_TIMEOUT_SECONDS,
+    bounded_echo,
+    changelog_apply_call,
+    changelog_enable_call,
+    check_changelog_applied,
+    invoke_transfer,
+    snapshot_load_call,
+)
+from agent_env.config import get_config
+from agent_env.env.env import DeployedEnv, DeployedSandboxEnv, Env
+from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url, sandbox_request_headers_for_url
+from agent_env.providers.sandbox_providers.sandbox import NetworkPolicy
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
-from agent_env.attribution import attribution_of, metadata_from_legacy_document
+from agent_env.attribution import deploy_attribution
 
 logger = logging.getLogger(__name__)
-
-
-# Re-sign with this much buffer left on the original URL. 2h covers a worst-case
-# task: the workspace tarball can be fetched again later in the run (snapshot save
-# round-trip, mid-task /ext/snapshot reloads, retried activities), and any of
-# those need the URL to still be valid an hour or two after deploy_agent ran.
-_PRESIGN_REFRESH_BUFFER_SECONDS = 2 * 3600
-# 7 days is the SigV4 max for IAM-credentialed presigning.
-_PRESIGN_REFRESH_TTL_SECONDS = 7 * 24 * 3600
-
-
-async def _card_name(client: httpx.AsyncClient, card_url: str | None) -> str | None:
-    """The MCP server name from the env's card; None without a card."""
-    if not card_url:
-        return None
-    try:
-        resp = await client.get(card_url, timeout=30)
-        resp.raise_for_status()
-        name = resp.json().get("name")
-        return name if isinstance(name, str) and name else None
-    except Exception as e:
-        logger.warning(f"Could not read the environment card at {card_url}: {e!r}")
-        return None
 
 
 def _mcp_add_body(mcp_ext: dict, url: str, headers: dict | None, card_name: str | None) -> dict:
@@ -55,7 +47,9 @@ def _mcp_add_body(mcp_ext: dict, url: str, headers: dict | None, card_name: str 
 
 
 def _choose_mcp_url(agent, env) -> str:
-    """The env's MCP URL, as reachable from wherever the agent runs."""
+    """The env's MCP URL, as reachable from wherever the agent runs; an env outside our sandboxes gives its own."""
+    if not isinstance(env, DeployedSandboxEnv):
+        return env.mcp_url
     return reachable_url(env.mcp_url, from_sandbox_type=env.sandbox_type, to_sandbox_type=agent.sandbox_type)
 
 
@@ -74,71 +68,18 @@ def _live_mcp_url(env_id: str) -> str:
     return url.strip()
 
 
-def _maybe_resign_presigned_url(url: str) -> str:
-    """If ``url`` is a presigned S3 GET URL near expiry, re-sign it.
-
-    Why: sandbox pods can't reach the agent-env artifact bucket (their IAM,
-    `sandbox-pods-sa`, only covers the sandbox user-artifacts bucket), so
-    the hub upserts a long-lived presigned URL as `bundle_s3_url`. If the
-    URL was minted >7 days ago it's expired and the sidecar gets 403.
-    The agent-env worker has the cross-account perms to re-sign at deploy
-    time, which is the right boundary.
-
-    Pass-through for non-presigned URLs (raw `s3://`, plain HTTPS, other
-    schemes).
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return url
-    qs = parse_qs(parsed.query)
-    amz_date = (qs.get("X-Amz-Date") or [None])[0]
-    amz_expires_str = (qs.get("X-Amz-Expires") or [None])[0]
-    if not amz_date or not amz_expires_str:
-        # Not a SigV4 presigned URL — leave alone.
-        return url
-    try:
-        signed_at = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        expires_at = signed_at.timestamp() + int(amz_expires_str)
-    except (ValueError, TypeError):
-        logger.warning("Could not parse presigned URL expiry; passing through")
-        return url
-
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if expires_at - now_ts > _PRESIGN_REFRESH_BUFFER_SECONDS:
-        return url
-
-    # Recover bucket + key from the URL host/path. SigV4 presigned URLs use
-    # virtual-hosted-style: `https://<bucket>.s3.<region>.amazonaws.com/<key>`.
-    host_parts = parsed.netloc.split(".")
-    if len(host_parts) < 4 or host_parts[1] != "s3":
-        logger.warning(
-            "Presigned URL near expiry but host shape unexpected (%s); passing through", parsed.netloc,
-        )
-        return url
-    bucket = host_parts[0]
-    # Region sits at index 2 for virtual-hosted URLs like
-    # <bucket>.s3.<region>.amazonaws.com; fall back to None so boto3 uses
-    # the environment default if the URL shape is unusual.
-    region = host_parts[2] if len(host_parts) >= 5 else None
-    key = parsed.path.lstrip("/")
-    if not bucket or not key:
-        logger.warning("Could not extract bucket/key from presigned URL; passing through")
-        return url
-
-    import boto3
-    fresh = boto3.client("s3", region_name=region).generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=_PRESIGN_REFRESH_TTL_SECONDS,
-    )
-    logger.info(
-        "Re-signed presigned bundle URL (was expiring at %s, now valid for %ds) bucket=%s key=%s",
-        datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
-        _PRESIGN_REFRESH_TTL_SECONDS,
-        bucket,
-        key,
-    )
-    return fresh
+def _skill_fields(skill: dict) -> dict:
+    """A ``skills`` entry as ``A2AAgent.register_skill`` arguments. ``content`` and ``s3_uri`` are
+    older names for ``skill_md`` and ``skill_s3_url``; ``skill_md`` is sent verbatim."""
+    skill_md = skill.get("skill_md", skill.get("content"))
+    return {
+        "name": skill.get("name", ""),
+        "description": skill.get("description", ""),
+        "skill_md": skill_md,
+        "object_url": (
+            skill.get("skill_s3_url", skill.get("s3_uri")) if skill_md is None else None
+        ),
+    }
 
 
 class DeployAgentTaskStep(TaskStep):
@@ -186,6 +127,7 @@ class DeployAgentTaskStep(TaskStep):
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         metadata: Optional[dict] = None,
+        agent_changelog_object_url: Optional[str] = None,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         self.env_ids = env_ids or []
@@ -211,10 +153,20 @@ class DeployAgentTaskStep(TaskStep):
         self.network_policy = NetworkPolicy.from_dict(network_policy).to_dict() if network_policy else None
         self.role = role
         self.enable_agent_changelog = enable_agent_changelog
+        self.agent_changelog_object_url = agent_changelog_object_url
         self.agent_changelog_s3_prefix = agent_changelog_s3_prefix
         self.agent_changelog_toolcall_position_exclusive = agent_changelog_toolcall_position_exclusive
-        if self.agent_changelog_toolcall_position_exclusive is not None and not self.agent_changelog_s3_prefix:
-            raise ValueError("agent_changelog_toolcall_position_exclusive requires agent_changelog_s3_prefix")
+        if self.agent_changelog_object_url and self.agent_changelog_s3_prefix:
+            raise ValueError(
+                "set only one of agent_changelog_object_url and "
+                "agent_changelog_s3_prefix"
+            )
+        if self.agent_changelog_toolcall_position_exclusive is not None and not (
+            self.agent_changelog_object_url or self.agent_changelog_s3_prefix
+        ):
+            raise ValueError(
+                "agent_changelog_toolcall_position_exclusive requires a changelog source"
+            )
         self.sandbox_name = sandbox_name
         # Rootless Docker-in-Docker for the agent (not the VM socket); VM mode only.
         self.enable_docker = enable_docker
@@ -244,6 +196,7 @@ class DeployAgentTaskStep(TaskStep):
         base["network_policy"] = self.network_policy
         base["role"] = self.role
         base["enable_agent_changelog"] = self.enable_agent_changelog
+        base["agent_changelog_object_url"] = self.agent_changelog_object_url
         base["agent_changelog_s3_prefix"] = self.agent_changelog_s3_prefix
         base["agent_changelog_toolcall_position_exclusive"] = self.agent_changelog_toolcall_position_exclusive
         base["sandbox_name"] = self.sandbox_name
@@ -273,10 +226,11 @@ class DeployAgentTaskStep(TaskStep):
             agent_snapshot_files_artifact_version=data.get("agent_snapshot_files_artifact_version"),
             agent_snapshot_target_context_id=data.get("agent_snapshot_target_context_id"),
             priority=data.get("priority"),
-            metadata=metadata_from_legacy_document(data),
+            metadata=dict(data.get("metadata") or {}),
             network_policy=data.get("network_policy"),
             role=data.get("role"),
             enable_agent_changelog=data.get("enable_agent_changelog", False),
+            agent_changelog_object_url=data.get("agent_changelog_object_url"),
             agent_changelog_s3_prefix=data.get("agent_changelog_s3_prefix"),
             agent_changelog_toolcall_position_exclusive=data.get("agent_changelog_toolcall_position_exclusive"),
             sandbox_name=data.get("sandbox_name"),
@@ -286,12 +240,11 @@ class DeployAgentTaskStep(TaskStep):
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent
         from agent_env.a2a_agent.a2a_agent import DEFAULT_A2A_PORT
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
             build_sandbox_provider,
             get_sandbox_provider,
         )
-        from agent_env.config import get_config
 
         # Resolved before anything is provisioned so an unbound env fails before a sandbox exists.
         env_deployments = {env_id: self._deployed_env(context, env_id) for env_id in self.env_ids}
@@ -360,15 +313,13 @@ class DeployAgentTaskStep(TaskStep):
             deploy_kwargs["disk_size_gb"] = agent_disk_size_gb
         if resolved_sandbox_type is not None:
             deploy_kwargs["sandbox_type"] = resolved_sandbox_type
-        _ttl_override = user_overrides.get("ttl_seconds")
-        resolved_ttl = _ttl_override if _ttl_override is not None else self.ttl_seconds
-        if resolved_ttl is not None:
-            deploy_kwargs["ttl_seconds"] = resolved_ttl
+        resolved_ttl = self._resolved_ttl_seconds(context)
+        deploy_kwargs["ttl_seconds"] = resolved_ttl
         if self.cpu is not None:
             deploy_kwargs["cpu"] = self.cpu
         if self.memory_mb is not None:
             deploy_kwargs["memory"] = self.memory_mb
-        deploy_kwargs["attribution"] = attribution_of(self)
+        deploy_kwargs["attribution"] = deploy_attribution(self, context)
         _priority_override = user_overrides.get("priority")
         resolved_priority = _priority_override if _priority_override is not None else self.priority
         if resolved_priority is not None:
@@ -386,33 +337,25 @@ class DeployAgentTaskStep(TaskStep):
         card = deployed.agent_card
         logger.info(f"A2A agent '{a2a_agent_id}' deployed at {a2a_url}")
 
-        # Per-server headers the agent sends on MCP requests; Bearer tokens are per-run, never persisted.
-        remote_tokens = user_overrides.get("remote_tokens") or {}
-
-        def _headers_for(url: str, env_id: str) -> dict[str, str] | None:
-            headers: dict[str, str] = dict(sandbox_request_headers_for_url(url))
-            token = remote_tokens.get(env_id)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            return headers or None
-
-        env_mcp_urls: list[tuple[str, str, dict | None, str | None]] = []  # (env_id, url, headers, card_url)
+        env_mcp_urls: list[tuple[str, str, dict | None, str | None]] = []  # (env_id, url, headers, card_name)
         for env_id in self.env_ids:
             deployed_env = env_deployments[env_id]
             if deployed_env is not None:
                 url = _choose_mcp_url(deployed, deployed_env)
-                card_url = deployed_env.environment_card_url
+                card_name = (deployed_env.environment_card or {}).get("name")
+                if not card_name:
+                    logger.warning(f"Env {env_id} has no env card name; the agent will pick its own MCP alias")
             else:
                 url = _live_mcp_url(env_id)
-                card_url = None
-            env_mcp_urls.append((env_id, url, _headers_for(url, env_id), card_url))
+                card_name = None
+            env_mcp_urls.append((env_id, url, sandbox_request_headers_for_url(url) or None, card_name))
 
         mcp_ext = A2AAgent.find_extension(card, A2AAgent.EXT_MCP_CONFIG)
         if mcp_ext and env_mcp_urls:
             endpoint = a2a_url + mcp_ext["params"]["endpoint"]
             async with httpx.AsyncClient() as client:
-                for env_id, mcp_url, headers, card_url in env_mcp_urls:
-                    body = _mcp_add_body(mcp_ext, mcp_url, headers, await _card_name(client, card_url))
+                for env_id, mcp_url, headers, card_name in env_mcp_urls:
+                    body = _mcp_add_body(mcp_ext, mcp_url, headers, card_name)
                     logger.info(f"Registering MCP for env {env_id} via {mcp_url}")
                     resp = await client.post(endpoint, json=body, timeout=180)
                     if resp.status_code >= 400:
@@ -422,23 +365,9 @@ class DeployAgentTaskStep(TaskStep):
 
         skill_ext = A2AAgent.find_extension(card, A2AAgent.EXT_SKILL_CONFIG)
         if skill_ext and self.skills:
-            endpoint = a2a_url + skill_ext["params"]["endpoint"]
-            async with httpx.AsyncClient() as client:
-                for skill in self.skills:
-                    payload = {"name": skill.get("name", ""), "description": skill.get("description", "")}
-                    if "skill_md" in skill:
-                        payload["skill_md"] = skill["skill_md"]
-                    elif "content" in skill:
-                        payload["skill_md"] = skill["content"]
-                    elif "skill_s3_url" in skill:
-                        payload["skill_s3_url"] = skill["skill_s3_url"]
-                    elif "s3_uri" in skill:
-                        payload["skill_s3_url"] = skill["s3_uri"]
-                    resp = await client.post(endpoint, json=payload, timeout=180)
-                    if resp.status_code >= 400:
-                        logger.error(f"Failed to register skill: {resp.status_code} {resp.text}")
-                    resp.raise_for_status()
-                    logger.info(f"Registered skill: {resp.json()}")
+            for skill in self.skills:
+                result = await A2AAgent.register_skill(deployed, **_skill_fields(skill))
+                logger.info(f"Registered skill: {result}")
 
         if self.system_prompt is not None:
             config_ext = A2AAgent.find_extension(card, A2AAgent.EXT_AGENT_CONFIG)
@@ -481,11 +410,13 @@ class DeployAgentTaskStep(TaskStep):
         if self.agent_snapshot_files_artifact_id:
             await self._load_snapshot(a2a_url, card, a2a_agent_id, context)
 
-        if self.agent_changelog_s3_prefix:
+        if self.agent_changelog_object_url or self.agent_changelog_s3_prefix:
             await self._apply_agent_changelog(a2a_url, card, context)
 
         if self.enable_agent_changelog:
-            await self._configure_agent_changelog(a2a_url, card, context)
+            await self._configure_agent_changelog(
+                a2a_url, card, context, expires_in=resolved_ttl
+            )
 
         context.deployed_agents.append(DeployedAgent(
             agent_name=self.agent_name,
@@ -525,12 +456,27 @@ class DeployAgentTaskStep(TaskStep):
             )
         return matches[0] if matches else None
 
-    async def _configure_agent_changelog(self, a2a_url: str, card: dict, context: TaskStepContext) -> None:
+    def _resolved_ttl_seconds(self, context: TaskStepContext) -> int:
+        override = context.metadata.get("user_overrides", {}).get("ttl_seconds")
+        if override is not None:
+            return override
+        if self.ttl_seconds is not None:
+            return self.ttl_seconds
+        return TaskStep.DEFAULT_TTL_SECONDS
+
+    async def _configure_agent_changelog(
+        self,
+        a2a_url: str,
+        card: dict,
+        context: TaskStepContext,
+        *,
+        expires_in: int,
+    ) -> None:
         """Enable whole-writable-layer changelog capture via the snapshot enable-changelog method; records the derived prefix in context.metadata['agent_changelog']."""
         from agent_env.a2a_agent import A2AAgent
-        from agent_env.config import get_config
 
-        method = A2AAgent.extension_method(card, A2AAgent.EXT_SNAPSHOT, A2AAgent.SNAPSHOT_METHOD_ENABLE_CHANGELOG)
+        snapshot_ext = A2AAgent.find_extension(card, A2AAgent.EXT_SNAPSHOT)
+        method, path = A2AAgent.operation(snapshot_ext, A2AAgent.SNAPSHOT_METHOD_ENABLE_CHANGELOG)
         if method is None:
             raise RuntimeError(
                 f"Agent '{self.agent_name}' does not support the snapshot "
@@ -538,50 +484,85 @@ class DeployAgentTaskStep(TaskStep):
             )
         instance_id = (context.instance_id or "noinstance").replace("/", "_")
         agent_name = self.agent_name.replace("/", "_")
-        bucket = get_config().get_s3_bucket()
-        prefix = f"s3://{bucket}/agent_changelog/{instance_id}/{agent_name}"
-        endpoint = a2a_url + method.get("endpoint", "/ext/snapshot/changelog")
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(endpoint, json={"s3_prefix": prefix}, timeout=120)
-            resp.raise_for_status()
-            body = resp.json()
-        entry = {
+        config = get_config()
+        store = config.get_object_store()
+        namespace_url = store.object_url(f"{config.get_artifact_key_prefix()}agent_changelog/{instance_id}/{agent_name}")
+        call = await asyncio.to_thread(
+            changelog_enable_call,
+            method,
+            store,
+            agent_name=self.agent_name,
+            namespace_url=namespace_url,
+            expires_in=expires_in,
+        )
+        answer = await invoke_transfer(
+            a2a_url + path,
+            call,
+            verb="POST",
+            operation="changelog enable",
+            timeout=REPLY_TIMEOUT_SECONDS,
+            response_model=NamespaceChangelogEnableResponse,
+        )
+        if call.mode == "objects":
+            roots, object_url = answer.roots, namespace_url
+        else:
+            roots = answer.get("roots")
+            object_url = bounded_echo(namespace_url, answer.get("s3_prefix") or namespace_url)
+        context.metadata.setdefault("agent_changelog", []).append({
             "agent_name": self.agent_name,
-            "s3_prefix": body.get("s3_prefix", prefix),
-            "roots": body.get("roots"),
-        }
-        context.metadata.setdefault("agent_changelog", []).append(entry)
-        logger.info(f"agent-changelog capture enabled on '{self.agent_name}': {entry['s3_prefix']}")
+            "roots": roots,
+            "transfer_mode": call.mode,
+            "object_url": object_url,
+        })
+        logger.info(f"agent-changelog capture enabled on '{self.agent_name}': {object_url}")
 
     async def _apply_agent_changelog(self, a2a_url: str, card: dict, context: TaskStepContext) -> None:
         """Rewind this fresh agent to a point in a source changelog (fs + conversation) via the snapshot apply-changelog method and resume."""
         from agent_env.a2a_agent import A2AAgent
 
-        method = A2AAgent.extension_method(card, A2AAgent.EXT_SNAPSHOT, A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG)
+        snapshot_ext = A2AAgent.find_extension(card, A2AAgent.EXT_SNAPSHOT)
+        method, path = A2AAgent.operation(snapshot_ext, A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG)
         if method is None:
             raise RuntimeError(
                 f"Agent '{self.agent_name}' does not support the snapshot "
                 f"'{A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG}' method; cannot apply agent changelog"
             )
-        payload: dict = {"s3_prefix": self.agent_changelog_s3_prefix, "resume_conversation": True}
-        if self.agent_changelog_toolcall_position_exclusive is not None:
-            payload["up_to_tool_call_exclusive"] = self.agent_changelog_toolcall_position_exclusive
-        if self.agent_snapshot_target_context_id:
-            payload["target_context_id"] = self.agent_snapshot_target_context_id
-        endpoint = a2a_url + method.get("endpoint", "/ext/snapshot/changelog")
-        async with httpx.AsyncClient() as client:
-            resp = await client.put(endpoint, json=payload, timeout=600)
-            resp.raise_for_status()
-            body = resp.json()
+        store = get_config().get_object_store()
+        source_url = self.agent_changelog_object_url or self.agent_changelog_s3_prefix
+        call = await asyncio.to_thread(
+            changelog_apply_call,
+            method,
+            store,
+            agent_name=self.agent_name,
+            source_url=source_url,
+            portable=bool(self.agent_changelog_object_url),
+            up_to_tool_call_exclusive=self.agent_changelog_toolcall_position_exclusive,
+            resume_conversation=True,
+            target_context_id=self.agent_snapshot_target_context_id,
+        )
+        answer = await invoke_transfer(
+            a2a_url + path,
+            call,
+            verb="PUT",
+            operation="changelog apply",
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+            response_model=ObjectChangelogApplyResponse,
+        )
+        if call.mode == "objects":
+            check_changelog_applied(answer, call, agent_name=self.agent_name)
+            context_id = answer.context_id
+        else:
+            context_id = answer.get("context_id")
         context.metadata.setdefault("agent_changelog_rewinds", []).append({
             "agent_name": self.agent_name,
-            "context_id": body.get("context_id"),
-            "s3_prefix": self.agent_changelog_s3_prefix,
+            "context_id": context_id,
             "up_to_tool_call_exclusive": self.agent_changelog_toolcall_position_exclusive,
+            "transfer_mode": call.mode,
+            "object_url": source_url,
         })
         logger.info(
-            f"agent-changelog applied onto '{self.agent_name}' from {self.agent_changelog_s3_prefix} "
-            f"(position_exclusive={self.agent_changelog_toolcall_position_exclusive}, context_id={body.get('context_id')})"
+            f"agent-changelog applied onto '{self.agent_name}' from {source_url} "
+            f"(position_exclusive={self.agent_changelog_toolcall_position_exclusive}, context_id={context_id})"
         )
 
     async def _load_snapshot(
@@ -610,21 +591,27 @@ class DeployAgentTaskStep(TaskStep):
                 f"FileArtifactUniverse '{universe.id}' v{universe.version} has no bundle_s3_url; "
                 "snapshot universes must be created via put_existing or put_bundled"
             )
-        ext_params = snapshot_ext.get("params") or {}
-        load_url = a2a_url + ext_params.get("endpoint", "/ext/snapshot")
-        # Re-sign if the stored URL is a presigned URL near expiry (the hub's
-        # openclaw-tasks/upsert mints these because sandbox pods lack S3 IAM
-        # for the artifact bucket). No-op for raw s3:// or non-S3 URLs.
-        bundle_url = _maybe_resign_presigned_url(universe.bundle_object_url)
-        load_payload: dict[str, str] = {"s3_prefix": bundle_url}
-        if self.agent_snapshot_target_context_id:
-            load_payload["target_context_id"] = self.agent_snapshot_target_context_id
-        async with httpx.AsyncClient() as client:
-            resp = await client.put(load_url, json=load_payload, timeout=180)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"snapshot load failed: {resp.status_code} {resp.text}")
-            load_body = resp.json()
-        loaded_context_id = load_body.get("context_id")
+        load_method, load_path = A2AAgent.operation(snapshot_ext, "load")
+        call = await asyncio.to_thread(
+            snapshot_load_call,
+            load_method,
+            get_config().get_object_store(),
+            agent_name=self.agent_name,
+            bundle_url=universe.bundle_object_url,
+            file_names=set((universe.file_artifact_refs or universe.file_artifact_ids or {}).keys()),
+            target_context_id=self.agent_snapshot_target_context_id,
+        )
+        answer = await invoke_transfer(
+            a2a_url + load_path,
+            call,
+            verb="PUT",
+            operation="snapshot load",
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+            response_model=ObjectSnapshotLoadResponse,
+        )
+        loaded_context_id = (
+            answer.context_id if call.mode == "objects" else answer.get("context_id")
+        )
         logger.info(
             f"Loaded snapshot universe={universe.id} v{universe.version} "
             f"into agent '{self.agent_name}' as context_id={loaded_context_id}"
@@ -636,5 +623,4 @@ class DeployAgentTaskStep(TaskStep):
                 "context_id": loaded_context_id,
                 "source_artifact_id": universe.id,
                 "source_artifact_version": universe.version,
-                "source_bundle_s3_url": universe.bundle_object_url,
             })

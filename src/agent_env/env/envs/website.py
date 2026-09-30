@@ -9,16 +9,21 @@ import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
-from agentenv_protocol import FilePart, WELL_KNOWN_PATH, client as protocol_v1
+from agentenv_protocol import FilePart, client as protocol_v1
 from agent_env.artifact import Artifact, DockerImageArtifact, EnvironmentArtifact
-from agent_env.artifact.artifacts.docker_image import GitHubBuildResult, ProgressCallback
-from agent_env.env.env import Env
+from agent_env.artifact.artifacts.docker_image import GitHubBuildResult, ProgressCallback, refuse_local_github_build
+from agent_env.env.env import Env, gateway_url_of
+from agent_env.store.routing import refuse_local_derivation
 from agent_env.env import legacy_protocol
+from agent_env.env.envs._deployment import (
+    as_builtin, builtin_provider_for, close_deployed, close_replaced, deploy_refusal, deploy_through_provider, host_staging_refusal,
+    load_by_signed_url, plugin_provider_like_a_builtin, provider_or_class,
+)
 from agent_env.env.gateway import AGENT_ENV_GATEWAY_MCP_PORT, GatewayMode
-from agent_env.env.store import register_env_instance
 from agent_env.attribution import Attribution
 if TYPE_CHECKING:
-    from agent_env.providers.gateway_provider import GatewayProvider, WebsiteConfig
+    from agent_env.env.env import DeployedEnv
+    from agent_env.providers.env_providers.env_provider import EnvironmentProvider
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 class WebsiteEnv(Env):
     type: ClassVar[str] = "website"
-    description = "Website environment with frontend and backend containers"
+    description = "Website environment with frontend and backend containers, deployed through the environment provider its env_provider_type names"
 
     def __init__(
         self,
@@ -36,21 +41,25 @@ class WebsiteEnv(Env):
         backend_docker_image_artifact: DockerImageArtifact,
         frontend_docker_image_artifact: DockerImageArtifact,
         environment_name: Optional[str] = None,
-        service_version: Optional[int] = None,
+        *,
         metadata: Optional[dict[str, str]] = None,
+        env_provider_type: str = "gateway",
     ):
         super().__init__(id, version, metadata=metadata)
         if not environment_name:
             raise ValueError("environment_name cannot be empty")
+        if not env_provider_type:
+            raise ValueError("env_provider_type cannot be empty")
         self.backend_docker_image_artifact = backend_docker_image_artifact
         self.frontend_docker_image_artifact = frontend_docker_image_artifact
         self.environment_name = environment_name
-        # Coerced, not just tolerated: to_dict writes this key unconditionally.
-        self.service_version = 1 if service_version is None else service_version
+        self.env_provider_type = env_provider_type
         self._sandbox = None
-        from agent_env.providers.gateway_provider import GatewayProvider
-        self._gateway_provider = GatewayProvider()
+        # As for an MCPServerEnv: a built-in's provider is built with the env, a plugin's when it deploys.
+        self._env_provider: Optional[EnvironmentProvider] = builtin_provider_for(env_provider_type)
         self._gateway_url = None
+        self._deployed: Optional[DeployedEnv] = None
+        self._replaced: list[tuple] = []  # the provider and sandbox of each deployment a later deploy replaced, for close()
 
     def to_dict(self) -> dict:
         base = super().to_dict()
@@ -66,7 +75,7 @@ class WebsiteEnv(Env):
         }
         base["service_name"] = self.environment_name
         base["environment_name"] = self.environment_name  # dual-write with service_name during the rename
-        base["service_version"] = self.service_version  # no environment_version: deprecated, not renamed
+        base["env_provider_type"] = self.env_provider_type
         return base
 
     @classmethod
@@ -81,86 +90,39 @@ class WebsiteEnv(Env):
             backend_docker_image_artifact=backend_artifact,
             frontend_docker_image_artifact=frontend_artifact,
             environment_name=data["environment_name"] if "environment_name" in data else data["service_name"],
-            service_version=data.get("service_version", 1),
             metadata=data.get("metadata", {}),
+            env_provider_type=data.get("env_provider_type", "gateway"),
         )
 
     async def deploy(self, ttl_seconds: int = 10800, disk_size_gb: float = 10, gateway_mode: GatewayMode = GatewayMode.PERFORMANCE, cpu: float | None = None, memory_mb: int | None = None, sandbox_type: str | None = None, priority: Optional[int] = None, env_state_type: str | None = None, env_state_instance_id: str | None = None, *, attribution: Optional[Attribution] = None) -> DeployedEnv:
-        attribution = dict(attribution or {})
-        from agent_env.env.env import DeployedEnv
-        from agent_env.providers import DB_WEB_PORT, DB_MCP_PORT
-        from agent_env.config import get_config
+        return await deploy_through_provider(
+            self, environment_name=self.environment_name, ttl_seconds=ttl_seconds, sandbox_type=sandbox_type,
+            disk_size_gb=disk_size_gb, gateway_mode=gateway_mode, cpu=cpu, memory_mb=memory_mb, priority=priority,
+            env_state_type=env_state_type, env_state_instance_id=env_state_instance_id, attribution=attribution,
+        )
 
-        config = get_config()
-        service_db = Env.get(config.default_service_db_env_id)
-
-        try:
-            from agent_env.providers import build_sandbox_provider, get_env_sandbox_provider
-            from agent_env.providers.gateway_provider import WebsiteConfig
-            from agent_env.providers.state import acquire_state_for_deploy
-            sandbox_provider = build_sandbox_provider(sandbox_type) if sandbox_type else get_env_sandbox_provider()
-            website_config = WebsiteConfig(
-                backend_image=self.backend_docker_image_artifact.image_name,
-                frontend_image=self.frontend_docker_image_artifact.image_name,
-                environment_name=self.environment_name,
-            )
-
-            state_instance = await acquire_state_for_deploy(
-                env_state_type=env_state_type, ttl_seconds=ttl_seconds, name_hint=self.id, env_state_instance_id=env_state_instance_id,
-            )
-            result = await self._gateway_provider.create_gateway(
-                sandbox_provider=sandbox_provider,
-                mcp_servers=[],
-                mcp_server_images=[],
-                website_configs=[website_config],
-                website_images=[self.backend_docker_image_artifact, self.frontend_docker_image_artifact],
-                gateway_mode=gateway_mode,
-                ttl_seconds=ttl_seconds,
-                disk_size_gb=disk_size_gb,
-                cpu=cpu, memory_mb=memory_mb,
-                attribution=attribution,
-                priority=priority,
-                env_id=self.id,
-                state_instance=state_instance,
-            )
-            self._sandbox = self._gateway_provider.sandbox
-            self._gateway_url = result.gateway_url
-            deployed_env = DeployedEnv(
-                env_id=self.id,
-                env_version=self.version,
-                gateway_url=result.gateway_url,
-                mcp_url=result.mcp_url,
-                db_web_url=result.db_web_url,
-                sandbox_id=self._sandbox.sandbox_id, sandbox_type=self._sandbox.type,
-                db_mcp_url=result.db_mcp_url,
-                environment_card_url=f"{result.gateway_url}{WELL_KNOWN_PATH}",
-                environment_card=result.environment_card,
-                environment_card_read_at_utc=result.environment_card_read_at_utc,
-                website_frontend_urls=result.website_frontend_urls,
-                gateway_mode=gateway_mode.value,
-            )
-            deployed_env = register_env_instance(deployed_env, ttl_seconds)
-            self._instance_id = deployed_env.instance_id
-            return deployed_env
-        except BaseException:
-            await self.close()
-            raise
+    def deploy_refusal(self, **options) -> str | None:
+        """Why deploy() would refuse these options before building anything, or None; raises, as deploy() does, for a type this process can't find."""
+        return deploy_refusal(self, provider_or_class(self), options)
 
     @classmethod
     async def from_deployed_env(cls, deployed: DeployedEnv) -> WebsiteEnv:
-        from agent_env.env.env import DeployedEnv
         env = Env.get(deployed.env_id, deployed.env_version)
         if not isinstance(env, WebsiteEnv):
             raise TypeError(f"Expected WebsiteEnv, got {type(env).__name__}")
-        from agent_env.providers import build_sandbox_provider, get_env_sandbox_provider
-        provider = build_sandbox_provider(deployed.sandbox_type) if deployed.sandbox_type else get_env_sandbox_provider()
-        env._sandbox = await provider.get_sandbox(deployed.sandbox_id)
-        env._gateway_url = deployed.gateway_url
+        if env._env_provider is None:
+            env._env_provider = plugin_provider_like_a_builtin(env.env_provider_type)
+        if builtin := as_builtin(env._env_provider):
+            env._sandbox = await builtin._reattach(env, deployed)
+        env._gateway_url = gateway_url_of(deployed)
         env._instance_id = deployed.instance_id
+        env._deployed = deployed
         return env
 
     async def load_environment_artifact(self, environment_artifact: EnvironmentArtifact) -> None:
-        if self._sandbox is None or self._gateway_url is None:
+        builtin = as_builtin(self._env_provider)
+        # A built-in's deploy leaves a sandbox and gateway to stage through; a plugin's leaves only its record.
+        if (self._sandbox is None or self._gateway_url is None) if builtin else self._deployed is None:
             raise RuntimeError("Environment not deployed - call deploy() first")
         if environment_artifact.environment_name != self.environment_name:
             raise ValueError(
@@ -168,8 +130,11 @@ class WebsiteEnv(Env):
                 f"does not match env environment_name '{self.environment_name}'"
             )
         file_artifact = environment_artifact.get_file_artifact()
-        base_url = legacy_protocol.environment_base_url(self._gateway_url, self.environment_name, mcp=False)
-        if await protocol_v1.supports_v1(base_url):
+        if builtin is None:
+            await load_by_signed_url(self, file_artifact)
+            return
+        base_url = await legacy_protocol.v1_base_url(self._deployed, self._gateway_url, self.environment_name, mcp=False)
+        if base_url is not None:
             from agent_env.env.gateway.constants import DATA_PLANE_LOAD_TIMEOUT_S
             container_path = await self._copy_artifact_into_container(file_artifact)
             await protocol_v1.reset_data(base_url)
@@ -180,10 +145,16 @@ class WebsiteEnv(Env):
             })], timeout=DATA_PLANE_LOAD_TIMEOUT_S)
         else:
             await self._load_environment_artifact_legacy(file_artifact)
-        await self._gateway_provider.install_changelog_triggers(self.environment_name)
+        await builtin.install_changelog_triggers(self.environment_name)
+
+    async def load_file_artifact_universe(self, file_artifact_universe: "Any", destination_path: Optional[str] = None,
+                                          ) -> "LoadFileArtifactUniverseResult":
+        if refusal := host_staging_refusal(self, "Staging files onto the env's host"):
+            raise RuntimeError(refusal)
+        return await super().load_file_artifact_universe(file_artifact_universe, destination_path)
 
     async def _copy_artifact_into_container(self, file_artifact) -> str:
-        from agent_env.providers.gateway_provider import AGENT_ENV_WEBSITE_BACKEND_SUFFIX, DOCKER_COMPOSE_PATH
+        from agent_env.providers.env_providers.constants import AGENT_ENV_WEBSITE_BACKEND_SUFFIX, DOCKER_COMPOSE_PATH
         filename = file_artifact.filename
         backend_service = f"{self.environment_name}-{AGENT_ENV_WEBSITE_BACKEND_SUFFIX}"
         # Random suffix so concurrent loads on a shared sandbox (parallel /load-universe,
@@ -213,11 +184,12 @@ class WebsiteEnv(Env):
             raise
 
     async def close(self) -> None:
-        if self._gateway_provider is not None:
+        await close_replaced(self)
+        if self._env_provider is not None:
             try:
-                await self._gateway_provider.close()
+                await self._env_provider.close()
             except BaseException as e:
-                logger.warning(f"Failed to close gateway provider: {e}")
+                logger.warning(f"Failed to close env provider: {e}")
         if self._sandbox is not None:
             try:
                 await self._sandbox.terminate()
@@ -230,6 +202,7 @@ class WebsiteEnv(Env):
 
         Deploys the env, fetches + persists its composed EnvironmentCard, then tears down.
         """
+        refuse_local_derivation(self.id, "env", "validating")
         from agent_env.task import Task
         from agent_env.task_step import DeployEnvTaskStep, VerifyEnvironmentCardStep
 
@@ -250,10 +223,9 @@ class WebsiteEnv(Env):
 
         for deployed_env in context.deployed_envs:
             try:
-                env = await WebsiteEnv.from_deployed_env(deployed_env)
-                await env.close()
+                await close_deployed(deployed_env, WebsiteEnv)
             except Exception as e:
-                logger.warning(f"Failed to clean up env sandbox {deployed_env.sandbox_id}: {e}")
+                logger.warning(f"Failed to clean up env {deployed_env.env_id}: {e}")
         return context.instance_id
 
     @classmethod
@@ -265,13 +237,15 @@ class WebsiteEnv(Env):
         frontend_dockerfile_github_url: str = "",
         frontend_docker_context_github_url: str | None = None,
         environment_name: str | None = None,
-        service_version: int = 0,
+        *,
         metadata: dict[str, str] | None = None,
         on_backend_progress: ProgressCallback | None = None,
         on_frontend_progress: ProgressCallback | None = None,
         github_token: str | None = None,
+        env_provider_type: str = "gateway",
     ) -> WebsiteEnv:
         """Build backend and frontend Docker images from GitHub in parallel and create a WebsiteEnv."""
+        refuse_local_github_build(id)
         backend, frontend = await asyncio.gather(
             DockerImageArtifact.put_from_github(
                 id=f"website-backend-{id}",
@@ -314,7 +288,7 @@ class WebsiteEnv(Env):
             backend_docker_image_artifact=backend.artifact,
             frontend_docker_image_artifact=frontend.artifact,
             environment_name=environment_name,
-            service_version=service_version,
             metadata=combined_metadata,
+            env_provider_type=env_provider_type,
         )
         return env

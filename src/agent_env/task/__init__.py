@@ -4,7 +4,7 @@ from .task import Task
 from .store import (
     TaskStore, TaskQuery, get_task_store, set_task_store, reset_task_store,
     TaskInstance, TaskInstanceStore, get_task_instance_store, set_task_instance_store, reset_task_instance_store,
-    TaskStepResult, TaskStepStatus, record_step_complete, record_task_failure,
+    TaskStepResult, TaskStepStatus, record_step_complete, record_task_cancelled, record_task_failure,
 )
 
 __all__ = [
@@ -22,5 +22,6 @@ __all__ = [
     "set_task_instance_store",
     "reset_task_instance_store",
     "record_step_complete",
+    "record_task_cancelled",
     "record_task_failure",
 ]

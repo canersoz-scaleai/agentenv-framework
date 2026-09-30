@@ -1,10 +1,10 @@
 [project]
 name = "agentenv-protocol"
-version = "0.1.210"
+version = "0.1.266"
 description = "Open data-plane protocol and server SDK for agent environments."
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "Scale AI" }]
 requires-python = ">=3.10"
 dependencies = [
@@ -16,13 +16,11 @@ dependencies = [
 [project.optional-dependencies]
 agent = [
     "a2a-sdk[http-server]>=0.3.26,<0.4",
-    "boto3>=1.35",
     "regex>=2023.12.25",
     "uvicorn>=0.30",
 ]
 dev = [
     "a2a-sdk[http-server]>=0.3.26,<0.4",
-    "boto3>=1.35",
     "regex>=2023.12.25",
     "pytest>=9.0",
     "pytest-asyncio>=0.23.0",

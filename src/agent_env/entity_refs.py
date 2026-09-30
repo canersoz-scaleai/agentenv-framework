@@ -1,8 +1,9 @@
-"""Which fields of a step dict hold env, A2A agent or artifact ids.
+"""Which fields of a step dict, or keys of an entity's toml, hold env, A2A agent, artifact or task ids.
 
-A step type declares them on its class so a tool that rewrites ids before a run, such as a bundle
+A type declares them on its class so a tool that rewrites ids before a run, such as a bundle
 resolver, finds every one without guessing from field names. Nothing at run time reads the
-declarations. For example::
+declarations. Step types declare ``entity_refs``; env, agent, artifact and eval types declare the keys
+of their toml as ``toml_refs``. For example::
 
     class LoadArtifactTaskStep(TaskStep):
         entity_refs = (
@@ -11,8 +12,13 @@ declarations. For example::
             EntityRef.artifact("artifacts[].id", version_field="version"),
         )
 
-Fields that name something else, such as another step's id, are left out. Declarations are not
-inherited, so a subclass declares its own.
+A toml pins a ref inline, with a table keyed by the ref's kind, which also lets a list element be
+pinned: ``mcp_server_envs = ["tickets", { env = "crm", version = 2 }]``; ``ref_sites`` reads that
+form when asked to.
+
+Fields that name something else, such as another step's id, are left out. A step type's
+declarations are not inherited, so a subclass declares its own; ``toml_refs`` are, as ``from_toml``
+is.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ class EntityKind(StrEnum):
     ENV = "env"
     AGENT = "agent"
     ARTIFACT = "artifact"
+    TASK = "task"
 
 
 class RefRole(StrEnum):
@@ -42,7 +49,7 @@ class RefRole(StrEnum):
 
 @dataclass(frozen=True)
 class EntityRef:
-    """One ref-holding field. ``path`` is dotted keys into the step dict, ``[]`` meaning each
+    """One ref-holding field. ``path`` is dotted keys into the step dict or toml, ``[]`` meaning each
     element of a list (``env_ids[]``, ``artifacts[].id``); ``version_field`` is the key beside the
     ref, in the same dict, that pins its version. ``walk``, for a shape a path cannot spell, maps
     the value at the path's parent to the dicts that hold the last key, each with its path parts.
@@ -69,6 +76,10 @@ class EntityRef:
     def artifact(cls, path: str, **options: Any) -> EntityRef:
         return cls(path, EntityKind.ARTIFACT, **options)
 
+    @classmethod
+    def task(cls, path: str, **options: Any) -> EntityRef:
+        return cls(path, EntityKind.TASK, **options)
+
     def __post_init__(self) -> None:
         if not _PATH.fullmatch(self.path):
             raise ValueError(f"entity ref path {self.path!r} is not dotted keys with optional [] suffixes")
@@ -89,8 +100,9 @@ class EntityRef:
 
 
 class RefSite(NamedTuple):
-    """One ref found in a step dict: ``owner[key]`` holds ``value``; ``path`` is concrete
-    (``artifacts[1].id``). ``version`` is the sibling pin, None when unset or not pinnable."""
+    """One ref found in a step dict or toml: ``owner[key]`` holds ``value``; ``path`` is concrete
+    (``artifacts[1].id``, ``mcp_server_envs[1].env``). ``version`` is its pin, None when unset;
+    ``version_key`` is the key of ``owner`` that holds a pin, None when the ref can't be pinned."""
 
     path: str
     ref: EntityRef
@@ -98,24 +110,41 @@ class RefSite(NamedTuple):
     version: Any
     owner: dict | list
     key: str | int
+    version_key: str | None = None
 
     def rewrite(self, value: Any, version: int | None = None) -> None:
-        """Replace the ref in its step dict and, when ``version`` is given, pin it beside the ref."""
-        if version is not None and self.ref.version_field is None:
+        """Replace the ref where it was found and, when ``version`` is given, pin it: beside the ref
+        in a step dict, inside its table in a toml."""
+        if version is not None and self.version_key is None:
             raise ValueError(f"entity ref {self.path!r} has no version field to pin")
         self.owner[self.key] = value
         if version is not None:
-            self.owner[self.ref.version_field] = version
+            self.owner[self.version_key] = version
 
 
-def ref_sites(refs: Iterable[EntityRef], data: dict) -> Iterator[RefSite]:
-    """Every ref ``refs`` declares that is present, and not None, in ``data``."""
+def parse_toml_ref(kind: EntityKind, value: Any) -> tuple[str, int | None]:
+    """The id and version a toml ref names: an id, or ``{ <kind> = "<id>", version = <n> }`` with the
+    version optional. Raises ValueError naming the expected form."""
+    table = isinstance(value, dict)
+    entity_id, version = (value.get(kind.value), value.get("version")) if table else (value, None)
+    known_keys = not table or value.keys() <= {kind.value, "version"}
+    positive = version is None or (isinstance(version, int) and not isinstance(version, bool) and version >= 1)
+    if not (known_keys and isinstance(entity_id, str) and entity_id and positive):
+        raise ValueError(f'expected an id or {{ {kind.value} = "<id>", version = <n> }}, the version optional, '
+                         f"not {value!r}")
+    return entity_id, version
+
+
+def ref_sites(refs: Iterable[EntityRef], data: dict, *, inline_pins: bool = False) -> Iterator[RefSite]:
+    """Every ref ``refs`` declares that is present, and not None, in ``data``. With ``inline_pins``,
+    for a toml, a table holding the ref's kind is a pinned ref and its site points inside the table;
+    any other value is reported as it is."""
     for ref in refs:
         *parents, leaf = ref.path.split(".")
         for trail, node in _descend(data, parents, ()):
             for rel, holder in ref.walk(node) if ref.walk else [((), node)]:
                 if isinstance(holder, dict):
-                    yield from _leaf(ref, holder, leaf, (*trail, *rel))
+                    yield from _leaf(ref, holder, leaf, (*trail, *rel), inline_pins)
 
 
 def _descend(node: Any, segments: list[str], trail: tuple[str, ...]) -> Iterator[tuple[tuple[str, ...], Any]]:
@@ -133,16 +162,25 @@ def _descend(node: Any, segments: list[str], trail: tuple[str, ...]) -> Iterator
             yield from _descend(item, segments[1:], (*trail, f"{key}[{i}]"))
 
 
-def _leaf(ref: EntityRef, holder: dict, leaf: str, trail: tuple[str, ...]) -> Iterator[RefSite]:
+def _leaf(ref: EntityRef, holder: dict, leaf: str, trail: tuple[str, ...], inline_pins: bool) -> Iterator[RefSite]:
     key = leaf.removesuffix("[]")
     value = holder.get(key)
     if value is None:
         return
     path = ".".join((*trail, key))
     if not leaf.endswith("[]"):
-        version = holder.get(ref.version_field) if ref.version_field else None
-        yield RefSite(path, ref, value, version, holder, key)
+        yield _site(ref, path, holder, key, ref.version_field, inline_pins)
     elif isinstance(value, list):
         for i, item in enumerate(value):
             if item is not None:
-                yield RefSite(f"{path}[{i}]", ref, item, None, value, i)
+                yield _site(ref, f"{path}[{i}]", value, i, None, inline_pins)
+
+
+def _site(ref: EntityRef, path: str, owner: dict | list, key: str | int, version_key: str | None,
+          inline_pins: bool) -> RefSite:
+    value = owner[key]
+    if inline_pins and isinstance(value, dict) and value.get(ref.kind.value) is not None:
+        return RefSite(f"{path}.{ref.kind.value}", ref, value[ref.kind.value], value.get("version"),
+                       value, ref.kind.value, "version")
+    version = owner.get(version_key) if version_key else None
+    return RefSite(path, ref, value, version, owner, key, version_key)

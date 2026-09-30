@@ -1,8 +1,8 @@
 """The ``Runner`` seam: dispatch a task run and return a handle to poll. Selected via
 ``[runner]`` in ``.agentenv/config.toml`` like a store.
 
-``RunStatus`` and ``submit``'s ``(run_id, instance_id)`` return match the Temporal
-worker's, so the hub works against either backend unchanged.
+``RunStatus`` and ``submit``'s ``(run_id, instance_id)`` return are the contract every
+backend maps onto, so callers work against any configured runner unchanged.
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from typing import Any, Optional
 
 
 class RunStatus(StrEnum):
-    """Run lifecycle. Values match Temporal's workflow-execution statuses; ``QUEUED`` is
-    added for the pre-start state and is non-terminal."""
+    """Run lifecycle, engine-neutral: a backend maps its own states onto these. ``QUEUED``
+    is the pre-start state and is non-terminal."""
 
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"

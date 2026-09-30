@@ -26,8 +26,6 @@ export const STEP_COLORS: Record<string, string> = {
   collect_artifacts: '#14b8a6',
   rubrics_verifier: '#10b981',
   env_outcome_verifier: '#10b981',
-  cua_initialize: '#ec4899',
-  cua_evaluate: '#ef4444',
   prompt_usersim: '#d946ef',
   build_interactive_solver_image: '#0ea5e9',
   interactive_usersim: '#a855f7',
@@ -48,8 +46,6 @@ export const STEP_TYPES = [
   'collect_artifacts',
   'rubrics_verifier',
   'env_outcome_verifier',
-  'cua_initialize',
-  'cua_evaluate',
   'prompt_usersim',
   'build_interactive_solver_image',
   'interactive_usersim',
@@ -72,8 +68,6 @@ export const STEP_TYPE_LABELS: Record<StepType, string> = {
   collect_artifacts: 'Collect Artifacts',
   rubrics_verifier: 'Rubrics Verifier',
   env_outcome_verifier: 'Env Outcome Verifier',
-  cua_initialize: 'CUA Initialize',
-  cua_evaluate: 'CUA Evaluate',
   prompt_usersim: 'Prompt UserSim',
   build_interactive_solver_image: 'Build Interactive Solver Image',
   interactive_usersim: 'Interactive UserSim',
@@ -110,8 +104,6 @@ export const AUTO_ID_STEP_TYPES = new Set<StepType>([
 
 export const JSON_FIELDS = new Set([
   'criteria',
-  'init_config',
-  'evaluator',
   'args',
   'options',
   'output_format',
@@ -120,7 +112,6 @@ export const JSON_FIELDS = new Set([
 export const EVALUATOR_STEP_TYPES = new Set<StepType>([
   'rubrics_verifier',
   'env_outcome_verifier',
-  'cua_evaluate',
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -223,14 +214,6 @@ export function makeDefaultStep(type: StepType, key: number): StepState {
       fields.file_artifact_id = '';
       fields.score_aggregator = 'all_pass';
       break;
-    case 'cua_initialize':
-      fields.env_id = '';
-      fields.init_config = '[]';
-      break;
-    case 'cua_evaluate':
-      fields.env_id = '';
-      fields.evaluator = '{}';
-      break;
     case 'prompt_usersim':
       fields.usersim_image_id = '';
       fields.usersim_model = MODEL_OPTIONS[2];
@@ -283,30 +266,21 @@ export function getRecommendedStep(steps: StepState[]): StepType | null {
   if (steps.length === 0) return 'deploy_env';
 
   const types = new Set(steps.map(s => s.type));
-  const hasCua = steps.some(
-    s => s.type === 'deploy_env' && String(s.fields._env_type) === 'cua',
-  );
   const last = steps[steps.length - 1];
   if (!last) return 'deploy_env';
   const lastType = last.type;
 
-  if (lastType === 'deploy_env' && !types.has('load_artifact') && !hasCua)
+  if (lastType === 'deploy_env' && !types.has('load_artifact'))
     return 'load_artifact';
-  if (lastType === 'deploy_env' && hasCua && !types.has('cua_initialize'))
-    return 'cua_initialize';
   if (
-    (lastType === 'deploy_env' ||
-      lastType === 'load_artifact' ||
-      lastType === 'cua_initialize') &&
+    (lastType === 'deploy_env' || lastType === 'load_artifact') &&
     !types.has('deploy_agent')
   )
     return 'deploy_agent';
   if (lastType === 'deploy_agent' && !types.has('prompt_agent'))
     return 'prompt_agent';
-  if (lastType === 'prompt_agent' && !hasCua && !types.has('rubrics_verifier'))
+  if (lastType === 'prompt_agent' && !types.has('rubrics_verifier'))
     return 'rubrics_verifier';
-  if (lastType === 'prompt_agent' && hasCua && !types.has('cua_evaluate'))
-    return 'cua_evaluate';
   if (
     lastType === 'build_interactive_solver_image' &&
     !types.has('interactive_usersim') &&
@@ -357,10 +331,7 @@ export function stepToDict(step: StepState): Record<string, unknown> {
       } catch {
         // object-typed JSON fields fall back to {}, array-typed to []
         base[key] =
-          key === 'evaluator' ||
-          key === 'args' ||
-          key === 'options' ||
-          key === 'output_format'
+          key === 'args' || key === 'options' || key === 'output_format'
             ? {}
             : [];
       }
@@ -936,15 +907,11 @@ export function StepFields({
       .filter(s => s.type === 'prompt_agent' && s.id)
       .map(s => s.id);
 
-    // Agent name auto-select for prompt_agent, collect_artifacts, rubrics_verifier, cua_initialize, cua_evaluate
+    // Agent name auto-select for prompt_agent, collect_artifacts, rubrics_verifier
     if (
-      [
-        'prompt_agent',
-        'collect_artifacts',
-        'rubrics_verifier',
-        'cua_initialize',
-        'cua_evaluate',
-      ].includes(step.type) &&
+      ['prompt_agent', 'collect_artifacts', 'rubrics_verifier'].includes(
+        step.type,
+      ) &&
       !step.fields.agent_name &&
       uniqueAgents.length > 0
     ) {
@@ -965,9 +932,9 @@ export function StepFields({
       }
     }
 
-    // load_artifact, cua_initialize, cua_evaluate: auto-select first env_id
+    // load_artifact: auto-select first env_id
     if (
-      ['load_artifact', 'cua_initialize', 'cua_evaluate'].includes(step.type) &&
+      step.type === 'load_artifact' &&
       !step.fields.env_id &&
       deployedEnvIds.length > 0
     ) {
@@ -1532,80 +1499,6 @@ export function StepFields({
           )}
         </>
       );
-    case 'cua_initialize': {
-      const cuaInitEnvIds = allSteps
-        .filter(s => s.type === 'deploy_env' && s.fields.env_id)
-        .map(s => String(s.fields.env_id));
-      const cuaInitCurrent = String(step.fields.env_id ?? '');
-      // Auto-selection handled by useEffect above
-      return (
-        <>
-          <Field label="Environment ID">
-            {cuaInitEnvIds.length === 0 ? (
-              <p className="text-xs text-[var(--muted-foreground)] italic">
-                Add a Deploy Env step first
-              </p>
-            ) : (
-              <div className="flex flex-col gap-1">
-                {cuaInitEnvIds.map(envId => (
-                  <label
-                    key={envId}
-                    className="flex items-center gap-2 cursor-pointer py-0.5"
-                  >
-                    <input
-                      type="radio"
-                      name={`cua-init-env-${step.key}`}
-                      checked={cuaInitCurrent === envId}
-                      onChange={() => onUpdateField(index, 'env_id', envId)}
-                      className="border-[var(--border)]"
-                    />
-                    <span className="text-sm font-mono">{envId}</span>
-                  </label>
-                ))}
-              </div>
-            )}
-          </Field>
-          {textarea('init_config', 'Init Config (JSON array)', 4)}
-        </>
-      );
-    }
-    case 'cua_evaluate': {
-      const cuaEvalEnvIds = allSteps
-        .filter(s => s.type === 'deploy_env' && s.fields.env_id)
-        .map(s => String(s.fields.env_id));
-      const cuaEvalCurrent = String(step.fields.env_id ?? '');
-      // Auto-selection handled by useEffect above
-      return (
-        <>
-          <Field label="Environment ID">
-            {cuaEvalEnvIds.length === 0 ? (
-              <p className="text-xs text-[var(--muted-foreground)] italic">
-                Add a Deploy Env step first
-              </p>
-            ) : (
-              <div className="flex flex-col gap-1">
-                {cuaEvalEnvIds.map(envId => (
-                  <label
-                    key={envId}
-                    className="flex items-center gap-2 cursor-pointer py-0.5"
-                  >
-                    <input
-                      type="radio"
-                      name={`cua-eval-env-${step.key}`}
-                      checked={cuaEvalCurrent === envId}
-                      onChange={() => onUpdateField(index, 'env_id', envId)}
-                      className="border-[var(--border)]"
-                    />
-                    <span className="text-sm font-mono">{envId}</span>
-                  </label>
-                ))}
-              </div>
-            )}
-          </Field>
-          {textarea('evaluator', 'Evaluator (JSON object)', 4)}
-        </>
-      );
-    }
     case 'prompt_usersim':
       return (
         <>
@@ -1868,7 +1761,7 @@ export function StepEditor({
             style={{ backgroundColor: color }}
           />
           <span className="text-sm font-medium text-[var(--foreground)]">
-            {STEP_TYPE_LABELS[step.type]}
+            {STEP_TYPE_LABELS[step.type] ?? step.type}
           </span>
           <span className="text-xs font-mono text-[var(--muted-foreground)]">
             {step.id}

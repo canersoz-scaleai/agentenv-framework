@@ -810,15 +810,28 @@ def test_create_app_after_mount_raises(monkeypatch):
         env.create_app()
 
 
-def test_card_config_name_overrides_injected_name_envs(monkeypatch):
-    """A card author's declared name beats both injected names.
+def test_injected_environment_name_overrides_card_config_name(monkeypatch):
+    """ENVIRONMENT_NAME beats the card's declared name, and SERVICE_NAME is still ignored.
 
-    ENVIRONMENT_NAME/SERVICE_NAME are transport artifacts agent-env injects at
-    deploy (the gateway emits both while the rename lands); once the card is the
-    identity surface neither may silently override the card's own declared name.
+    agent-env injects ENVIRONMENT_NAME as the env's registered name, so a registration that
+    renames an env must rename its card too, or card-first lookups by that name miss it.
     """
     monkeypatch.setenv("ENVIRONMENT_NAME", "slack_env")
     monkeypatch.setenv("SERVICE_NAME", "slack")
+    env = _ServeEnv()
+    app = env.mount(_FakeServableMCP())
+    assert env._build_card().name == "slack_env"
+    assert "slack_env_add_item" in app.tools
+    assert "items_add_item" not in app.tools
+
+
+@pytest.mark.parametrize("injected", [None, ""], ids=["unset", "empty"])
+def test_carded_env_falls_back_to_card_name_without_environment_name(monkeypatch, injected):
+    """Run outside agent-env (no ENVIRONMENT_NAME, or an empty one), the declared name is used."""
+    if injected is None:
+        monkeypatch.delenv("ENVIRONMENT_NAME", raising=False)
+    else:
+        monkeypatch.setenv("ENVIRONMENT_NAME", injected)
     env = _ServeEnv()
     app = env.mount(_FakeServableMCP())
     assert env._build_card().name == "items"
@@ -908,9 +921,8 @@ def test_blank_environment_name_env_falls_through_to_class_name(monkeypatch):
 
 
 class _CardlessEnv(_ToolHandler, AgentEnvEnvironment):
-    """No ``@environment_card``: the shape of the envs that are not synthetic servers
-    (openclaw-*, skillsbench_*, gmail_mock, ios_cua, ...), whose identity comes from
-    resolution alone."""
+    """No ``@environment_card``: the shape of envs that are not synthetic servers, whose
+    identity comes from resolution alone."""
 
 
 # A value only ever reachable through the deleted ``SERVICE_NAME`` term: if it ever shows up in a
@@ -958,17 +970,17 @@ async def test_only_service_name_leaves_no_trace_anywhere_in_the_served_card(mon
 
 
 @pytest.mark.asyncio
-async def test_carded_env_ignores_both_injected_names(monkeypatch):
-    """A declared card name is the identity; neither injected variable can edge into the card."""
+async def test_carded_env_serves_environment_name_and_ignores_service_name(monkeypatch):
+    """The injected ENVIRONMENT_NAME reaches the wire over the declared name; SERVICE_NAME never does."""
     monkeypatch.setenv("ENVIRONMENT_NAME", "injected_environment_name")
     monkeypatch.setenv("SERVICE_NAME", _SERVICE_NAME_SENTINEL)
 
     body, tools = await _mount_and_fetch_card(_ServeEnv())
 
-    assert body["name"] == "items"
-    assert tools == {"count_items", "items_add_item"}
+    assert body["name"] == "injected_environment_name"
+    assert tools == {"count_items", "injected_environment_name_add_item"}
+    assert {t["name"] for t in body["capabilities"]["tools"]} == tools
     assert _SERVICE_NAME_SENTINEL not in json.dumps(body)
-    assert "injected_environment_name" not in json.dumps(body)
 
 
 @pytest.mark.parametrize(
@@ -1027,18 +1039,19 @@ async def test_environment_name_fallback_leaves_the_rest_of_the_card_config_inta
 @pytest.mark.parametrize(
     "env_cls,environment_name,expected",
     [
-        (_ServeEnv, "injected_environment_name", "items"),
+        (_ServeEnv, "injected_environment_name", "injected_environment_name"),
+        (_ServeEnv, None, "items"),
         (_CardlessEnv, "injected_environment_name", "injected_environment_name"),
         (_CardlessEnv, None, "_CardlessEnv"),
     ],
-    ids=["carded", "cardless_with_environment_name", "cardless_only"],
+    ids=["carded_with_environment_name", "carded_only", "cardless_with_environment_name", "cardless_only"],
 )
 def test_service_name_sentinel_never_wins_any_resolution_branch(monkeypatch, env_cls, environment_name, expected):
     """The regression net for the dropped fallback, across every branch of the ``or`` chain.
 
-    Re-adding a ``SERVICE_NAME`` term anywhere it could win flips one of these three cases: ahead
-    of the card name breaks ``carded``, ahead of ENVIRONMENT_NAME breaks
-    ``cardless_with_environment_name``, ahead of the class name breaks ``cardless_only``.
+    Re-adding a ``SERVICE_NAME`` term anywhere it could win flips one of these cases: ahead of
+    ENVIRONMENT_NAME breaks both ``*_with_environment_name`` cases, ahead of the card name breaks
+    ``carded_only``, ahead of the class name breaks ``cardless_only``.
     """
     monkeypatch.setenv("SERVICE_NAME", _SERVICE_NAME_SENTINEL)
     if environment_name is None:

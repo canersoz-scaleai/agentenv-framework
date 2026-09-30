@@ -1,0 +1,100 @@
+{
+  "format_version": 1,
+  "agent_env": {
+    "version": "<version>",
+    "environment": "<environment>",
+    "location": "<location>"
+  },
+  "config": {
+    "path": "<tmp>/.agentenv/config.toml",
+    "error": null
+  },
+  "loaded": true,
+  "group_errors": {},
+  "discovery_errors": {},
+  "plugins": [
+    {
+      "name": "agentenv-a",
+      "version": "1.0",
+      "contributions": [
+        {
+          "group": "agent_env.envs",
+          "name": "browser",
+          "value": "tst.unit.plugins_test:_BrowserEnv",
+          "status": "replaced",
+          "code": "replaced-by-config",
+          "reason": "<text>",
+          "replaced_by": {
+            "file": "<tmp>/.agentenv/config.toml",
+            "table": "envs",
+            "impl": "tst.unit.plugins_test:_OtherBrowserEnv"
+          },
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.envs",
+          "name": "website",
+          "value": "tst.unit.plugins_test:_BrowserEnv",
+          "status": "skipped",
+          "code": "builtin-name",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.task_steps",
+          "name": "plugin_step",
+          "value": "tst.unit.plugins_test:_PluginStep",
+          "status": "active",
+          "code": null,
+          "reason": null,
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.sandbox_providers",
+          "name": "box",
+          "value": "tst.unit.plugins_test:_OtherRecordingProvider",
+          "status": "conflict",
+          "code": "name-conflict",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": [
+            {
+              "package": "agentenv-b",
+              "version": "1.0",
+              "value": "tst.unit.plugins_test:_GuardedProvider"
+            }
+          ]
+        },
+        {
+          "group": "agent_env.state_providers",
+          "name": "plugin_state",
+          "value": "tst.unit.plugins_test:_PluginState",
+          "status": "active",
+          "code": null,
+          "reason": null,
+          "replaced_by": null,
+          "conflicts_with": []
+        },
+        {
+          "group": "agent_env.bundles",
+          "name": "hello",
+          "value": "report_bundles_a",
+          "status": "active",
+          "code": "qualified-only",
+          "reason": "<text>",
+          "replaced_by": null,
+          "conflicts_with": [
+            {
+              "package": "agentenv-b",
+              "version": "1.0",
+              "value": "report_bundles_b"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "config_effect": "<text>"
+}

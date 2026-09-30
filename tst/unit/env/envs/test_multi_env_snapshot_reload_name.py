@@ -8,7 +8,7 @@ import pytest
 
 from agent_env.artifact import DockerImageArtifact
 from agent_env.env.envs.multi_env import MultiEnv
-from agent_env.providers.gateway_provider import GatewayProvider
+from agent_env.providers.env_providers import EnvironmentGatewayProvider
 
 
 class _Stop(Exception):
@@ -28,8 +28,8 @@ async def test_snapshot_reload_keeps_the_env_name(declared, deployed_as, expecte
     with patch("agent_env.artifact.Artifact.get", return_value=db_image), \
          patch("agent_env.env.env.Env.get", side_effect=lambda env_id, *a, **k: gateway_env if env_id == "gw-id" else service_db), \
          patch("agent_env.config.get_config", return_value=MagicMock(default_gateway_env_id="gw-id", default_service_db_env_id="db-id")), \
-         patch("agent_env.providers.state.LocalPostgresStateProvider"), \
-         patch.object(GatewayProvider, "create_docker_compose", side_effect=_Stop) as compose:
+         patch("agent_env.providers.env_state.LocalPostgresStateProvider"), \
+         patch.object(EnvironmentGatewayProvider, "create_docker_compose", side_effect=_Stop) as compose:
         with pytest.raises(_Stop):
             await env._load_from_snapshot(snapshot)
 

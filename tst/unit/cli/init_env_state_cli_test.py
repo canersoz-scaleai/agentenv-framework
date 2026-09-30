@@ -11,7 +11,7 @@ from click.testing import CliRunner
 
 from agent_env.cli.env.state.init import DEFAULT_TTL_SECONDS, init_env_state
 from agent_env.env import Env, MultiEnv
-from agent_env.providers.state.env_state_provider import EnvStateInstance
+from agent_env.providers.env_state.env_state_provider import EnvStateInstance
 
 # Any config.toml-registered external backend; core ships none, so the tag is just a string here.
 REMOTE_POSTGRES_STATE_TYPE = "remote_postgres"
@@ -43,8 +43,8 @@ def _invoke(args):
     provider = MagicMock()
     provider.prepare = AsyncMock()
     with patch.object(Env, "get", return_value=_fake_multi_env()) as get, \
-         patch("agent_env.providers.state.acquire_state_for_deploy", acquire), \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider):
+         patch("agent_env.providers.env_state.acquire_state_for_deploy", acquire), \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider):
         res = CliRunner().invoke(init_env_state, args)
     return res, acquire, provider, get
 
@@ -104,8 +104,8 @@ def test_persistent_backend_materializes_base_via_acquire_then_prepare():
     provider = MagicMock()
     provider.prepare = AsyncMock()
     with patch.object(Env, "get", return_value=_fake_multi_env()), \
-         patch("agent_env.providers.state.acquire_state_for_deploy", AsyncMock(return_value=base)) as acquire, \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider):
+         patch("agent_env.providers.env_state.acquire_state_for_deploy", AsyncMock(return_value=base)) as acquire, \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider):
         res = CliRunner().invoke(
             init_env_state,
             ["--id", "multi-slack-email", "--env-state-type", "persistent_remote_postgres"],
@@ -136,8 +136,8 @@ def test_website_env_includes_the_gateway_auto_added_browser_environment():
     provider.prepare = AsyncMock()
     cfg = MagicMock(default_website_browser_env_id="website-browser-env")
     with patch.object(Env, "get", side_effect=_get), \
-         patch("agent_env.providers.state.acquire_state_for_deploy", AsyncMock(return_value=_fake_instance())), \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider), \
+         patch("agent_env.providers.env_state.acquire_state_for_deploy", AsyncMock(return_value=_fake_instance())), \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider), \
          patch("agent_env.config.get_config", return_value=cfg):
         res = CliRunner().invoke(
             init_env_state, ["--id", "multi-shop", "--env-state-type", "remote_postgres"]
@@ -151,8 +151,8 @@ def test_environment_names_are_deduped():
     provider = MagicMock()
     provider.prepare = AsyncMock()
     with patch.object(Env, "get", return_value=_fake_multi_env(mcp=("slack", "slack", "email"))), \
-         patch("agent_env.providers.state.acquire_state_for_deploy", AsyncMock(return_value=_fake_instance())), \
-         patch("agent_env.providers.state.build_state_provider", return_value=provider):
+         patch("agent_env.providers.env_state.acquire_state_for_deploy", AsyncMock(return_value=_fake_instance())), \
+         patch("agent_env.providers.env_state.build_state_provider", return_value=provider):
         res = CliRunner().invoke(
             init_env_state, ["--id", "e", "--env-state-type", "remote_postgres"]
         )

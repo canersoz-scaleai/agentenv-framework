@@ -82,6 +82,7 @@ def up(no_bootstrap: bool) -> None:
     _require_explorer_deps()
 
     from agent_env.config import configure, get_config, get_runner
+    from agent_env.store.routing import configured_store
 
     configure()
     cfg = get_config()
@@ -97,9 +98,9 @@ def up(no_bootstrap: bool) -> None:
     # The local image store (if the config resolves one) brings up its own registry:2 on
     # first push via ensure_repository — up manages no store infra of its own.
     click.echo("\n  resolved backends")
-    click.echo(f"    document store   {type(cfg.get_document_store()).__name__}")
-    click.echo(f"    object store     {type(cfg.get_object_store()).__name__}")
-    click.echo(f"    image store      {type(cfg.get_image_store()).__name__}")
+    click.echo(f"    document store   {type(configured_store(cfg.get_document_store())).__name__}")
+    click.echo(f"    object store     {type(configured_store(cfg.get_object_store())).__name__}")
+    click.echo(f"    image store      {type(configured_store(cfg.get_image_store())).__name__}")
     click.echo(f"    secret store     {type(cfg.get_secret_store()).__name__}")
     click.echo(f"    runner           {get_runner().type}")
 

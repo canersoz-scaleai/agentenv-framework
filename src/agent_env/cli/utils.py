@@ -6,7 +6,10 @@ from pathlib import Path
 import click
 
 from agent_env.env import Env
+from agent_env.providers.env_providers.env_provider import _env_provider_class
+from agent_env.providers.env_providers.env_server_provider import EnvironmentServerProvider
 from agent_env.store.base import NotFoundError
+from agent_env.store.ids import is_local_id
 
 DEFAULT_BUILD_PLATFORM = "linux/amd64"
 
@@ -35,6 +38,21 @@ def build_platform_option(f):
 def docker_build_platform_args(platform: str | None) -> list[str]:
     """['--platform', <platform>] when a platform is set, else [] (host-native build)."""
     return ["--platform", platform] if platform else []
+
+
+def env_provider_type_option(help: str, env_type: str = "mcp_server"):
+    """Shared `--env-provider-type` option (default `gateway`), refused at parse time unless an installed provider has that type, and
+    for an env other than one MCP server, unless that provider deploys more than one."""
+    def check(ctx: click.Context, param: click.Parameter, value: str) -> str:
+        try:
+            provider_class = _env_provider_class(value)
+        except ValueError as e:
+            raise click.BadParameter(str(e)) from e
+        if env_type != "mcp_server" and issubclass(provider_class, EnvironmentServerProvider):
+            raise click.BadParameter(f"'{value}' deploys one MCP server, not a {env_type} env")
+        return value
+
+    return click.option("--env-provider-type", "env_provider_type", default="gateway", show_default=True, callback=check, help=help)
 
 
 def environment_name_options(f):
@@ -160,3 +178,12 @@ def deployed_env_from_instance(env_id: str | None, instance_id: str) -> Env:
         raise click.UsageError(
             f"--id '{env_id}' does not match instance '{instance_id}' (env '{env.id}')")
     return env
+
+
+def skips_local_validation(entity_id: str, kind: str) -> bool:
+    """Whether a put leaves ``entity_id`` unvalidated because it is an ``@local`` id: validating one
+    isn't supported yet, and the entity itself was written fine."""
+    if not is_local_id(entity_id):
+        return False
+    click.echo(f"Skipped validation: validating an @local {kind} isn't supported yet")
+    return True

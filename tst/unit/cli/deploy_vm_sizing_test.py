@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
 
 from agent_env.cli.env import env as env_cli
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 
 
 def _deploy_kwargs(extra_args: list[str]) -> dict:
@@ -24,7 +24,7 @@ def _deploy_kwargs(extra_args: list[str]) -> dict:
 
     async def fake_deploy(**kwargs):
         captured.update(kwargs)
-        return DeployedEnv(
+        return DeployedGatewayEnv(
             env_id="e1", env_version=1, gateway_url="http://gw", mcp_url="http://mcp",
             db_web_url=None, sandbox_id="s1",
         )

@@ -2,19 +2,36 @@
 
 from __future__ import annotations
 
+import io
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from typing import BinaryIO
+
+from agentenv_protocol.transfers import (
+    HttpGetGrant,
+    HttpPostPolicyGrant,
+    HttpPutGrant,
+)
 
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 
 @dataclass(frozen=True)
+class UploadPolicy:
+    """A signed multipart POST that uploads any object under one prefix, and when it stops working."""
+    write: HttpPostPolicyGrant
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
 class ObjectMetadata:
-    """Metadata of a stored object."""
+    """Metadata of a stored object. ``content_encoding`` is how the stored bytes are encoded (such
+    as ``gzip``); reads return the bytes as stored, so ``size`` counts the encoded bytes."""
     content_type: str | None = None
     size: int | None = None
     last_modified: datetime | None = None
+    content_encoding: str | None = None
 
 
 class ObjectStore(ABC):
@@ -22,8 +39,14 @@ class ObjectStore(ABC):
 
     Write ops return an ``object_url`` — an opaque, backend-specific locator
     (persisted on documents) that read ops accept back; ``object_url(key)``
-    reproduces it without writing.
+    reproduces it without writing. A read of a missing object raises ObjectNotFoundError.
     """
+
+    # Whether this store can serve the three issue_* grant methods; callers check this, not
+    # the NotImplementedError the defaults raise.
+    supports_transfer_grants: bool = False
+    # The largest object one upload through a grant can create, where the provider caps it.
+    max_single_upload_bytes: int | None = None
 
     @classmethod
     def from_config(cls, **config) -> ObjectStore:
@@ -62,8 +85,8 @@ class ObjectStore(ABC):
 
     @abstractmethod
     def get_object_metadata(self, key: str) -> ObjectMetadata | None:
-        """Metadata (content_type, size, last_modified) for the object at ``key``,
-        or None if it does not exist. Unpersisted fields come back None."""
+        """Metadata (content_type, size, last_modified, content_encoding) for the object at
+        ``key``, or None if it does not exist. Unpersisted fields come back None."""
 
     @abstractmethod
     def get_object_metadata_at(self, object_url: str) -> ObjectMetadata | None:
@@ -84,11 +107,25 @@ class ObjectStore(ABC):
     @abstractmethod
     def get_object_key(self, object_url: str) -> str:
         """The logical key ``object_url`` addresses — inverse of ``object_url(key)``.
-        Only valid for object_urls in this store (raises otherwise)."""
+        Only valid for object_urls in this store (raises ValueError otherwise)."""
+
+    def owns(self, object_url: str) -> bool:
+        """Whether ``object_url`` is one of this store's own urls (what ``object_url(key)`` can
+        return), so callers need not read its scheme; the explicit-url reads may reach further."""
+        try:
+            self.get_object_key(object_url)
+        except ValueError:
+            return False
+        return True
 
     @abstractmethod
     def download_to_file(self, object_url: str, dest_path: str) -> None:
         """Stream the object at an object_url to a local path, creating parent dirs."""
+
+    def open(self, object_url: str) -> BinaryIO:
+        """The object at an object_url as a readable binary stream. The default reads it whole;
+        a backend that can stream overrides this."""
+        return io.BytesIO(self.get(object_url))
 
     def read(self, key: str) -> bytes:
         """Read by key — convenience for the list→read flow (``get(object_url(key))``)."""
@@ -117,3 +154,45 @@ class ObjectStore(ABC):
         fields. Pass the whole value on, not just ``url``.
         """
         return None
+
+    def shared_credentials_env(self) -> dict[str, str]:
+        """Environment variables handing credentials to the agents and env services agent-env
+        deploys, so they can use this store directly. None by default; a deployment that wants
+        it overrides this, and the workloads get whatever scope those credentials carry."""
+        return {}
+
+    def issue_read_grant(
+        self, object_url: str, *, expires_in: int = 3600
+    ) -> HttpGetGrant:
+        """An HTTPS GET grant for the existing object at ``object_url``. ``expires_at`` is at most
+        ``expires_in`` away, and earlier if the store's signing credentials expire first; raise
+        GrantUnavailableError for an ``expires_in`` beyond what the store can sign."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot issue remote object-transfer grants"
+        )
+
+    def issue_write_grant(
+        self,
+        object_url: str,
+        *,
+        media_type: str,
+        max_bytes: int,
+        expires_in: int = 3600,
+    ) -> HttpPutGrant:
+        """An HTTPS PUT grant for one object at ``object_url``, signed for ``media_type`` and
+        bounded to ``max_bytes`` where the provider can enforce that; expiry as for a read grant."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot issue remote object-transfer grants"
+        )
+
+    def issue_upload_policy(
+        self, prefix_url: str, *, max_object_bytes: int, expires_in: int
+    ) -> UploadPolicy:
+        """A multipart POST policy for uploads of at most ``max_object_bytes`` each to any key
+        below ``prefix_url``. It is handed over once for a long capture, so it must last all of
+        ``expires_in``: raise GrantUnavailableError when it might not, judged by the kind of
+        credentials that sign it rather than by how long they have left. Object counts and total
+        size are the uploader's to enforce."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot issue remote object-transfer grants"
+        )

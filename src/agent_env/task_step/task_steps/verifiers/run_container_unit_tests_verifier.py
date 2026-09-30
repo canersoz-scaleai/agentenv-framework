@@ -22,6 +22,7 @@ consumers must read `extracted_files` to grade.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import time
 import uuid
 from typing import Any, ClassVar, Optional
 
-from agent_env.providers.sandbox_provider import (
+from agent_env.providers.sandbox_providers.sandbox_provider import (
     all_sandbox_container_env,
     registered_sandbox_provider_classes,
 )
@@ -198,7 +199,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.artifact.artifacts.file import FileArtifact
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             build_sandbox_provider,
             get_sandbox_provider,
         )
@@ -295,19 +296,24 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
                 extracted_files[result_path] = None
 
         # 7. Persist stdout + stderr as separate FileArtifacts
-        ts = int(time.time())
-        bucket = config.get_s3_bucket()
-        stdout_artifact = self._upload_text_artifact(
+        # Every execution gets its own key: a retried step keeps its run's instance id, and the
+        # outputs are write-once. The instance id and the time only group and order them.
+        run = "-".join(filter(None, (context.instance_id, str(int(time.time())), uuid.uuid4().hex[:12])))
+        store = config.get_object_store()
+        outputs = f"{config.get_artifact_key_prefix()}verifier-outputs/{self.id}/{run}"
+        stdout_artifact = await asyncio.to_thread(
+            self._upload_text_artifact,
             text=stdout,
-            artifact_id=f"verifier-stdout-{self.id}-{ts}",
+            artifact_id=f"verifier-stdout-{self.id}-{run}",
             description=f"stdout of {self.verifier_id} from step {self.id}",
-            s3_url=f"s3://{bucket}/verifier-outputs/{self.id}/{ts}/stdout.txt",
+            s3_url=store.object_url(f"{outputs}/stdout.txt"),
         )
-        stderr_artifact = self._upload_text_artifact(
+        stderr_artifact = await asyncio.to_thread(
+            self._upload_text_artifact,
             text=stderr,
-            artifact_id=f"verifier-stderr-{self.id}-{ts}",
+            artifact_id=f"verifier-stderr-{self.id}-{run}",
             description=f"stderr of {self.verifier_id} from step {self.id}",
-            s3_url=f"s3://{bucket}/verifier-outputs/{self.id}/{ts}/stderr.txt",
+            s3_url=store.object_url(f"{outputs}/stderr.txt"),
         )
 
         # 8. Record on context (shape compatible with aggregate_verifiers).

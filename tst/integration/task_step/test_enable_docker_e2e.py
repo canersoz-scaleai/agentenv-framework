@@ -93,7 +93,7 @@ async def test_enable_docker_gives_agent_working_docker():
 
 
 async def _terminate_agent_sandboxes(context: TaskStepContext) -> None:
-    from agent_env.providers.sandbox_provider import get_agent_sandbox_provider
+    from agent_env.providers.sandbox_providers.sandbox_provider import get_agent_sandbox_provider
 
     for agent in context.deployed_agents:
         if not agent.sandbox_id:

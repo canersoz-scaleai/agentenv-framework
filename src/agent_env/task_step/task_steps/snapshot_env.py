@@ -12,12 +12,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import ClassVar, Optional
+from urllib.parse import urlparse
 
 import httpx
 
 from agentenv_protocol import FilePart
 
+from agent_env.env.gateway.constants import EXT_TRAJECTORY_URI
 from agent_env.store import get_config
+from agent_env.store.object_store import S3ObjectStore
+from agent_env.store.routing import in_local_run
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef, RefRole
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -35,29 +39,27 @@ _S3_CREDENTIALS_EXTENSION_URI = "urn:agentenv:add-s3-credentials/v1"
 
 
 async def _push_s3_credentials(base_url: str, card: dict, timeout_seconds: float) -> None:
-    """Best-effort: push the worker's frozen AWS creds + bucket to a service
-    advertising add_s3_credentials. Never raises (get_data falls back)."""
+    """Best-effort: push the object store's shared AWS creds + bucket to a service
+    advertising add_s3_credentials, if the store shares any. Never raises (get_data falls back).
+    An @local run's snapshots land in the local stores, so it hands a service no credentials to
+    upload one to S3 with; the service returns it instead."""
     from agentenv_protocol import client as protocol_v1
 
-    if protocol_v1.find_extension(card, _S3_CREDENTIALS_EXTENSION_URI) is None:
+    if protocol_v1.find_extension(card, _S3_CREDENTIALS_EXTENSION_URI) is None or in_local_run():
         return
     try:
-        import boto3
-
-        from agent_env.config import get_config
-
-        session = boto3.Session()
-        creds = session.get_credentials()
-        if creds is None:
-            logger.warning("snapshot_env: no AWS creds to push to %s", base_url)
+        store = get_config().get_object_store()
+        if not isinstance(store, S3ObjectStore):
             return
-        frozen = creds.get_frozen_credentials()
+        env = await asyncio.to_thread(store.shared_credentials_env)
+        if "AWS_ACCESS_KEY_ID" not in env:
+            return
         params = {
-            "aws_access_key_id": frozen.access_key,
-            "aws_secret_access_key": frozen.secret_key,
-            "aws_session_token": frozen.token,
-            "region_name": session.region_name or "us-west-2",
-            "bucket": get_config().get_s3_bucket(),
+            "aws_access_key_id": env["AWS_ACCESS_KEY_ID"],
+            "aws_secret_access_key": env["AWS_SECRET_ACCESS_KEY"],
+            "aws_session_token": env.get("AWS_SESSION_TOKEN"),
+            "region_name": env.get("AWS_DEFAULT_REGION"),
+            "bucket": store.bucket,
         }
         await protocol_v1.invoke_extension(
             base_url,
@@ -93,7 +95,7 @@ class SnapshotEnvTaskStep(TaskStep):
     ``gateway_url``, ``snapshot_id`` and ``original_universe_artifact_id`` are
     optional overrides; universe metadata carries over from that id, else the
     loaded universe. The generated snapshot id is stable across
-    Temporal retries of a run, so retries bump versions instead of minting
+    retries of a run, so retries bump versions instead of minting
     duplicate universes.
 
     Output: ``context.metadata["env_snapshotted_universes"][self.id]`` =
@@ -162,13 +164,13 @@ class SnapshotEnvTaskStep(TaskStep):
         )
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        from agent_env.env.env import Env
+        from agent_env.env.env import Env, gateway_url_of
 
         deployed = self._resolve_deployed_env(context)
         env_id = self.env_id or (deployed.env_id if deployed else None)
         if not env_id:
             raise RuntimeError("snapshot_env could not resolve an env_id")
-        gateway_url = self.gateway_url or (deployed.gateway_url if deployed else None)
+        gateway_url = self.gateway_url or gateway_url_of(deployed)
         if not gateway_url:
             raise RuntimeError(
                 f"Deployed env '{env_id}' has no gateway_url and no override was provided"
@@ -177,7 +179,7 @@ class SnapshotEnvTaskStep(TaskStep):
         if self.include_env_trajectory:
             entry: dict = {"captured_at_utc": datetime.now(timezone.utc).isoformat(), "capture_step_id": self.id}
             try:
-                await asyncio.wait_for(self._capture_env_trajectory(entry, context, env_id, gateway_url), timeout=_TRAJECTORY_CAPTURE_BUDGET_SECONDS)
+                await asyncio.wait_for(self._capture_env_trajectory(entry, context, env_id, deployed), timeout=_TRAJECTORY_CAPTURE_BUDGET_SECONDS)
             except Exception as e:
                 detail = f"{type(e).__name__}: {str(e)[:200]}"
                 logger.warning(f"snapshot_env: env trajectory capture aborted (continuing): {detail}")
@@ -278,22 +280,26 @@ class SnapshotEnvTaskStep(TaskStep):
             f"(have: {[d.env_id for d in context.deployed_envs]})"
         )
 
-    async def _capture_env_trajectory(self, entry: dict, context: TaskStepContext, env_id: str, gateway_url: str) -> None:
+    async def _capture_env_trajectory(self, entry: dict, context: TaskStepContext, env_id: str, deployed) -> None:
         """Stream the trajectory to a temp file, upload it verbatim (no envelope), and fill ``entry``."""
+        method, url = _trajectory_route(deployed, self.gateway_url)
         store = get_config().get_object_store()
         event_count = 0
         timeout = httpx.Timeout(_TRAJECTORY_CAPTURE_BUDGET_SECONDS, connect=_CONNECT_TIMEOUT_SECONDS)
         tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("GET", f"{gateway_url.rstrip('/')}/trajectory") as response:
+                async with client.stream(method, url) as response:
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes():
                         tmp.write(chunk)
                         event_count += chunk.count(b"\n")
             tmp.close()
             instance_key = context.instance_id or f"adhoc-{uuid.uuid4().hex[:12]}"
-            key = f"env_trajectory/instance_id={instance_key}/{env_id}-{uuid.uuid4().hex[:8]}.jsonl"
+            key = (
+                f"{get_config().get_artifact_key_prefix()}env_trajectory/"
+                f"instance_id={instance_key}/{env_id}-{uuid.uuid4().hex[:8]}.jsonl"
+            )
             object_url = await asyncio.to_thread(store.put_file, key, tmp.name, "application/jsonl")
         finally:
             tmp.close()
@@ -344,24 +350,24 @@ class SnapshotEnvTaskStep(TaskStep):
 
     @staticmethod
     async def _export_environment_to_file(
-        gateway_url: str, environment_name: str, tmp_path: str, timeout_seconds: float
+        gateway_url: str, environment_name: str, tmp_path: str, timeout_seconds: float, deployed=None
     ) -> str:
         """Export one service; return the suffix written (".json"/".zip") to
-        ``tmp_path``, or an ``s3://`` url if the service returned an ``s3://``
-        FilePart (nothing written to ``tmp_path`` then — export_one registers it).
+        ``tmp_path``, or the object url a FilePart names when the service uploaded the
+        bundle itself (nothing written to ``tmp_path`` then — export_one registers it).
 
-        v1 ``get_data``: ``DataPart`` → json; ``FilePart`` → ``s3://`` url (no
+        v1 ``get_data``: ``DataPart`` → json; ``FilePart`` → object url (no
         download) / base64 ``bytes`` / streamed relative-or-http ``uri`` → ".zip";
         else legacy ``GET /export-state`` streamed to disk with a first-byte JSON
         guard. Errors are caught by the caller (fails just this service)."""
         from agent_env.env import legacy_protocol
         from agentenv_protocol import client as protocol_v1
 
-        base_url = legacy_protocol.environment_base_url(gateway_url, environment_name, mcp=True)
-        if await protocol_v1.supports_v1(base_url):
+        base_url = await legacy_protocol.v1_base_url(deployed, gateway_url, environment_name, mcp=True)
+        if base_url is not None:
             # Push S3 creds (no-op unless the service advertises the extension).
-            card = await protocol_v1.get_card(base_url)
-            await _push_s3_credentials(base_url, card, timeout_seconds)
+            card_base, card = await legacy_protocol.child_env_card(deployed, gateway_url, environment_name)
+            await _push_s3_credentials(card_base, card or {}, timeout_seconds)
             resp = await protocol_v1.get_data(base_url, timeout=int(timeout_seconds))
             part = resp.parts[0] if resp.parts else None
             if isinstance(part, FilePart):
@@ -377,15 +383,16 @@ class SnapshotEnvTaskStep(TaskStep):
                         raise ValueError(
                             f"FilePart for '{environment_name}' has neither bytes nor uri"
                         )
-                    # Service already uploaded to S3 — hand back the url as-is;
-                    # export_one registers it directly (no download). The key's
-                    # basename carries the shape (e.g. gdrive.zip).
-                    if uri.startswith("s3://"):
+                    # Any url but http(s) is an object the service uploaded itself — hand
+                    # it back as-is; export_one registers it directly (no download). Its
+                    # last segment carries the shape (e.g. gdrive.zip).
+                    scheme = urlparse(uri).scheme
+                    if scheme and scheme not in ("http", "https"):
                         return uri
                     # A relative uri (e.g. "export-snapshot") means "stream it from
                     # my service endpoint" — resolve against the service base_url so
                     # multi-GB bundles never ride inline in the JSON-RPC response.
-                    if not uri.startswith(("http://", "https://")):
+                    if not scheme:
                         uri = f"{base_url.rstrip('/')}/{uri.lstrip('/')}"
                     async with httpx.AsyncClient() as client:
                         async with client.stream(
@@ -405,10 +412,11 @@ class SnapshotEnvTaskStep(TaskStep):
                 json.dump(state, f, default=str)
             return ".json"
 
+        legacy_url = f"{legacy_protocol.environment_base_url(gateway_url, environment_name, mcp=True)}/export-state"
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "GET",
-                f"{base_url}/export-state",
+                legacy_url,
                 timeout=httpx.Timeout(timeout_seconds, connect=_CONNECT_TIMEOUT_SECONDS),
             ) as resp:
                 resp.raise_for_status()
@@ -443,6 +451,7 @@ class SnapshotEnvTaskStep(TaskStep):
 
         A classmethod so callers that have no step instance can reuse it."""
         from agent_env.artifact import FileArtifact, EnvironmentArtifact, EnvironmentUniverseArtifact
+        from agent_env.env.env import gateway_url_of
 
         services = cls._enumerate_environments(env)
         gateway = gateway_url.rstrip("/")
@@ -474,6 +483,8 @@ class SnapshotEnvTaskStep(TaskStep):
                     raise  # caller named this id — surface a bad one
                 logger.warning("snapshot_env: failed to carry metadata from %s", source_id, exc_info=True)
 
+        # The stored card describes the deployment's own gateway; an override pointing elsewhere keeps the live probe.
+        card_record = deployed if deployed is not None and (gateway_url_of(deployed) or "").rstrip("/") == gateway else None
         sem = asyncio.Semaphore(concurrency)
 
         async def export_one(environment_name: str):
@@ -487,7 +498,8 @@ class SnapshotEnvTaskStep(TaskStep):
                 try:
                     try:
                         result = await cls._export_environment_to_file(
-                            gateway, environment_name, tmp_path, export_timeout_seconds
+                            gateway, environment_name, tmp_path, export_timeout_seconds,
+                            deployed=card_record,
                         )
                     except httpx.HTTPStatusError as e:
                         body_snippet = ""
@@ -504,32 +516,29 @@ class SnapshotEnvTaskStep(TaskStep):
                         return str(e), str(e)
 
                     # Service uploaded the bundle itself — register a FileArtifact
-                    # pointing at it directly (no download). The s3 url is just a
-                    # path: derive filename/content_type from its basename (the
-                    # extension drives load-time parsing), like FileArtifact.put.
-                    if result.startswith("s3://"):
-                        from urllib.parse import urlparse
-
+                    # pointing at it directly (no download). Derive filename/content_type
+                    # from the url's last segment (the extension drives load-time parsing),
+                    # like FileArtifact.put.
+                    if urlparse(result).scheme:
                         from agent_env.artifact.store import get_artifact_store
-                        from agent_env.config import get_config
 
-                        s3_url = result
-                        filename = os.path.basename(urlparse(s3_url).path) or f"{environment_name}.zip"
+                        object_url = result
+                        filename = object_url.rsplit("/", 1)[-1] or f"{environment_name}.zip"
                         content_type = mimetypes.guess_type(filename)[0] or "application/zip"
 
-                        def _register_s3_ref():
-                            object_store = get_config().get_object_store()
-                            if object_store.get_object_metadata_at(s3_url) is None:
-                                raise FileNotFoundError(f"snapshot bundle not found at {s3_url}")
+                        def _register_uploaded_bundle():
+                            if get_config().get_object_store().get_object_metadata_at(object_url) is None:
+                                raise FileNotFoundError(f"snapshot bundle not found at {object_url}")
                             store = get_artifact_store()
                             fa_id = f"{snapshot_id}-{environment_name}-file"
+                            get_config().check_object_url(fa_id, object_url)
                             fa = FileArtifact(
                                 id=fa_id,
                                 version=store.next_version(fa_id),
                                 description=f"State snapshot of {environment_name} from env {env.id}",
                                 filename=filename,
                                 content_type=content_type,
-                                s3_url=s3_url,
+                                s3_url=object_url,
                             )
                             fa = store.put_document(fa)
                             return EnvironmentArtifact.put(
@@ -539,9 +548,9 @@ class SnapshotEnvTaskStep(TaskStep):
                             )
 
                         try:
-                            return await asyncio.to_thread(_register_s3_ref)
+                            return await asyncio.to_thread(_register_uploaded_bundle)
                         except Exception as e:
-                            public = f"failed to register s3 artifact ({type(e).__name__})"
+                            public = f"failed to register the uploaded bundle ({type(e).__name__})"
                             return public, f"{public} for {environment_name}: {e}"
 
                     # Otherwise `result` is the written suffix (.json/.zip).
@@ -615,3 +624,14 @@ class SnapshotEnvTaskStep(TaskStep):
             environments_snapshotted=[sa.environment_name for sa in environment_artifacts],
             total=len(services),
         )
+
+
+def _trajectory_route(deployed, override_url: Optional[str]) -> tuple[str, str]:
+    """The verb and URL of the env trajectory: an override keeps `{override}/trajectory`, else the stored card names them."""
+    if override_url:
+        return "GET", f"{override_url.rstrip('/')}/trajectory"
+    from agentenv_protocol import client as protocol_v1
+
+    deployed.require(EXT_TRAJECTORY_URI, "get")
+    op = protocol_v1.find_extension_method(deployed.environment_card, EXT_TRAJECTORY_URI, "get")
+    return op["method"], f"{deployed.environment_url}{op['endpoint']}"

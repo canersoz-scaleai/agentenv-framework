@@ -18,8 +18,8 @@ from tst.util.config import config_with_document
 from agent_env.config.errors import ConfigError
 from agent_env.env.registry import _merge_config_toml_envs
 from agent_env.explorer.plugin import load_plugins
-from agent_env.providers.sandbox_provider import _merge_config_toml_sandbox_providers
-from agent_env.providers.state.env_state_provider import _merge_config_toml_state_providers
+from agent_env.providers.sandbox_providers.sandbox_provider import _merge_config_toml_sandbox_providers
+from agent_env.providers.env_state.env_state_provider import _merge_config_toml_state_providers
 from agent_env.task_step.registry import _merge_config_toml_steps
 
 # Each builder, the top-level section it reads, and a call that builds into a throwaway

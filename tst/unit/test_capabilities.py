@@ -148,7 +148,7 @@ def _fake_e2b_builder(monkeypatch, outcome):
             raise outcome
         return outcome
 
-    monkeypatch.setattr("agent_env.providers.sandbox_provider.build_sandbox_provider", build)
+    monkeypatch.setattr("agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider", build)
 
 
 def test_e2b_absent_when_its_config_is_missing(monkeypatch):

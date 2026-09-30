@@ -439,6 +439,7 @@ class SnapshotSeries:
             a2a_card=a2a_card,
             context_id=self.a2a_context_id,
             timeout_seconds=remaining(),
+            trajectory_output_prefix=self.trajectory_output_prefix,
         )
         if traj.reason and is_final:
             recorded = self._recorded_trajectory_uri(context)
@@ -446,6 +447,8 @@ class SnapshotSeries:
             reasons.append(traj.reason if recorded else f"{traj.reason}; trajectory_missing")
         elif traj.reason:
             reasons.append(traj.reason)
+        elif traj.object_url:
+            row["trajectory_s3_uri"] = traj.object_url
         else:
             try:
                 row["trajectory_s3_uri"] = await asyncio.to_thread(
@@ -475,7 +478,7 @@ class SnapshotSeries:
         recording its ``{id, version}`` on the row. Returns a reason on failure —
         the export is all-or-nothing, so one unreachable service costs this leg of
         the tick, not the workspace bundle."""
-        from agent_env.env.env import Env
+        from agent_env.env.env import Env, gateway_url_of
         from agent_env.task_step.task_steps.snapshot_env import SnapshotEnvTaskStep
 
         deployed = next(
@@ -487,7 +490,7 @@ class SnapshotSeries:
                 self.step_id, self.config.env_id, [d.env_id for d in context.deployed_envs],
             )
             return "env_not_deployed"
-        if not deployed.gateway_url:
+        if not gateway_url_of(deployed):
             return "env_has_no_gateway_url"
 
         try:
@@ -516,8 +519,8 @@ class SnapshotSeries:
     def _recorded_trajectory_uri(self, context: TaskStepContext) -> Optional[str]:
         """This rollout's per-turn trajectory uri from ``prompt_responses``.
 
-        Matched on ``a2a_context_id``, newest-first: a Temporal retry restores the
-        context from the last heartbeat, so an earlier attempt's response for the
+        Matched on ``a2a_context_id``, newest-first: a retry can restore a context
+        snapshot taken during an earlier attempt, so that attempt's response for the
         same ``prompt_id`` can still be present and would otherwise attach a
         previous conversation's trajectory to this capture.
         """

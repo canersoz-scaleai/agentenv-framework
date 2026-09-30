@@ -17,7 +17,7 @@ import uuid
 
 import pytest
 
-from agent_env.env.env import DeployedEnv, Env
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, Env
 from agent_env.env.store import reset_env_store
 from agent_env.config import Config, configure, get_config, reset_config
 from agent_env.store.document_store import Filter
@@ -47,7 +47,7 @@ class _CustomEnv(Env):
                    metadata=data.get("metadata"), flavor=data.get("flavor", "plain"))
 
     async def deploy(self, **kwargs) -> DeployedEnv:
-        return DeployedEnv(
+        return DeployedGatewayEnv(
             env_id=self.id, env_version=self.version or 1,
             gateway_url=f"https://gw.example/{self.id}",
             mcp_url=f"https://mcp.example/{self.id}",

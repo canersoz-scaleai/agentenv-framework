@@ -40,16 +40,21 @@ This is the same install CI performs. `make install` is equivalent.
 | `make unit-test` | unit suite for `agentenv-framework` and `agentenv-protocol` | nothing external |
 | `make int-test-fast` | integration tests against the local backends | Docker |
 | `make int-test-slow` | tests that build images or deploy sandboxes, minutes each | Docker, and a sandbox backend for some |
+| `make clean-install-test` | both distributions built as the release builds them, installed into a fresh venv from public PyPI, and `agent-env run hello` run twice by name | Python 3.11, uv and git |
+| `make installer-test` | `plugin add` and `remove` through the real pip, uv and pipx, offline against wheels built from the checkout, and the new-user journey in containers with no network | uv, pipx and Docker; the first run downloads the dependencies once |
 
 CI runs the same tiers as the `unit`, `integration-local` and `integration-local-slow` jobs;
-all three must pass. One exception: the public jobs exclude
+all three must pass, and so must `plugin-api` (see "Making changes"). The `installer` job runs
+`make installer-test` too, on pull requests that touch the plugin code, the installer tier or
+the lockfile, and must pass when it runs. One exception: the public jobs exclude
 `tst/integration/env/gateway/gateway_test.py`, which needs an x86 Chromium build that the
 hosted runners do not have; its virtual-clock tests also build MCP servers from sources outside
 this repository, found through `AGENT_ENV_TEST_MCP_SERVERS_DIR` (one `<server>/Dockerfile` per
 server), and skip without them. `make int-test-slow` does run it, so run that locally when your
 change touches the gateway, and say so in the pull request. A test may skip only when a capability is genuinely unavailable, and the skip reason
 must name it (`agentenv-capability-missing: <name>`, see `tst/util/capabilities.py`); the
-`check_skip_policy` step fails the run otherwise.
+`check_skip_policy` step fails the run otherwise. The `clean-install` job runs the same script as
+`make clean-install-test` on every pull request, and is one of the required checks.
 
 ## Making changes
 
@@ -61,7 +66,11 @@ must name it (`agentenv-capability-missing: <name>`, see `tst/util/capabilities.
 - Imports go at the top of the module.
 - Title the pull request `type(scope): summary`, for example `fix(gateway): forward the request
   target as received`. Types in use: `feat`, `fix`, `refactor`, `docs`, `test`, `build`, `ci`,
-  `security`.
+  `chore`, `perf`, `security`. The title becomes the commit title.
+- Mark a breaking change with `!` after the scope: `feat(plugins)!: summary`. The `plugin-api` job
+  fails a pull request that breaks the plugin surface (README "Plugin compatibility") without it,
+  lists what broke, and runs again when you edit the title. To run it before you push:
+  `.venv/bin/python .github/scripts/check_plugin_api.py --base origin/main --title "<title>"`.
 - Commit with an email address you are comfortable publishing; the history of this repository is
   public. GitHub's `noreply` address is a good default.
 

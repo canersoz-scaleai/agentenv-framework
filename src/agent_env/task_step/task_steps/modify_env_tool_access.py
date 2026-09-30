@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from typing import ClassVar, Optional
 
-import httpx
-
 from agent_env.env.gateway import TOOL_DISABLE_ACTION, TOOL_ENABLE_ACTION
+from agent_env.env.gateway.constants import EXT_DISABLE_TOOL_URI, EXT_ENABLE_TOOL_URI
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -64,11 +63,7 @@ class ModifyEnvToolAccessStep(TaskStep):
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
-        url = f"{deployed.gateway_url}/tools/{self.action}"
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json={"role": self.role, "tools": self.tools}, timeout=30)
-            resp.raise_for_status()
-            body = resp.json()
+        body = await deployed.invoke(_TOOL_ACCESS_URIS[self.action], self.action, {"role": self.role, "tools": self.tools})
         logger.info(f"{self.action} role={self.role!r} tools={self.tools} on env={self.env_id}: {body}")
         context.metadata.setdefault("tool_access_changes", []).append({
             "step_id": self.id,
@@ -79,3 +74,7 @@ class ModifyEnvToolAccessStep(TaskStep):
             "role_state_after": {"disabled": body.get("disabled", []), "allowed": body.get("allowed", [])},
         })
         return context
+
+
+# The gateway extension each action is advertised under on the env card.
+_TOOL_ACCESS_URIS = {TOOL_DISABLE_ACTION: EXT_DISABLE_TOOL_URI, TOOL_ENABLE_ACTION: EXT_ENABLE_TOOL_URI}

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.env.env_artifact_store import EnvArtifactType
 from agent_env.task_step.context import TaskStepContext
 from agent_env.task_step.task_steps.multienv_validator.combine_universe_verdicts import (
@@ -29,7 +29,7 @@ class _FakeStore:
 
 
 def _deployed_env(env_id="multi-x", env_version=3):
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id=env_id, env_version=env_version, gateway_url="g", mcp_url="m",
         db_web_url=None, sandbox_id="sb-1",
     )
@@ -111,13 +111,13 @@ def test_serialization_round_trip():
     assert back.judge_verifier_id == VID
 
 
-# --- The "environments" twin across the Temporal step boundary -----------------------------
+# --- The "environments" twin across a serialization boundary --------------------------------
 #
 # VerifyUniverseLoadExportRoundtripStep builds ONE dict and binds it to both "services" and
 # "environments" (dual-write during the service->environment rename), so in-process every mutation
 # lands in both. That aliasing does NOT survive serialization: dataclasses.asdict recurses per key
-# with no shared memo, and JSON has no notion of object identity — so after a Temporal heartbeat or
-# an activity hand-off the twins are two independent dicts. apply_judge_verdict writes only
+# with no shared memo, and JSON has no notion of object identity — so once the context is
+# serialized between processes the twins are two independent dicts. apply_judge_verdict writes only
 # "services", so the twin would persist stale without the re-point in the combine step.
 
 
@@ -149,27 +149,26 @@ def _judge_flags_slack_and_refs():
     }
 
 
-def _cross_temporal_boundary(ctx: TaskStepContext) -> TaskStepContext:
-    """Round-trip the context exactly the way the Temporal worker does: _sanitize_context
-    (dataclasses.asdict) -> JSON payload/heartbeat -> _context_from_json (TaskStepContext.from_dict).
-    default=str mirrors the worker's tolerant encoder."""
+def _cross_process_boundary(ctx: TaskStepContext) -> TaskStepContext:
+    """Round-trip the context the way an out-of-process runner does: dataclasses.asdict ->
+    JSON -> TaskStepContext.from_dict, with a tolerant default=str encoder."""
     return TaskStepContext.from_dict(json.loads(json.dumps(dataclasses.asdict(ctx), default=str)))
 
 
-def test_alias_does_not_survive_the_temporal_boundary():
+def test_alias_does_not_survive_the_process_boundary():
     """Premise pin: aliased in-process, two independent dicts after asdict and after JSON."""
     pv = _pv_aliased()
     assert pv["services"] is pv["environments"]
 
     ctx = _ctx({EnvArtifactType.UNIVERSE_COMPATIBILITY: pv})
 
-    # dataclasses.asdict alone already splits them — the worker's _sanitize_context is enough.
+    # dataclasses.asdict alone already splits them.
     as_dict = dataclasses.asdict(ctx)["metadata"]["verifications"][EnvArtifactType.UNIVERSE_COMPATIBILITY]
     assert as_dict["services"] is not as_dict["environments"]
     assert as_dict["services"]["slack"] is not as_dict["environments"]["slack"]
 
     # ...and so does a full JSON round-trip.
-    crossed = _cross_temporal_boundary(ctx).metadata["verifications"][EnvArtifactType.UNIVERSE_COMPATIBILITY]
+    crossed = _cross_process_boundary(ctx).metadata["verifications"][EnvArtifactType.UNIVERSE_COMPATIBILITY]
     assert crossed["services"] is not crossed["environments"]
     assert crossed["services"]["slack"] is not crossed["environments"]["slack"]
 
@@ -179,7 +178,7 @@ async def test_environments_twin_not_stale_when_judge_gates_after_boundary(fake_
     """The judge's False must reach BOTH twins in the persisted doc, even though the boundary broke
     the alias and apply_judge_verdict writes only "services"."""
     ctx = _ctx({EnvArtifactType.UNIVERSE_COMPATIBILITY: _pv_aliased(), VID: _judge_flags_slack_and_refs()})
-    crossed = _cross_temporal_boundary(ctx)
+    crossed = _cross_process_boundary(ctx)
     pre = crossed.metadata["verifications"][EnvArtifactType.UNIVERSE_COMPATIBILITY]
     assert pre["services"] is not pre["environments"]  # guard: the boundary really did split them
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Optional, Self, TypeVar
 
 from agent_env.config import get_config
 from agent_env.plugins import _registration
@@ -19,7 +21,6 @@ from agent_env.store.document_store import (
     UpdateSpec,
     VersionedEntityStore,
     VersionedEntityStoreCache,
-    reject_reserved_id,
 )
 from agent_env.store.ids import key_segment
 from agent_env.store.query import QueryBuilder, to_document_query
@@ -27,13 +28,30 @@ from agent_env.store.query import QueryBuilder, to_document_query
 if TYPE_CHECKING:
     from agent_env.artifact.artifact import Artifact
 
+_A = TypeVar("_A", bound="Artifact")
+
 ARTIFACTS_COLLECTION = "artifacts"
 
 # Retry cap for the version-allocation race in put_document.
 _MAX_VERSION_RETRIES = 3
 
+_write_locks: dict[str, threading.Lock] = {}
+_write_locks_guard = threading.Lock()
+
+
+def artifact_write_lock(artifact_id: str) -> threading.Lock:
+    """A lock for writing ``artifact_id`` from this process. A write that allocates a version, puts
+    objects at paths named by it and then records the document takes the same version as any
+    other write of that id running alongside it; hold this around the whole write to take turns."""
+    with _write_locks_guard:
+        return _write_locks.setdefault(artifact_id, threading.Lock())
+
 # Fields that address the document rather than describe it, so `set_field` must not touch them.
 _IDENTITY_FIELDS = frozenset({"id", "version", "type"})
+
+
+# Hex digits of the attempt part of an object prefix: enough that two attempts never meet.
+_ATTEMPT_ID_LENGTH = 8
 
 
 class ArtifactQuery(QueryBuilder["Artifact"]):
@@ -100,10 +118,19 @@ class ArtifactStore:
         return artifact
 
     def next_version(self, id: str) -> int:
-        # Every put asks for its version before writing an object or pushing an image, so a
-        # reserved id is refused here rather than after those side effects, in put_document.
-        reject_reserved_id(id)
+        # Every put asks for its version before writing an object or pushing an image, so an id
+        # the store refuses, or a bare one while an @local task runs, is refused here rather than
+        # after those side effects, in put_document.
+        self._doc_store.check_id(id)
+        get_config().check_local_run_write(id)
         return self._versioned.next_version(id)
+
+    def attempt_prefix(self, artifact_type: str, id: str) -> str:
+        """An object-store prefix of its own for one write of ``id``'s next version. Objects are written
+        once, so a write that fails partway must not leave its objects where the next attempt writes."""
+        attempt = f"{self.next_version(id)}-{uuid.uuid4().hex[:_ATTEMPT_ID_LENGTH]}"
+        key = f"{get_config().get_artifact_key_prefix()}artifacts/{artifact_type}/{key_segment(id)}/{attempt}"
+        return get_config().get_object_store_for(id).object_url(key).rstrip("/") + "/"
 
     def put_object(
         self,
@@ -121,7 +148,7 @@ class ArtifactStore:
         set allow_overwrite=True for mutable data (e.g. rolling run snapshots).
         """
         key = self._object_key(artifact_type, id, version, object_name)
-        return get_config().get_object_store().put(key, data, content_type, allow_overwrite)
+        return get_config().get_object_store_for(id).put(key, data, content_type, allow_overwrite)
 
     def put_object_file(
         self,
@@ -134,7 +161,7 @@ class ArtifactStore:
     ) -> str:
         """Write-once upload of a local file (multipart for large files); return its object URL."""
         key = self._object_key(artifact_type, id, version, object_name)
-        return get_config().get_object_store().put_file(key, file_path, content_type)
+        return get_config().get_object_store_for(id).put_file(key, file_path, content_type)
 
     @staticmethod
     def _object_key(artifact_type: str, id: str, version: int, object_name: str) -> str:
@@ -142,9 +169,9 @@ class ArtifactStore:
 
     def get_object(self, object_url: str) -> bytes:
         """Download an artifact object by its object_url."""
-        return get_config().get_object_store().get(object_url)
+        return get_config().get_object_store_at(object_url).get(object_url)
 
-    def put_document(self, artifact: "Artifact") -> "Artifact":
+    def put_document(self, artifact: _A) -> _A:
         """Insert an artifact document, retrying the version-allocation race.
 
         Concurrent writers to one id can allocate the same next_version; the
@@ -152,7 +179,7 @@ class ArtifactStore:
         than fail the caller (which drops a pass@k rollout).
         """
 
-        reject_reserved_id(artifact.id)
+        self._doc_store.check_id(artifact.id)
         if artifact.version < 0:
             raise ValueError(f"Artifact version must be non-negative, got {artifact.version}")
 
@@ -229,9 +256,11 @@ class ArtifactStore:
         artifact_type = canonical_type(doc["type"])
         cls = get_artifact_registry().get(artifact_type)
         if cls is None:
+            # A plugin that claims the name says why it is missing; the config remedies are for a name none claims.
+            if note := _registration.failure_note(_registration.ARTIFACTS, artifact_type):
+                raise ValueError(f"Unknown artifact type {doc['type']!r}{note}")
             raise ValueError(
-                f"Unknown artifact type {doc['type']!r}{_registration.failure_note(_registration.ARTIFACTS, artifact_type)}; "
-                f"register it under [artifacts].impls "
+                f"Unknown artifact type {doc['type']!r}; register it under [artifacts].impls "
                 f"in .agentenv/config.toml, or map a renamed type to its current spelling "
                 f"under [artifacts].type_aliases"
             )

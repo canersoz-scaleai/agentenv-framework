@@ -1,0 +1,10 @@
+[
+  {"id": "box", "type": "deploy_sandbox", "sandbox_name": "box", "sandbox_mode": "vm", "sandbox_type": "local"},
+  {"id": "load", "type": "load_artifact", "sandbox_name": "box", "artifact_id": "greeting",
+   "destination_path": "/app/greeting"},
+  {"id": "hello", "type": "verify_sandbox", "sandbox_name": "box", "base_dir": "/app/greeting",
+   "verifier_id": "hello", "criteria": [
+     {"type": "probe_file_contains", "criterion": "greets", "paths": ["hello.txt"], "expected": "hello"},
+     {"type": "bash_cmd_succeeds", "criterion": "check passes", "bash_cmd": "bash check.sh"}
+   ]}
+]

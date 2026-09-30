@@ -1,9 +1,9 @@
 """Arm a deployed env gateway's virtual clock, then sync its backing servers to it.
 
-Arms the clock (set_time), reads the gateway's server-reachable env_get_time_url from /clock/state,
-and invokes the sync_time extension (clock/v1) on each backing server that advertises it, over the
-{gateway}/svc/mcp-{service} proxy. Non-advertisers are skipped when tolerate_missing_sync_time
-(default True). Place right before prompt_agent so the virtual timeline starts at agent-start.
+Arms the clock (set_time) and reads the gateway's server-reachable env_get_time_url (state), both as the
+stored env card declares clock/v1, then invokes sync_time on each backing server whose child env card
+advertises it. Non-advertisers are skipped when tolerate_missing_sync_time (default True). Place right
+before prompt_agent so the virtual timeline starts at agent-start.
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
 logger = logging.getLogger(__name__)
-
-_SVC_PROXY_PREFIX = "svc/mcp-"
 
 
 class SyncEnvClockTaskStep(TaskStep):
@@ -81,24 +79,23 @@ class SyncEnvClockTaskStep(TaskStep):
         return names
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        from agent_env.env.env import gateway_url_of
+
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
-        gateway_url = deployed.gateway_url.rstrip("/")
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.put(f"{gateway_url}/clock/set-time",
-                                    json={"virtual_time": self.virtual_time, "virtual_seconds_per_real_second": self.virtual_seconds_per_real_second},
-                                    timeout=self.timeout_seconds)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"clock arm failed (HTTP {resp.status_code}): {resp.text}")
-            state = (await client.get(f"{gateway_url}/clock/state", timeout=self.timeout_seconds)).json()
+        try:
+            await deployed.invoke(EXT_CLOCK_URI, "set_time",
+                                  {"virtual_time": self.virtual_time, "virtual_seconds_per_real_second": self.virtual_seconds_per_real_second},
+                                  timeout=self.timeout_seconds)
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"clock arm failed (HTTP {e.response.status_code}): {e.response.text}") from e
+        state = await deployed.invoke(EXT_CLOCK_URI, "state", timeout=self.timeout_seconds)
         env_get_time_url = state.get("env_get_time_url")
 
         synced, skipped = [], []
         for service in self._service_names(deployed):
-            base_url = f"{gateway_url}/{_SVC_PROXY_PREFIX}{service}"
-            outcome = await self._sync_one(base_url, service, env_get_time_url)
+            outcome = await self._sync_one(deployed, gateway_url_of(deployed), service, env_get_time_url)
             (synced if outcome.get("synced") else skipped).append({"service": service, "environment": service, **outcome})
 
         context.metadata.setdefault("clock_configurations", []).append({
@@ -113,14 +110,15 @@ class SyncEnvClockTaskStep(TaskStep):
                            f"({[(s['service'], s.get('reason')) for s in skipped]}) — every tool still answers wall time")
         return context
 
-    async def _sync_one(self, base_url: str, service: str, env_get_time_url: Optional[str]) -> dict:
-        """Invoke sync_time on one server if it advertises clock/v1; skip (or raise) per the flag."""
-        try:
-            card = await protocol_v1.get_card(base_url, timeout=self.timeout_seconds)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404 and self.tolerate_missing_sync_time:
+    async def _sync_one(self, deployed, gateway_url: str, service: str, env_get_time_url: Optional[str]) -> dict:
+        """Invoke sync_time on one server if its card advertises clock/v1; skip (or raise) per the flag."""
+        from agent_env.env import legacy_protocol
+
+        base_url, card = await legacy_protocol.child_env_card(deployed, gateway_url, service, timeout=self.timeout_seconds)
+        if card is None:
+            if self.tolerate_missing_sync_time:
                 return {"synced": False, "reason": "no_env_card"}
-            raise
+            raise RuntimeError(f"{service} has no env card: it serves none, its card isn't named {service!r}, or the deploy couldn't read it")
         if protocol_v1.find_extension(card, EXT_CLOCK_URI) is None:
             if self.tolerate_missing_sync_time:
                 logger.info(f"sync_env_clock: {service} does not advertise {EXT_CLOCK_URI}; skipping")

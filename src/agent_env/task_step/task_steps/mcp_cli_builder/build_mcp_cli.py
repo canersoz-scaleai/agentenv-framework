@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import tempfile
@@ -14,10 +15,13 @@ from agentenv_protocol import GET_INTERFACES_EXTENSION_URI, INTERFACE_MANIFEST_P
 from agentenv_protocol import client as protocol_v1
 
 from agent_env.artifact import CliArtifact
+from agent_env.artifact.store import artifact_write_lock
 from agent_env.env import Env
+from agent_env.env.env import require_gateway_url
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef, RefRole
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
+from agent_env.task_step.thread_work import finish_on_thread
 from agent_env.task_step.task_steps.mcp_cli_builder.codegen import generate_cli_script
 
 logger = logging.getLogger(__name__)
@@ -155,35 +159,43 @@ class BuildMcpCliTaskStep(TaskStep):
         deployed = next((d for d in context.deployed_envs if d.env_id == self.env_id), None)
         if deployed is None:
             raise RuntimeError(f"Env '{self.env_id}' not found in context.deployed_envs")
+        gateway_url = require_gateway_url(deployed, "build_mcp_cli")  # the CLI it generates talks to the gateway
 
         env = Env.get(self.env_id, deployed.env_version)
         environment_name = getattr(env, "environment_name", None)
         if not environment_name:
             raise RuntimeError(f"Env '{self.env_id}' has no environment_name")
-        manifest = await fetch_interface_manifest(deployed.gateway_url, environment_name)
+        manifest = await fetch_interface_manifest(gateway_url, environment_name)
         script_source = generate_cli_script(
             self.command_name,
             interface_manifest=manifest,
             environment_name=environment_name,
         )
 
-        with tempfile.TemporaryDirectory() as tmp_str:
+        artifact = await finish_on_thread(
+            functools.partial(self._put_cli, script_source, deployed.env_version),
+            f"Uploading CLI {self.cli_artifact_id}",
+        )
+
+        context.metadata["cli_artifact"] = {"id": artifact.id, "version": artifact.version, "type": artifact.type}
+        logger.info(f"Created CliArtifact: id={artifact.id} version={artifact.version} command_name={artifact.command_name}")
+        return context
+
+    def _put_cli(self, script_source: str, env_version: Optional[int]) -> CliArtifact:
+        """Stage the CLI bundle in a temp dir and upload it as the CliArtifact, one write per id at
+        a time in this process."""
+        with artifact_write_lock(self.cli_artifact_id), tempfile.TemporaryDirectory() as tmp_str:
             cli_dir = Path(tmp_str)
             bin_dir = cli_dir / "bin"
             bin_dir.mkdir()
             entrypoint_path = bin_dir / self.command_name
             entrypoint_path.write_text(script_source)
             os.chmod(entrypoint_path, 0o755)
-
-            artifact = CliArtifact.put(
+            return CliArtifact.put(
                 id=self.cli_artifact_id,
                 command_name=self.command_name,
                 entrypoint=f"bin/{self.command_name}",
                 cli_dir=cli_dir,
                 env_id=self.env_id,
-                env_version=deployed.env_version,
+                env_version=env_version,
             )
-
-        context.metadata["cli_artifact"] = {"id": artifact.id, "version": artifact.version, "type": artifact.type}
-        logger.info(f"Created CliArtifact: id={artifact.id} version={artifact.version} command_name={artifact.command_name}")
-        return context

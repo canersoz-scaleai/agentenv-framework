@@ -8,7 +8,9 @@ from typing import Any
 
 from agent_env.env.env import DeployedEnv
 
-_REDACTED_KEYS = {"litellm_api_key", "usersim_api_key", "remote_tokens", "cf_access_client_secret"}
+_REDACTED_KEYS = {
+    "litellm_api_key", "judge_litellm_api_key", "usersim_api_key", "remote_tokens", "cf_access_client_secret",
+}
 
 
 def _holds_redacted_key(value: Any) -> bool:
@@ -60,6 +62,8 @@ class DeployedAgent:
     instance_id: str | None = None
     role: str | None = None
     network_policy: dict | None = None
+    # Installed straight onto the sandbox host (install_agent host mode), not into a container.
+    on_host: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> DeployedAgent:
@@ -73,6 +77,7 @@ class DeployedAgent:
             instance_id=data.get("instance_id"),
             role=data.get("role"),
             network_policy=data.get("network_policy"),
+            on_host=bool(data.get("on_host", False)),
         )
 
 
@@ -167,7 +172,7 @@ class TaskStepContext:
     agent_harness: str | None = None
     instance_id: str | None = None
 
-    def to_safe_dict(self) -> dict:
+    def to_safe_dict(self) -> dict[str, Any]:
         """Return a dict representation with sensitive keys recursively removed."""
         d = dataclasses.asdict(self)
         if "metadata" in d:
@@ -175,7 +180,7 @@ class TaskStepContext:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> TaskStepContext:
+    def from_dict(cls, data: dict[str, Any]) -> TaskStepContext:
         return cls(
             deployed_envs=[DeployedEnv.from_dict(e) for e in data.get("deployed_envs", [])],
             deployed_agents=[DeployedAgent.from_dict(a) for a in data.get("deployed_agents", [])],

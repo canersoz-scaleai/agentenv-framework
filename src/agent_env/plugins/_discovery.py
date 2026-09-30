@@ -10,6 +10,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, distributions, entry_points
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,19 @@ def discovery_error(exc: Exception) -> str:
                 unreadable.append(str(getattr(dist, "_path", None) or "a distribution with no path"))
     where = f" (unreadable entry points: {', '.join(unreadable)})" if unreadable else ""
     return f"{type(exc).__name__}: {exc}{where}"
+
+
+def identity(ep: EntryPoint) -> tuple[str, str]:
+    """The (name, version) a contribution is listed under. A distribution with unreadable metadata
+    is named by where it is installed, so two such packages are not merged."""
+    name, version = dist_name(ep), dist_version(ep)
+    if name:
+        return name, version
+    try:
+        where = getattr(getattr(ep, "dist", None), "_path", None)
+    except Exception:
+        where = None
+    return (f"(unreadable metadata: {Path(where).name})" if where else "(unreadable metadata)"), version
 
 
 def sort_key(ep: EntryPoint) -> tuple[str, str, str]:

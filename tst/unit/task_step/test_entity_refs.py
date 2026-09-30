@@ -5,7 +5,7 @@ import inspect
 import pytest
 
 from agent_env.artifact.registry import get_artifact_registry
-from agent_env.entity_refs import EntityKind, EntityRef, ref_sites
+from agent_env.entity_refs import EntityKind, EntityRef, parse_toml_ref, ref_sites
 from agent_env.task_step.registry import _builtin_registry
 from agent_env.task_step.snapshot_utils.snapshot_series import SnapshotConfig
 from agent_env.task_step.task_step import TaskStep
@@ -93,6 +93,55 @@ def test_a_list_element_rewrites_but_cannot_pin_a_version():
     assert data == {"env_ids": ["@local/crm"]}
 
 
+
+def test_a_toml_pins_inline_in_a_table_keyed_by_the_kind():
+    refs = (EntityRef.env("mcp_server_envs[]"), EntityRef.artifact("image", artifact_type="docker_image"))
+    data = {"mcp_server_envs": ["tickets", {"env": "crm", "version": 2}], "image": {"artifact": "base", "version": 3}}
+    assert [(s.path, s.value, s.version) for s in ref_sites(refs, data, inline_pins=True)] == [
+        ("mcp_server_envs[0]", "tickets", None), ("mcp_server_envs[1].env", "crm", 2), ("image.artifact", "base", 3),
+    ]
+
+
+def test_a_pin_table_rewrites_and_pins_inside_itself():
+    data = {"mcp_server_envs": [{"env": "crm", "version": 2}]}
+    (site,) = ref_sites((EntityRef.env("mcp_server_envs[]"),), data, inline_pins=True)
+    site.rewrite("@local/crm", version=5)
+    assert data == {"mcp_server_envs": [{"env": "@local/crm", "version": 5}]}
+
+
+def test_any_other_value_is_reported_as_it_is():
+    refs = (EntityRef.artifact("image"), EntityRef.env("envs[]"))
+    data = {"image": {"dockerfile": "Dockerfile.slim"}, "envs": [{"artifact": "base"}]}
+    assert [(s.path, s.value) for s in ref_sites(refs, data, inline_pins=True)] == [
+        ("image", {"dockerfile": "Dockerfile.slim"}), ("envs[0]", {"artifact": "base"}),
+    ]
+
+
+@pytest.mark.parametrize(("value", "parsed"), [
+    ("crm", ("crm", None)),
+    ({"env": "crm"}, ("crm", None)),
+    ({"env": "crm", "version": 2}, ("crm", 2)),
+])
+def test_a_toml_ref_is_an_id_or_a_table_with_an_optional_version(value, parsed):
+    assert parse_toml_ref(EntityKind.ENV, value) == parsed
+
+
+@pytest.mark.parametrize("value", [
+    "", 3, None, {"version": 2}, {"env": "crm", "version": 0}, {"env": "crm", "version": True},
+    {"env": "crm", "version": 2, "extra": 1}, {"artifact": "crm"},
+])
+def test_any_other_toml_ref_is_refused(value):
+    with pytest.raises(ValueError) as caught:
+        parse_toml_ref(EntityKind.ENV, value)
+    assert str(caught.value) == f'expected an id or {{ env = "<id>", version = <n> }}, the version optional, not {value!r}'
+
+
+def test_a_step_dict_never_reads_a_table_as_a_pin():
+    data = {"env_id": {"env": "crm", "version": 2}, "env_version": 1}
+    (site,) = ref_sites((EntityRef.env("env_id", version_field="env_version"),), data)
+    assert (site.path, site.value, site.version) == ("env_id", {"env": "crm", "version": 2}, 1)
+
+
 def test_trigger_walker_finds_nested_env_triggers_only():
     when = {"type": "all", "of": [
         {"type": "env_trigger", "env_id": "crm", "trigger_id": "t1"},
@@ -160,7 +209,8 @@ def test_malformed_declarations_fail_where_they_are_written(bad):
 
 
 def test_each_kind_has_a_constructor_and_only_artifacts_take_a_type():
-    assert [EntityRef.env("e").kind, EntityRef.agent("a").kind, EntityRef.artifact("f").kind] == list(EntityKind)
+    kinds = [EntityRef.env("e").kind, EntityRef.agent("a").kind, EntityRef.artifact("f").kind, EntityRef.task("t").kind]
+    assert kinds == list(EntityKind)
     assert EntityRef.artifact("f", artifact_type="file").artifact_type == "file"
     with pytest.raises(ValueError):
         EntityRef.env("e", artifact_type="file")

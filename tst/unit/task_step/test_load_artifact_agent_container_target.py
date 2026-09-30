@@ -7,8 +7,8 @@ import pytest
 from agent_env.artifact.artifact import Artifact
 from agent_env.artifact.artifacts.file import FileArtifact
 from agent_env.artifact.artifacts.environment import EnvironmentArtifact
-from agent_env.providers.sandbox import Sandbox, VmSandbox
-from agent_env.providers.sandbox_provider import SANDBOX_MODE_CONTAINER, SANDBOX_MODE_VM
+from agent_env.providers.sandbox_providers.sandbox import Sandbox, VmSandbox
+from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_CONTAINER, SANDBOX_MODE_VM
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
 from agent_env.task_step.task_steps import load_artifact as mod
 from agent_env.task_step.task_steps.load_artifact import LoadArtifactTaskStep
@@ -50,7 +50,7 @@ class _LocalLikeSandbox(VmSandbox):
 def artifact(monkeypatch):
     art = EnvironmentArtifact(
         id=ARTIFACT_ID, version=1, description="fs payload",
-        environment_name="filesystem", service_version=1,
+        environment_name="filesystem",
     )
     monkeypatch.setattr(
         type(art), "get_file_artifact",
@@ -83,7 +83,7 @@ def _context_with_agent(monkeypatch, sandbox) -> TaskStepContext:
 
     provider = type("P", (), {"get_sandbox": staticmethod(_get_sandbox)})()
 
-    from agent_env.providers import sandbox_provider as sp_mod
+    from agent_env.providers.sandbox_providers import sandbox_provider as sp_mod
 
     monkeypatch.setattr(sp_mod, "build_sandbox_provider", lambda _type: provider)
     monkeypatch.setattr(sp_mod, "get_agent_sandbox_provider", lambda: provider)

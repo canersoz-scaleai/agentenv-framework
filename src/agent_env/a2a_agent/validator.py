@@ -13,12 +13,23 @@ a thin wrapper that delegates here.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional, TYPE_CHECKING, Union
 
+from agentenv_protocol.a2a_agent import ObjectChangelogApplyResponse
+
+from agent_env.a2a_agent.object_transfer import (
+    TRANSFER_TIMEOUT_SECONDS,
+    changelog_apply_call,
+    check_changelog_applied,
+    invoke_transfer,
+)
+from agent_env.config import get_config
+from agent_env.store.routing import refuse_local_derivation
 from agent_env.task_step.task_steps.a2a_agent_validator.verify_a2a_modalities import (
     AUDIO_M4A_EXPECTED,
     AUDIO_M4A_PROBE_PARTS,
@@ -133,6 +144,7 @@ class A2AAgentValidator:
 
         Returns the merged `verifications` dict from the run's task context.
         """
+        refuse_local_derivation(agent.id, "agent", "validating")
         from agent_env.task import Task
         from agent_env.task_step import (
             AddSkillsTaskStep,
@@ -162,14 +174,38 @@ class A2AAgentValidator:
         from agent_env.task_step.task_steps.snapshot_agent_state import SnapshotAgentStateTaskStep
         from agent_env.task_step.task_step import TaskStep, TaskStepDependency
         from agent_env.a2a_agent.a2a_agent import A2AAgent
-        from agent_env.config import get_config
 
         task_id = f"validate-a2a-{agent.id}-v{agent.version}"
 
         # ── Upload object-store fixtures (skill + URI probe bytes) ───────────
-        bucket = get_config().get_s3_bucket()
-        skill_object_url = A2AAgentValidator._upload_skill_fixture(agent)
-        fixtures = A2AAgentValidator._upload_probe_fixtures(agent, skill_object_url)
+        skill_object_url = await asyncio.to_thread(
+            A2AAgentValidator._upload_skill_fixture,
+            agent,
+            name="validator-test-s3",
+            description=(
+                "Validator test skill with project codename. "
+                "Use when asked about the project codename."
+            ),
+            body=(
+                "When asked for the project codename, respond with: "
+                "VALIDATOR-S3-99"
+            ),
+        )
+        skill_bundle_probe_url = await asyncio.to_thread(
+            A2AAgentValidator._upload_skill_fixture,
+            agent,
+            name="validator-probe-bundle",
+            description="Validator probe for the portable skill bundle variant.",
+            body="Portable skill bundle validation fixture.",
+        )
+        skill_s3_probe_url = await asyncio.to_thread(
+            A2AAgentValidator._upload_skill_fixture,
+            agent,
+            name="validator-probe-s3",
+            description="Validator probe for the legacy S3 skill variant.",
+            body="Legacy S3 skill validation fixture.",
+        )
+        fixtures = await asyncio.to_thread(A2AAgentValidator._upload_probe_fixtures, agent, skill_object_url)
 
         # ── Build modality probe steps + matching grading list ───────────────
         deploy_agent_id = f"{task_id}-deploy-agent"
@@ -262,8 +298,16 @@ class A2AAgentValidator:
                     {"id": "secret_code_inline", "description": "Response contains VALIDATOR-42"},
                     {"id": "secret_code_s3", "description": "Response contains VALIDATOR-S3-99"},
                 ]),
-            VerifyA2ASkillConfigStep(id=f"{task_id}-skill-config", version=None, a2a_agent_id=agent.id, rubric_verifier_id=skill_verifier_id,
-                depends_on=[TaskStepDependency(task_step_id=skill_rubric_id)], fail_task_on_error=False),
+            VerifyA2ASkillConfigStep(
+                id=f"{task_id}-skill-config",
+                version=None,
+                a2a_agent_id=agent.id,
+                rubric_verifier_id=skill_verifier_id,
+                skill_bundle_object_url=skill_bundle_probe_url,
+                skill_s3_url=skill_s3_probe_url,
+                depends_on=[TaskStepDependency(task_step_id=skill_rubric_id)],
+                fail_task_on_error=False,
+            ),
             # ── snapshot extension validation ────────────────────────────────
             PromptAgentTaskStep(
                 id=snapshot_plant_prompt_id, version=None,
@@ -410,7 +454,7 @@ class A2AAgentValidator:
         # install/v1: gated on the LIVE deployed card (not the stored one), so it
         # runs identically regardless of whether this agent was validated before.
         await A2AAgentValidator._validate_install(
-            agent, context, bucket=bucket, task_id=task_id, on_progress=on_progress,
+            agent, context, task_id=task_id, on_progress=on_progress,
         )
 
         await A2AAgentValidator._cleanup_sandboxes(context)
@@ -420,7 +464,6 @@ class A2AAgentValidator:
     async def _validate_install(
         agent: "A2AAgent",
         context,
-        bucket: str,
         task_id: str,
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -496,7 +539,7 @@ class A2AAgentValidator:
         validator_id = f"{task_id}-install-validator"
 
         try:
-            install_test_image = A2AAgentValidator._upload_install_test_image_fixture(agent)
+            install_test_image = await asyncio.to_thread(A2AAgentValidator._upload_install_test_image_fixture, agent)
             install_steps = [
                 DeploySandboxTaskStep(
                     id=deploy_sandbox_id, version=None,
@@ -589,9 +632,8 @@ class A2AAgentValidator:
         agent, then deterministically checks the marker file was reconstructed by
         exec-ing into the apply agent's sandbox. Records the outcome on the agent's
         validated_a2a_extensions and in context.metadata['verifications']."""
-        import httpx
         from agent_env.a2a_agent import A2AAgent
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM, build_sandbox_provider, get_agent_sandbox_provider,
         )
 
@@ -621,12 +663,13 @@ class A2AAgentValidator:
         capture = next(
             (e for e in (context.metadata.get("agent_changelog") or [])
              if e.get("agent_name") == capture_agent_name), None)
+        capture_source = capture.get("object_url") if capture else None
         apply_agent = next(
             (d for d in context.deployed_agents if d.agent_name == apply_agent_name), None)
         advertised = apply_agent is not None and A2AAgent.extension_method(
             apply_agent.a2a_card or {}, A2AAgent.EXT_SNAPSHOT,
             A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG) is not None
-        save_ok = capture is not None
+        save_ok = capture_source is not None
         if not save_ok or apply_agent is None or not advertised:
             record(supported=False, advertised=advertised, save_ok=save_ok,
                    apply_ok=False, roundtrip_ok=False,
@@ -634,15 +677,39 @@ class A2AAgentValidator:
             return
 
         # Apply the captured changelog onto the fresh apply agent.
-        method = A2AAgent.extension_method(
-            apply_agent.a2a_card, A2AAgent.EXT_SNAPSHOT, A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG)
+        method, path = A2AAgent.operation(
+            A2AAgent.find_extension(apply_agent.a2a_card, A2AAgent.EXT_SNAPSHOT),
+            A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG)
         a2a_url = apply_agent.a2a_url or apply_agent.api_url
-        endpoint = a2a_url + method.get("endpoint", "/ext/snapshot/changelog")
+        try:
+            call = await asyncio.to_thread(
+                changelog_apply_call,
+                method,
+                get_config().get_object_store(),
+                agent_name=apply_agent_name,
+                source_url=capture_source,
+                portable=capture.get("transfer_mode") == "objects",
+            )
+        except RuntimeError as e:
+            record(supported=False, advertised=advertised, save_ok=save_ok,
+                   apply_ok=False, roundtrip_ok=False, note=str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            record(supported=False, advertised=advertised, save_ok=save_ok,
+                   apply_ok=False, roundtrip_ok=False, note=f"apply request failed: {e}")
+            return
         try:
             log("Applying agent-changelog onto apply agent...")
-            async with httpx.AsyncClient() as client:
-                resp = await client.put(endpoint, json={"s3_prefix": capture["s3_prefix"]}, timeout=600)
-                resp.raise_for_status()
+            answer = await invoke_transfer(
+                a2a_url + path,
+                call,
+                verb="PUT",
+                operation="changelog apply",
+                timeout=TRANSFER_TIMEOUT_SECONDS,
+                response_model=ObjectChangelogApplyResponse,
+            )
+            if call.mode == "objects":
+                check_changelog_applied(answer, call, agent_name=apply_agent_name)
         except Exception as e:  # noqa: BLE001
             record(supported=False, advertised=advertised, save_ok=save_ok,
                    apply_ok=False, roundtrip_ok=False, note=f"apply request failed: {e}")
@@ -708,11 +775,11 @@ class A2AAgentValidator:
         import time
 
         from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
-        from agent_env.config import get_config
 
         ts = int(time.time())
         universe_id = f"validate-install-image-{agent.id}-v{agent.version}-{ts}"
-        s3_url = get_config().get_object_store().object_url(f"a2a_validator/install_test_image/{ts}/")
+        config = get_config()
+        s3_url = config.get_object_store().object_url(f"{config.get_artifact_key_prefix()}a2a_validator/install_test_image/{ts}/")
 
         with tempfile.NamedTemporaryFile("w", suffix=".Dockerfile", delete=False) as f:
             f.write("FROM ubuntu:24.04\n")
@@ -732,16 +799,20 @@ class A2AAgentValidator:
                 pass
 
     @staticmethod
-    def _upload_skill_fixture(agent: "A2AAgent") -> str:
-        from agent_env.config import get_config
+    def _upload_skill_fixture(
+        agent: "A2AAgent", *, name: str, description: str, body: str
+    ) -> str:
         from agent_env.task_step.task_steps.add_skills import Skill
 
-        store = get_config().get_object_store()
-        prefix = f"a2a_validator/validator_skill/{agent.id}-v{agent.version}/"
+        config = get_config()
+        store = config.get_object_store()
+        prefix = (
+            f"{config.get_artifact_key_prefix()}a2a_validator/validator_skill/{agent.id}-v{agent.version}/{name}/"
+        )
         skill = Skill(
-            name="validator-test-s3",
-            description="Validator test skill with project codename. Use when asked about the project codename.",
-            body="When asked for the project codename, respond with: VALIDATOR-S3-99",
+            name=name,
+            description=description,
+            body=body,
         )
         store.put(f"{prefix}SKILL.md", skill.to_skill_md().encode(), content_type="text/markdown", allow_overwrite=True)
         object_url = store.object_url(prefix)
@@ -757,10 +828,10 @@ class A2AAgentValidator:
         wrapper. The MP4 is too big for practical inline use and the URI path is
         the point.
         """
-        from agent_env.config import get_config
 
-        store = get_config().get_object_store()
-        prefix = f"a2a_validator/probe_fixtures/{agent.id}-v{agent.version}/"
+        config = get_config()
+        store = config.get_object_store()
+        prefix = f"{config.get_artifact_key_prefix()}a2a_validator/probe_fixtures/{agent.id}-v{agent.version}/"
 
         png_object_uri = store.put(f"{prefix}red.png", base64.b64decode(IMAGE_PROBE_PNG_B64), content_type="image/png", allow_overwrite=True)
         png_signed_url = store.signed_get_url(png_object_uri)
@@ -808,8 +879,11 @@ class A2AAgentValidator:
 
     @staticmethod
     async def _cleanup_sandboxes(context) -> None:
+        from agent_env.env.env import DeployedSandboxEnv
         from agent_env.providers import build_sandbox_provider, get_agent_sandbox_provider, get_env_sandbox_provider
         for deployed_env in context.deployed_envs:
+            if not isinstance(deployed_env, DeployedSandboxEnv):  # an env outside our sandboxes owns its own lifetime
+                continue
             try:
                 provider = build_sandbox_provider(deployed_env.sandbox_type) if deployed_env.sandbox_type else get_env_sandbox_provider()
                 sandbox = await provider.get_sandbox(deployed_env.sandbox_id)

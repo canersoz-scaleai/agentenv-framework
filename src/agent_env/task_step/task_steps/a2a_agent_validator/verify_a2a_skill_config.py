@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import ClassVar, Optional
 
 import httpx
+from agentenv_protocol.a2a_agent import SkillAddResponse
 
 from agent_env.task_step.context import TaskStepContext
+from agent_env.a2a_agent.object_transfer import (
+    TRANSFER_TIMEOUT_SECONDS,
+    TransferMode,
+    invoke_transfer,
+    parse_response,
+    skill_add_call,
+)
+from agent_env.config import get_config
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
@@ -26,20 +36,32 @@ class VerifyA2ASkillConfigStep(TaskStep):
         rubric_verifier_id: str,
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
+        skill_bundle_object_url: Optional[str] = None,
+        skill_s3_url: Optional[str] = None,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         self.a2a_agent_id = a2a_agent_id
         self.rubric_verifier_id = rubric_verifier_id
+        self.skill_bundle_object_url = skill_bundle_object_url
+        self.skill_s3_url = skill_s3_url
 
     def to_dict(self) -> dict:
         base = super().to_dict()
         base["a2a_agent_id"] = self.a2a_agent_id
         base["rubric_verifier_id"] = self.rubric_verifier_id
+        base["skill_bundle_object_url"] = self.skill_bundle_object_url
+        base["skill_s3_url"] = self.skill_s3_url
         return base
 
     @classmethod
     def from_dict(cls, data: dict) -> VerifyA2ASkillConfigStep:
-        return cls(**cls._base_from_dict(data), a2a_agent_id=data["a2a_agent_id"], rubric_verifier_id=data["rubric_verifier_id"])
+        return cls(
+            **cls._base_from_dict(data),
+            a2a_agent_id=data["a2a_agent_id"],
+            rubric_verifier_id=data["rubric_verifier_id"],
+            skill_bundle_object_url=data.get("skill_bundle_object_url"),
+            skill_s3_url=data.get("skill_s3_url"),
+        )
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent
@@ -64,18 +86,72 @@ class VerifyA2ASkillConfigStep(TaskStep):
         rubric_result = context.metadata.get("verifications", {}).get(self.rubric_verifier_id, {})
         results = rubric_result.get("results", [])
         inline_passed = any(r.get("id") == "secret_code_inline" and r.get("score") == 1.0 for r in results)
-        s3_passed = any(r.get("id") == "secret_code_s3" and r.get("score") == 1.0 for r in results)
-        logger.info(f"Rubric verifier '{self.rubric_verifier_id}': inline={inline_passed} s3={s3_passed}")
+        add_method, add_path = A2AAgent.operation(skill_ext, "add")
+        store = get_config().get_object_store()
+        a2a_url = deployed_agent.a2a_url or deployed_agent.api_url
+
+        async def probe_add(form: TransferMode, name: str, description: str, object_url: str | None) -> bool:
+            """Whether the agent registers an object-backed skill sent in exactly ``form``."""
+            if object_url is None:
+                return False
+            try:
+                call = await asyncio.to_thread(
+                    skill_add_call,
+                    add_method,
+                    store,
+                    name=name,
+                    description=description,
+                    object_url=object_url,
+                    forms=(form,),
+                )
+            except RuntimeError as exc:
+                logger.info("Skill %s request: not sent (%s)", form, exc)
+                return False
+            except Exception as exc:
+                logger.warning("Skill %s request: failed (%s)", form, exc)
+                return False
+            try:
+                answer = await invoke_transfer(
+                    a2a_url + add_path,
+                    call,
+                    verb="POST",
+                    operation=f"skill add ({form})",
+                    timeout=TRANSFER_TIMEOUT_SECONDS,
+                )
+                result = parse_response(SkillAddResponse, answer, operation=f"skill add ({form})")
+                if result.name != name:
+                    raise ValueError("response name does not match the requested skill")
+                logger.info("Skill %s request: OK", form)
+                return True
+            except Exception as exc:
+                logger.warning("Skill %s request: failed (%s)", form, exc)
+                return False
+
+        bundle_passed = await probe_add(
+            "objects",
+            "validator-probe-bundle",
+            "Validator probe for the portable skill bundle variant.",
+            self.skill_bundle_object_url,
+        )
+        s3_passed = await probe_add(
+            "legacy",
+            "validator-probe-s3",
+            "Validator probe for the legacy S3 skill variant.",
+            self.skill_s3_url,
+        )
+        logger.info(
+            "Skill validation '%s': inline=%s bundle=%s s3=%s",
+            self.rubric_verifier_id,
+            inline_passed,
+            bundle_passed,
+            s3_passed,
+        )
 
         # List skills via GET endpoint
-        a2a_url = deployed_agent.a2a_url or deployed_agent.api_url
-        ext_config = skill_ext.get("config") or skill_ext.get("params") or {}
-        endpoint = a2a_url + ext_config.get("endpoint", "/ext/skill-config")
-
         list_ok = False
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(endpoint, timeout=30)
+                resp = await client.get(a2a_url + A2AAgent.operation(skill_ext, "list")[1], timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
                 skills = data.get("skills", {})
@@ -84,8 +160,8 @@ class VerifyA2ASkillConfigStep(TaskStep):
         except Exception as e:
             logger.warning(f"Skill list failed: {e}")
 
-        # Build validated entry — map per-criterion results to skill vs skill_s3_url
-        add_supported = inline_passed or s3_passed
+        # Build validated entry from observed behavior for each request variant.
+        add_supported = inline_passed or bundle_passed or s3_passed
         skill_entry = {
             "supported": add_supported or list_ok,
             "methods": {
@@ -95,6 +171,8 @@ class VerifyA2ASkillConfigStep(TaskStep):
                         "name": {"supported": add_supported},
                         "description": {"supported": add_supported},
                         "skill": {"supported": inline_passed},
+                        "skill_md": {"supported": inline_passed},
+                        "skill_bundle": {"supported": bundle_passed},
                         "skill_s3_url": {"supported": s3_passed},
                     },
                 },
@@ -107,5 +185,10 @@ class VerifyA2ASkillConfigStep(TaskStep):
         validated_ext[A2AAgent.EXT_SKILL_CONFIG] = skill_entry
         agent.update_metadata({**agent.metadata, "validated_a2a_extensions": validated_ext})
 
-        context.metadata.setdefault("verifications", {})["a2a_skill_config"] = {"inline": inline_passed, "s3": s3_passed, "list": list_ok}
+        context.metadata.setdefault("verifications", {})["a2a_skill_config"] = {
+            "inline": inline_passed,
+            "bundle": bundle_passed,
+            "s3": s3_passed,
+            "list": list_ok,
+        }
         return context

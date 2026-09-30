@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
+from agent_env.entity_refs import EntityRef
+
 if TYPE_CHECKING:
     from agent_env.eval.store import EvalQuery
 
@@ -25,6 +27,7 @@ class Eval:
     """
 
     type: ClassVar[str] = "eval"
+    toml_refs: ClassVar[tuple[EntityRef, ...]] = (EntityRef.task("tasks[]"),)
 
     def __init__(self, id: str, version: Optional[int], tasks: list[EvalTask] | None = None):
         self.id = id

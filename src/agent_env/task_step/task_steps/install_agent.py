@@ -140,7 +140,7 @@ class InstallAgentTaskStep(TaskStep):
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
             build_sandbox_provider,
             get_sandbox_provider,
@@ -283,6 +283,7 @@ class InstallAgentTaskStep(TaskStep):
             a2a_url=a2a_url,
             a2a_card=agent_card,
             instance_id=deployed.instance_id,
+            on_host=host_mode,
         ))
 
         default_model = agent.metadata.get("default_model") or get_config().get_model_for_role("agent")

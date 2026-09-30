@@ -10,7 +10,7 @@ from agent_env.env.envs.mcp_server import MCPServerEnv
 
 
 def _env(environment_name: str = "email") -> MCPServerEnv:
-    return MCPServerEnv(id="mcp-email", version=1, docker_image_artifact=None, environment_name=environment_name, service_version=1)
+    return MCPServerEnv(id="mcp-email", version=1, docker_image_artifact=None, environment_name=environment_name)
 
 
 def _universe(service_names: list[str], universe_id: str = "uni-1"):

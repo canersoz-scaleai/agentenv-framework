@@ -3,25 +3,21 @@ propagation. Only the gateway HTTP boundary is mocked; the step logic runs real.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import json
 
 import httpx
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv, EnvCapabilityUnsupported
+from agent_env.env.gateway.constants import GATEWAY_EXTENSIONS, WELL_KNOWN_PATH
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
 from agent_env.task_step.task_steps.register_env_triggers import RegisterEnvTriggersStep
 
 _GATEWAY = "http://gw:18765"
 
 
-def _resp(status: int, url: str, body: dict) -> httpx.Response:
-    return httpx.Response(status, json=body, request=httpx.Request("POST", url))
-
-
 def _context(*, with_executor: bool = False):
-    env = DeployedEnv(env_id="env-x", env_version=1, gateway_url=_GATEWAY, mcp_url="",
-                      db_web_url=None, sandbox_id="sb")
+    env = _record()
     agents = []
     if with_executor:
         agents.append(DeployedAgent(agent_name="exec-1", api_url="http://exec:9000",
@@ -57,21 +53,13 @@ def test_bad_triggers_rejected_at_construction():
 
 
 @pytest.mark.asyncio
-async def test_registers_and_audits():
-    captured = {}
+async def test_registers_and_audits(monkeypatch):
+    sent = _mock_gateway(monkeypatch, {"ok": True, "added": ["t1"], "all": ["t1"]})
+    out = await _step(watch_roles=["default"]).execute(_context())
 
-    async def fake_post(self, url, json, timeout):
-        captured["url"] = url
-        captured["body"] = json
-        return _resp(200, url, {"ok": True, "added": ["t1"], "all": ["t1"]})
-
-    ctx = _context()
-    with patch.object(httpx.AsyncClient, "post", fake_post):
-        out = await _step(watch_roles=["default"]).execute(ctx)
-
-    assert captured["url"] == f"{_GATEWAY}/triggers/register"
-    assert captured["body"] == {"triggers": _TRIGGERS, "watch_roles": ["default"]}
-    assert "executor" not in captured["body"]
+    [request] = sent
+    assert (request.method, str(request.url)) == ("POST", f"{_GATEWAY}/triggers/register")
+    assert json.loads(request.content) == {"triggers": _TRIGGERS, "watch_roles": ["default"]}
     audit = out.metadata["env_trigger_registrations"]
     assert len(audit) == 1
     assert audit[0]["env_id"] == "env-x"
@@ -79,19 +67,12 @@ async def test_registers_and_audits():
 
 
 @pytest.mark.asyncio
-async def test_resolves_executor_agent_to_a2a_url():
-    captured = {}
+async def test_resolves_executor_agent_to_a2a_url(monkeypatch):
+    sent = _mock_gateway(monkeypatch, {"ok": True, "added": ["t1"], "all": ["t1"]})
+    await _step(executor_agent_name="exec-1", executor_timeout_seconds=45,
+                watch_roles=["default"]).execute(_context(with_executor=True))
 
-    async def fake_post(self, url, json, timeout):
-        captured["body"] = json
-        return _resp(200, url, {"ok": True, "added": ["t1"], "all": ["t1"]})
-
-    ctx = _context(with_executor=True)
-    with patch.object(httpx.AsyncClient, "post", fake_post):
-        await _step(executor_agent_name="exec-1", executor_timeout_seconds=45,
-                    watch_roles=["default"]).execute(ctx)
-
-    assert captured["body"]["executor"] == {
+    assert json.loads(sent[0].content)["executor"] == {
         "a2a_url": "http://exec:9000/a2a-base", "timeout_seconds": 45, "role": "executor"}
 
 
@@ -104,11 +85,8 @@ async def test_missing_executor_agent_raises():
 
 @pytest.mark.asyncio
 async def test_executor_without_role_raises():
-    from agent_env.env.env import DeployedEnv
-    env = DeployedEnv(env_id="env-x", env_version=1, gateway_url=_GATEWAY, mcp_url="",
-                      db_web_url=None, sandbox_id="sb")
     ctx = TaskStepContext(
-        deployed_envs=[env],
+        deployed_envs=[_record()],
         deployed_agents=[DeployedAgent(agent_name="exec-1", api_url="http://e", role=None)],
         metadata={})
     with pytest.raises(RuntimeError, match="deployed without an explicit role"):
@@ -130,11 +108,35 @@ async def test_missing_env_raises():
 
 
 @pytest.mark.asyncio
-async def test_gateway_4xx_raises():
-    async def fake_post(self, url, json, timeout):
-        return _resp(400, url, {"ok": False, "error": "trigger 't1': when.tool: bad"})
+async def test_gateway_4xx_raises(monkeypatch):
+    _mock_gateway(monkeypatch, {"ok": False, "error": "trigger 't1': when.tool: bad"}, status=400)
+    with pytest.raises(RuntimeError, match=r"trigger registration failed \(HTTP 400\): .*when.tool: bad"):
+        await _step().execute(_context())
 
-    ctx = _context()
-    with patch.object(httpx.AsyncClient, "post", fake_post):
-        with pytest.raises(RuntimeError, match="trigger registration failed"):
-            await _step().execute(ctx)
+
+@pytest.mark.asyncio
+async def test_a_card_without_triggers_raises_before_any_request(monkeypatch):
+    sent = _mock_gateway(monkeypatch, {})
+    ctx = TaskStepContext(deployed_envs=[_record(extensions=[])], deployed_agents=[], metadata={})
+    with pytest.raises(EnvCapabilityUnsupported, match="does not offer 'register' on urn:agentenv:triggers/v1"):
+        await _step().execute(ctx)
+    assert sent == []
+
+
+def _record(extensions: list = GATEWAY_EXTENSIONS) -> DeployedEnv:
+    """A gateway deployment whose stored card advertises `extensions` (the gateway's own, by default)."""
+    return DeployedGatewayEnv(env_id="env-x", env_version=1, gateway_url=_GATEWAY, mcp_url="", db_web_url=None, sandbox_id="sb",
+                       environment_card_url=f"{_GATEWAY}{WELL_KNOWN_PATH}",
+                       environment_card={"name": "gw", "capabilities": {"extensions": extensions}})
+
+
+def _mock_gateway(monkeypatch, body: dict, status: int = 200) -> list[httpx.Request]:
+    """Answer every request the protocol client sends with `body`; return the requests."""
+    sent, real = [], httpx.AsyncClient
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(status, json=body)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: real(transport=httpx.MockTransport(handle)))
+    return sent

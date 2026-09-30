@@ -461,7 +461,8 @@ def instance_progress(task_id: str, instance_id: str) -> dict:
     status = doc.get("status")
     current_step = doc.get("current_step")
     try:
-        terminal = RunStatus(str(status).upper()).is_terminal
+        # The instance store spells it "cancelled"; RunStatus spells it CANCELED.
+        terminal = RunStatus("CANCELED" if status == "cancelled" else str(status).upper()).is_terminal
     except ValueError:
         terminal = False   # an unrecognised status keeps polling rather than stalling the view
     return {

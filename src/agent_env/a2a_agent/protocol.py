@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -15,6 +17,33 @@ logger = logging.getLogger(__name__)
 _TERMINAL_TASK_STATES = frozenset({
     TaskState.completed, TaskState.failed, TaskState.canceled, TaskState.rejected,
 })
+
+
+_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def raise_for_extension_status(
+    response: httpx.Response, *, operation: str, include_body: bool = False
+) -> None:
+    """Raise ``httpx.HTTPStatusError`` naming the SDK error code, but no other part of a body
+    that may echo a grant. ``include_body`` keeps the body, for a request that sent no grant."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if include_body:
+            detail = response.text[:500]
+        else:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            error = body.get("error") if isinstance(body, Mapping) else None
+            code = error.get("code") if isinstance(error, Mapping) else None
+            detail = code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else ""
+        message = f"{operation} failed with HTTP {response.status_code}"
+        if detail:
+            message += f": {detail}"
+        raise httpx.HTTPStatusError(message, request=exc.request, response=response) from exc
 
 
 async def post_agent_config(url: str, payload: dict, timeout_seconds: int = 60) -> None:

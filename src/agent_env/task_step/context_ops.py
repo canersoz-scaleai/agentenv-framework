@@ -27,7 +27,7 @@ class ContextUpdateOps:
     their items and the write must dedupe (``$addToSet`` via ``to_update_spec``, or
     the Python ``_union`` the completion CAS in ``task/store.py`` applies). **Constraint:**
     items in any list must be uniquely identifiable by value, or duplicates are silently
-    dropped on write.
+    dropped on write; ``deployed_envs`` are told apart by ``instance_id`` (``step_journal._item_key``).
     """
 
     sets: dict[str, Any] = field(default_factory=dict)

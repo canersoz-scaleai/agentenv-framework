@@ -13,8 +13,10 @@ from agent_env.cli.utils import (
     build_platform_option,
     detect_env_metadata,
     docker_build_platform_args,
+    env_provider_type_option,
     environment_name_options,
     resolve_environment_name,
+    skips_local_validation,
 )
 from agent_env.utils.card_naming import card_name_from_github, card_name_from_source
 from agent_env.env import Env
@@ -40,7 +42,8 @@ def website():
 @click.option("--frontend-dockerfile-github-url", default=None, help="GitHub URL to frontend Dockerfile")
 @click.option("--frontend-docker-context-github-url", default=None, help="GitHub URL to frontend build context directory")
 @environment_name_options
-@click.option("--service-version", "service_version", type=int, default=1, help="Service version (default: 1)")
+@env_provider_type_option("What deploys the env: 'gateway' (a gateway in front of the website), or the type of an installed "
+                          "agent_env.env_providers plugin", "website")
 @click.option("--metadata", "metadata_pairs", multiple=True, help="Metadata key=value pair (repeatable)")
 @click.option("--skip-validation", is_flag=True, default=False, help="Skip environment validation after registration")
 @build_platform_option
@@ -55,7 +58,7 @@ def put(
     frontend_dockerfile_github_url: str | None,
     frontend_docker_context_github_url: str | None,
     environment_name: str | None,
-    service_version: int,
+    env_provider_type: str,
     metadata_pairs: tuple[str, ...],
     skip_validation: bool,
     build_platform: str,
@@ -124,14 +127,14 @@ def put(
             frontend_dockerfile_github_url=frontend_dockerfile_github_url,
             frontend_docker_context_github_url=frontend_docker_context_github_url,
             environment_name=environment_name,
-            service_version=service_version,
             metadata=user_metadata if user_metadata else None,
             on_backend_progress=_backend_progress,
             on_frontend_progress=_frontend_progress,
             github_token=os.environ.get("GITHUB_TOKEN"),
+            env_provider_type=env_provider_type,
         ))
-        click.echo(f"Created WebsiteEnv: id={env.id} version={env.version} environment_name={env.environment_name} service_version={env.service_version}")
-        if not skip_validation:
+        click.echo(f"Created WebsiteEnv: id={env.id} version={env.version} environment_name={env.environment_name}")
+        if not skip_validation and not skips_local_validation(env.id, "env"):
             click.echo("\nValidating environment (use --skip-validation to skip)...")
             instance_id = asyncio.run(env.validate(on_progress=click.echo))
             click.echo(f"Validation task: {instance_id}")
@@ -199,11 +202,11 @@ def put(
         backend_docker_image_artifact=backend_artifact,
         frontend_docker_image_artifact=frontend_artifact,
         environment_name=environment_name,
-        service_version=service_version,
         metadata=metadata if metadata else None,
+        env_provider_type=env_provider_type,
     )
-    click.echo(f"Created WebsiteEnv: id={env.id} version={env.version} environment_name={env.environment_name} service_version={env.service_version}")
-    if not skip_validation:
+    click.echo(f"Created WebsiteEnv: id={env.id} version={env.version} environment_name={env.environment_name} env_provider_type={env.env_provider_type}")
+    if not skip_validation and not skips_local_validation(env.id, "env"):
         click.echo("\nValidating environment (use --skip-validation to skip)...")
         instance_id = asyncio.run(env.validate(on_progress=click.echo))
         click.echo(f"Validation task: {instance_id}")

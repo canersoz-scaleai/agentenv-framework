@@ -1,8 +1,8 @@
 """Env registry guards + config.toml-declared custom envs.
 
 The registry is what lets stored env documents be deserialized by `Env.get` /
-`EnvStore._deserialize` — the path the hub backend and the Temporal
-worker use to list/load envs. An env missing here can be `put()` but never
+`EnvStore._deserialize` — the path the hub backend and runner
+workers use to list/load envs. An env missing here can be `put()` but never
 loaded back ("Unknown env type: ..."), so it can't be browsed or run from the
 hub. A custom `Env` named under `[envs]` in `.agentenv/config.toml` is imported,
 ABC-guarded, and registered under its own `type` — no change to the built-in
@@ -31,11 +31,11 @@ class _CustomEnv(Env):
         return cls(id=data["id"], version=data.get("version"), metadata=data.get("metadata"))
 
 
-class _CollidingEnv(Env):
+class _CollidingEnv(_CustomEnv):
     type = "mcp_server"
 
 
-class _CustomEnvDup(Env):
+class _CustomEnvDup(_CustomEnv):
     type = "custom_env_test"
 
 

@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv
 from agent_env.store.document_store import Filter
 from agent_env.task.store import (
     TASK_INSTANCES_COLLECTION,
@@ -41,7 +41,7 @@ def _assert_journal_matches(instance_id: str, n: int) -> None:
 
 
 def _env(instance_id: str) -> DeployedEnv:
-    return DeployedEnv(
+    return DeployedGatewayEnv(
         env_id="e", env_version=1, gateway_url="g", mcp_url="m",
         db_web_url=None, sandbox_id="s", instance_id=instance_id,
     )

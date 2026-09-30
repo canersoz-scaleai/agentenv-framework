@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Optional, Self, TypeVar
 
 from agent_env.plugins import _registration
 from agent_env.store.base import NotFoundError
@@ -14,6 +14,8 @@ from agent_env.store.query import QueryBuilder, to_document_query
 
 if TYPE_CHECKING:
     from agent_env.task_step.task_step import TaskStep
+
+_S = TypeVar("_S", bound="TaskStep")
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ class TaskStepStore:
     def next_version(self, id: str) -> int:
         return self._versioned.next_version(id)
 
-    def put_document(self, task_step: TaskStep) -> TaskStep:
+    def put_document(self, task_step: _S) -> _S:
         task_step.version = self._versioned.put(task_step)
         return task_step
 

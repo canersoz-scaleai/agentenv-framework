@@ -22,7 +22,7 @@ import logging
 import pytest
 
 import agent_env.task.store as store_mod
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedEnv, DeployedGatewayEnv
 from agent_env.store import LocalSqliteDocumentStore
 from agent_env.store.document_store import Filter
 from agent_env.task.step_journal import _SCHEDULER_STEP_ID, _SEED_STEP_ID, commit_ordered, replay_context
@@ -68,7 +68,7 @@ class _FakeDeployEnv:
             raise RuntimeError(f"Env '{self.id}' is already deployed")
         self.deploy_calls.append(self.id)
         context.deployed_envs.append(
-            DeployedEnv(
+            DeployedGatewayEnv(
                 env_id=self.id, env_version=1, gateway_url="g", mcp_url="m", db_web_url=None,
                 sandbox_id=f"sb-{self.id}-{len(self.deploy_calls)}", sandbox_type="fake",
             )
@@ -100,7 +100,7 @@ class _FlakyPrompt:
         context.prompt_responses.append(
             PromptResponse(prompt_id=self.id, response=f"attempt-{self.attempts}", step_id=self.id)
         )
-        context.metadata.setdefault("my_custom_ios_metadata", {})[self.id] = self.attempts
+        context.metadata.setdefault("my_custom_step_metadata", {})[self.id] = self.attempts
         context.metadata.setdefault("loaded_urls", []).append({"by": self.id, "attempt": self.attempts})
         if self.attempts <= self._fail_times:
             raise RuntimeError("flaky boom")
@@ -194,7 +194,7 @@ async def test_custom_metadata_and_lists_written_by_the_span_are_rolled_back(sto
     flaky = _FlakyPrompt("s1", retry_config=RetryConfig(retry_from_step_id="s0"), fail_times=1)
     result = await Task(id="t", version=1, steps=[deploy, flaky]).run(context=TaskStepContext())
 
-    assert result.metadata["my_custom_ios_metadata"] == {"s1": 2}
+    assert result.metadata["my_custom_step_metadata"] == {"s1": 2}
     assert result.metadata["loaded_urls"] == [{"by": "s1", "attempt": 2}]
     # failed_steps is an audit trail: the failed attempt is still recorded.
     assert [f["step_id"] for f in result.metadata["failed_steps"]] == ["s1"]
@@ -419,7 +419,7 @@ async def test_a_survivor_that_finished_before_the_span_started_does_not_block(s
                          fail_times=1, depends_on=["early"])
     result = await Task(id="t", version=1, steps=[deploy, early, flaky]).run(context=TaskStepContext())
     assert early.attempts == 1 and flaky.attempts == 2
-    assert result.metadata["my_custom_ios_metadata"] == {"early": 1, "late": 2}
+    assert result.metadata["my_custom_step_metadata"] == {"early": 1, "late": 2}
 
 
 @pytest.mark.asyncio
@@ -490,7 +490,7 @@ async def test_retry_reruns_independent_descendant_of_span(store):
 
 
 @pytest.mark.asyncio
-async def test_rollback_branching_dag_from_edgars_example(store):
+async def test_rollback_of_a_branching_dag_spans_the_dependents_closure(store):
     # Reviewer's graph:  L -> A -> {P -> {Q, S}, X -> {Y, Z}}.
     # Q fails with retry_from_step_id=A, so the span is the dependents-closure of
     # A = {A, P, X, Q, S, Y, Z}; L (A's ancestor) is untouched and the span
@@ -520,7 +520,7 @@ async def test_rollback_branching_dag_from_edgars_example(store):
     assert by_id["L"].attempts == 1
     assert by_id["Q"].attempts == 2
     assert store.get(ctx.instance_id).status == "completed"
-    assert result.metadata["my_custom_ios_metadata"]["L"] == 1  # L's write survived the undo
+    assert result.metadata["my_custom_step_metadata"]["L"] == 1  # L's write survived the undo
 
 
 @pytest.mark.asyncio
@@ -546,7 +546,7 @@ async def test_cancelled_sibling_is_rolled_back_and_redispatched(store):
                 raise RuntimeError(f"Env '{self.id}' is already deployed")
             self.runs += 1
             context.deployed_envs.append(
-                DeployedEnv(env_id=self.id, env_version=1, gateway_url="g", mcp_url="m",
+                DeployedGatewayEnv(env_id=self.id, env_version=1, gateway_url="g", mcp_url="m",
                             db_web_url=None, sandbox_id="")
             )
             await release.wait()
@@ -746,7 +746,7 @@ async def test_recovered_failure_is_marked_retried(store):
 def test_rolled_back_sandboxes_is_the_difference_between_stored_and_replayed():
     before = {
         "deployed_envs": [
-            {"env_id": "e", "sandbox_id": "sb-e", "sandbox_type": "beta", "sandbox_ids": {"cua": "sb-vm"}},
+            {"env_id": "e", "sandbox_id": "sb-e", "sandbox_type": "beta", "sandbox_ids": {"vm": "sb-vm"}},
             {"env_id": "keep", "sandbox_id": "sb-k", "sandbox_type": "beta", "sandbox_ids": {}},
         ],
         "deployed_agents": [
@@ -761,7 +761,7 @@ def test_rolled_back_sandboxes_is_the_difference_between_stored_and_replayed():
         "deployed_sandboxes": [],
     }
     assert _rolled_back_sandboxes(before, after) == {
-        "deployed_envs": [{"sandbox_id": "sb-e", "sandbox_type": "beta", "sandbox_ids": {"cua": "sb-vm"}}],
+        "deployed_envs": [{"sandbox_id": "sb-e", "sandbox_type": "beta", "sandbox_ids": {"vm": "sb-vm"}}],
         "deployed_agents": [{"sandbox_id": "sb-a", "sandbox_type": "local"}],
         "deployed_sandboxes": [{"sandbox_id": "sb-x", "sandbox_type": None}],
     }

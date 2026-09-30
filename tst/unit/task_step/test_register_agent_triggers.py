@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from agent_env.a2a_agent.a2a_agent import A2AAgent
-from agent_env.env.env import DeployedEnv
+from agent_env.env.env import DeployedGatewayEnv
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
 from agent_env.task_step.task_steps.register_agent_triggers import RegisterAgentTriggersStep
 
@@ -33,7 +33,7 @@ def _context(*, card: dict | None = None, env_ids: tuple[str, ...] = ("env-x",),
              registered_env_triggers: dict[str, list[str]] | None = None):
     if registered_env_triggers is None:
         registered_env_triggers = {"env-x": ["v6-rate"]}
-    envs = [DeployedEnv(env_id=e, env_version=1, gateway_url="http://gw", mcp_url="",
+    envs = [DeployedGatewayEnv(env_id=e, env_version=1, gateway_url="http://gw", mcp_url="",
                         db_web_url=None, sandbox_id="sb") for e in env_ids]
     agents = []
     if with_agent:

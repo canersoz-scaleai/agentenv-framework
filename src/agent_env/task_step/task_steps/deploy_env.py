@@ -11,7 +11,7 @@ from agent_env.env.store import update_env_instance_metadata
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
-from agent_env.attribution import attribution_of, metadata_from_legacy_document
+from agent_env.attribution import deploy_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +85,33 @@ class DeployEnvTaskStep(TaskStep):
             env_state_type=data.get("env_state_type"),
             env_state_instance_id=data.get("env_state_instance_id"),
             priority=data.get("priority"),
-            metadata=metadata_from_legacy_document(data),
+            metadata=dict(data.get("metadata") or {}),
         )
+
+    def preflight(self) -> list[str]:
+        """An invalid gateway_mode, an env this step can't load, or an option it would refuse at deploy, reported at save instead."""
+        from agent_env.env.env import Env
+        from agent_env.env.envs.mcp_server import MCPServerEnv
+        from agent_env.env.envs.multi_env import MultiEnv
+        from agent_env.env.envs.website import WebsiteEnv
+        from agent_env.store.base import NotFoundError
+
+        try:
+            GatewayMode(self.gateway_mode)
+        except ValueError as e:
+            return [f"deploy_env '{self.id}': {e}"]  # the words execute() would raise
+        try:
+            env = Env.get(self.env_id, self.env_version)
+            if not isinstance(env, (MCPServerEnv, WebsiteEnv, MultiEnv)):
+                return []
+            # As stored: run-time overrides aren't known at save, and deploy() consumes sandbox_type itself. Every run passes an
+            # attribution, so the check does too, whatever it will hold.
+            refusal = env.deploy_refusal(ttl_seconds=self.ttl_seconds, disk_size_gb=self.disk_size_gb, gateway_mode=self.gateway_mode, cpu=self.cpu,
+                                         memory_mb=self.memory_mb, priority=self.priority, env_state_type=self.env_state_type,
+                                         env_state_instance_id=self.env_state_instance_id, attribution={})
+        except (NotFoundError, ValueError) as e:  # missing, or a type or env_provider_type this process can't load
+            return [f"deploy_env '{self.id}': env '{self.env_id}' can't be loaded: {e}"]
+        return [f"deploy_env '{self.id}': {refusal}"] if refusal else []
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.env.env import Env
@@ -106,14 +131,14 @@ class DeployEnvTaskStep(TaskStep):
         resolved_priority = _priority_override if _priority_override is not None else self.priority
         _ttl_override = user_overrides.get("ttl_seconds")
         resolved_ttl = _ttl_override if _ttl_override is not None else self.ttl_seconds
-        attribution = attribution_of(self)
+        attribution = deploy_attribution(self, context)
         logger.info(
             f"Deploying env '{self.env_id}' (ttl={resolved_ttl}s, "
             f"disk_size_gb={self.disk_size_gb}, gateway_mode={self.gateway_mode}, "
             f"cpu={self.cpu}, memory_mb={self.memory_mb}, "
             f"sandbox_type={resolved_sandbox_type}, env_state_type={resolved_env_state_type}, "
             f"env_state_instance_id={resolved_env_state_instance_id}, "
-            f"project_id={attribution.get('project_id')}, priority={resolved_priority})"
+            f"attribution={attribution}, priority={resolved_priority})"
         )
         deploy_kwargs = {
             "ttl_seconds": resolved_ttl,
@@ -131,43 +156,20 @@ class DeployEnvTaskStep(TaskStep):
         if resolved_env_state_instance_id is not None:
             deploy_kwargs["env_state_instance_id"] = resolved_env_state_instance_id
         # Forward the per-run LiteLLM key so envs that spin up their own LLM-calling
-        # sidecars attribute spend to the same key as the agent, and the desktop sandbox
-        # override to envs that take one. Guard on the signature — most envs' deploy()
-        # takes a fixed param list and would TypeError on an unexpected kwarg.
+        # sidecars attribute spend to the same key as the agent. Guard on the
+        # signature — most envs' deploy() takes a fixed param list and would
+        # TypeError on an unexpected kwarg.
         params = inspect.signature(env.deploy).parameters
         accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         model_api_key = user_overrides.get("litellm_api_key")
         if model_api_key and ("litellm_api_key" in params or accepts_kwargs):
             deploy_kwargs["litellm_api_key"] = model_api_key
-        cua_sandbox_type = user_overrides.get("cua_sandbox")
-        if cua_sandbox_type is not None:
-            if "cua_sandbox_type" in params or accepts_kwargs:
-                deploy_kwargs["cua_sandbox_type"] = cua_sandbox_type
-            else:
-                logger.warning(
-                    f"Ignoring cua_sandbox={cua_sandbox_type!r}: env '{self.env_id}' "
-                    f"({type(env).__name__}) does not accept cua_sandbox_type"
-                )
         deployed_env = await env.deploy(**deploy_kwargs)
-        # Annotations for the instance record. `deploy_step_id` was previously set
-        # on the in-memory object only, which never reached Mongo: create_instance
-        # runs INSIDE env.deploy() above, so anything assigned here lands after the
-        # insert and is dropped. Records showed metadata=null as a result.
-        #
-        # `deployed_by_oauth_subject` is the identity of whoever asked for this env,
-        # carried from the hub in context.metadata because the record is written
-        # here — in the worker, minutes after the request whose bearer identified
-        # them is gone. It is what env-scoped destructive operations (a universe
-        # load) authorize against, so it has to be on the record itself rather than
-        # reconstructed later from run documents.
+        # create_instance runs inside env.deploy(), so an annotation set after it
+        # returns has to be persisted explicitly to reach the instance record.
         annotations = {"deploy_step_id": self.id}
-        hub_metadata = context.metadata.get("agent_env_hub") or {}
-        deploying_subject = hub_metadata.get("oauth_subject")
-        if isinstance(deploying_subject, str) and deploying_subject.strip():
-            annotations["deployed_by_oauth_subject"] = deploying_subject.strip()
         deployed_env.metadata = {**(deployed_env.metadata or {}), **annotations}
         if deployed_env.instance_id:
-            # Best-effort: annotating the record must not fail a good deploy.
             update_env_instance_metadata(deployed_env.instance_id, annotations)
         context.deployed_envs.append(deployed_env)
 

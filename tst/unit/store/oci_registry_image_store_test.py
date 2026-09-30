@@ -2,7 +2,7 @@
 
 import pytest
 
-from agent_env.store import OciRegistryCredentials, OciRegistryImageStore, RegistryAuth
+from agent_env.store import ImageStore, OciRegistryCredentials, OciRegistryImageStore, RegistryAuth
 from agent_env.store.image_store import registry_host_from_ref
 
 
@@ -82,3 +82,51 @@ def test_from_config_builds_nested_credential_provider(monkeypatch):
 
     assert isinstance(store.credentials, SecretStoreCredentials)
     assert store.auth("ghcr.io/example/image:v1") == RegistryAuth("ghcr.io", "u", "p")
+
+
+@pytest.mark.parametrize(
+    ("ref", "owned"),
+    [
+        ("us-west1-docker.pkg.dev/example-project/agentenv/server:v2", True),
+        ("us-west1-docker.pkg.dev/example-project/agentenv/team/server@sha256:" + "0" * 64, True),
+        ("US-WEST1-DOCKER.PKG.DEV/example-project/agentenv/server", True),
+        ("us-west1-docker.pkg.dev/other-project/agentenv/server:v2", True),
+        ("us-east1-docker.pkg.dev/example-project/agentenv/server:v2", False),
+        ("us-west1-docker.pkg.dev.attacker.example/example-project/agentenv/server:v2", False),
+        ("example-project/agentenv/server:v2", False),
+    ],
+)
+def test_owns_the_refs_its_registry_login_covers(ref, owned):
+    """A registry login covers the whole host, other repositories on it included."""
+    store = OciRegistryImageStore("us-west1-docker.pkg.dev", "example-project/agentenv", credentials=_Credentials())
+    assert store.owns(store.image_ref("server", "v2"))
+    assert store.owns(ref) is owned
+    assert (store.auth(ref) is not None) is owned
+
+
+def test_without_credentials_the_store_still_owns_its_registry():
+    store = OciRegistryImageStore("localhost:5000")
+    assert store.owns("localhost:5000/server:v1") and store.owns("localhost:5000/team/server")
+    assert not store.owns("localhost:5001/server:v1") and not store.owns("server:v1")
+    assert store.auth("localhost:5000/server:v1") is None
+
+
+def test_widening_owns_does_not_send_the_login_to_another_registry():
+    class _Mirroring(OciRegistryImageStore):
+        def owns(self, ref):
+            return super().owns(ref) or ref.startswith("mirror.example/")
+
+    store = _Mirroring("registry.example", credentials=_Credentials())
+    assert store.owns("mirror.example/app:v1")
+    assert store.auth("mirror.example/app:v1") is None
+
+
+def test_an_image_store_owns_nothing_unless_it_says_so():
+    class _Minimal(ImageStore):
+        def image_ref(self, repository, tag):
+            return f"registry.example/{repository}:{tag}"
+
+        def auth(self, ref):
+            return None
+
+    assert not _Minimal().owns("registry.example/server:v1")

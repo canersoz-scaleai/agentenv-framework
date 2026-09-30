@@ -4,11 +4,15 @@ Fast tier — no Mongo, no network (stdlib sqlite over a temp file), so the same
 assertions that prove Mongo parity also give quick backend-neutral coverage.
 """
 
+import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from agent_env.store import Filter, LocalSqliteDocumentStore, UpdateSpec, compare_and_swap
+from agent_env.store.document_store import sqlite_document_store
 from tst.store import conformance
 
 
@@ -55,3 +59,51 @@ def test_reader_sees_a_collection_created_by_another_connection(tmp_path):
         writer.insert(coll, {"id": "x", "version": 1})                # creates docs_<coll> + a row
         got = reader.find_one(coll, Filter.of(id="x"))
         assert got is not None and got["id"] == "x", f"{coll}: cross-connection write not seen"
+
+
+def test_processes_opening_a_new_database_at_once_all_write(tmp_path):
+    path = tmp_path / "new" / "shared.db"
+    code = (
+        "import sys\n"
+        "from agent_env.store import LocalSqliteDocumentStore\n"
+        "store = LocalSqliteDocumentStore(sys.argv[1])\n"
+        "for i in range(50):\n"
+        "    store.insert('coll', {'id': f'{sys.argv[2]}-{i}'})\n"
+    )
+    # nosemgrep: dangerous-subprocess-use-audit -- argv is sys.executable + the literal `code`; no external input
+    writers = [subprocess.Popen([sys.executable, "-c", code, str(path), name], stderr=subprocess.PIPE) for name in "abcd"]
+    for writer in writers:
+        _, stderr = writer.communicate(timeout=120)
+        assert writer.returncode == 0, stderr.decode()
+    assert len(LocalSqliteDocumentStore(str(path)).query("coll", Filter.of())) == 200
+
+
+class _Connection:
+    """Fails its first ``failures`` statements with ``code``."""
+
+    def __init__(self, failures, code):
+        self.failures, self.code, self.calls = failures, code, 0
+
+    def execute(self, sql):
+        self.calls += 1
+        if self.calls <= self.failures:
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = self.code
+            raise error
+
+
+def test_the_wal_switch_waits_out_a_connection_holding_the_lock():
+    conn = _Connection(failures=3, code=sqlite3.SQLITE_BUSY)
+    sqlite_document_store._enable_wal(conn)
+    assert conn.calls == 4
+
+
+def test_the_wal_switch_raises_other_errors_and_a_lock_held_too_long(monkeypatch):
+    conn = _Connection(failures=1, code=sqlite3.SQLITE_IOERR)
+    with pytest.raises(sqlite3.OperationalError):
+        sqlite_document_store._enable_wal(conn)
+    assert conn.calls == 1
+
+    monkeypatch.setattr(sqlite_document_store, "_BUSY_TIMEOUT_SECONDS", 0.05)
+    with pytest.raises(sqlite3.OperationalError):
+        sqlite_document_store._enable_wal(_Connection(failures=10**6, code=sqlite3.SQLITE_BUSY))

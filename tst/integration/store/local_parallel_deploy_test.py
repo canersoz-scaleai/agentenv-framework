@@ -124,7 +124,7 @@ async def test_two_deploy_env_steps_run_concurrently(local_stack):
 
     artifact = DockerImageArtifact.put(id=tag, description="parallel e2e", image_name=tag)
     env = MCPServerEnv.put(id=f"par-env-{uid}", docker_image_artifact=artifact,
-                           environment_name="slack", service_version=1)
+                           environment_name="slack")
 
     task = Task.put(id=f"par-task-{uid}", steps=[
         DeployEnvTaskStep(id="deploy_a", version=None, env_id=env.id, env_version=env.version,

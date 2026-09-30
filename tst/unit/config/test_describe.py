@@ -4,7 +4,7 @@ Two properties carry the weight. The first is that the report is *true*: it name
 `Config.trace_section` would actually take, so it cannot quietly drift into telling a
 reassuring story about a store the process is not using — the exact failure that let
 a consumer write to SQLite for two releases while reporting success. The second is that it
-is *inert*: it must not build a store, reach the network, or create `.agentenv/`.
+is *inert*: it must not build a store, reach the network, or create `.agentenv/` or the state root.
 """
 
 import pathlib
@@ -25,6 +25,7 @@ from agent_env.config.describe import (
     search_path,
 )
 from agent_env.config.errors import ConfigError
+from agent_env.config.paths import state_root
 from agent_env.config.runtime import ALIASED_SECTIONS, Config
 
 # TruffleHog scans the committed bytes, and a connection URI carrying inline userinfo is
@@ -88,6 +89,7 @@ def test_resolving_and_describing_a_bare_install_create_nothing(tmp_path):
     Config()._resolve_document_section()
     Config()._resolve_object_section()
     assert list(tmp_path.iterdir()) == []
+    assert not state_root().exists()
 
 
 # ---------------------------------------------------------------- precedence attribution
@@ -300,8 +302,14 @@ impls = ["pkg.steps:CustomStep"]
 [explorer]
 port = 9999
 
+[explorer.plugins]
+impls = []
+
 [runner]
 impl = "agent_env.runner.local_runner:LocalRunner"
+
+[plugins.agentenv-demo]
+timeout = 30
 """
 
 _ALIASED = ("document", "object", "image", "secret", "runner")
@@ -339,10 +347,13 @@ def test_every_top_level_table_is_covered(tmp_path, monkeypatch):
     path.write_text(FULL_SURFACE_TOML)
     monkeypatch.setenv("AGENT_ENV_CONFIG", str(path))
 
-    reported = _sections(describe_config())
+    report = describe_config()
+    reported = _sections(report)
     assert tuple(reported) == _EVERY_TABLE
     assert all(s.winner.kind == "file" for s in reported.values()), \
         {n: s.winner.kind for n, s in reported.items() if s.winner.kind != "file"}
+    # and the one top-level table core does not read, reported under the plugin it belongs to
+    assert [(t.owner.name, t.value) for t in report.plugins.tables] == [("agentenv-demo", {"timeout": 30})]
 
 
 def test_every_reported_fallback_names_a_core_module_that_mentions_that_table():
@@ -355,6 +366,22 @@ def test_every_reported_fallback_names_a_core_module_that_mentions_that_table():
         assert f'"{section.toml_path[0]}"' in module.read_text(), (section.name, section.owner)
 
 
+def _declared(shape) -> list[str]:
+    if isinstance(shape, describe.Named):
+        return _declared(shape.shape)
+    return [k for key, inner in (shape or {}).items() for k in (key, *_declared(inner))]
+
+
+def test_every_declared_key_is_named_in_its_owners_package():
+    """A declared key nothing reads would let a dead setting pass the unread-key check."""
+    core = pathlib.Path(describe.__file__).parents[1]
+    for section in describe._FILE_SECTIONS:
+        package = core.joinpath(*section.owner.split(".")).parent
+        source = "".join(p.read_text() for p in package.rglob("*.py") if p.name != "describe.py")
+        for key in _declared(section.keys):
+            assert f'"{key}"' in source, (section.name, key)
+
+
 def test_a_table_absent_from_the_file_names_where_its_fallback_lives(tmp_path, monkeypatch):
     """Those sections' defaults live in their reader, not here. The report says where to
     look rather than guessing a value it would then have to keep in sync."""
@@ -364,7 +391,7 @@ def test_a_table_absent_from_the_file_names_where_its_fallback_lives(tmp_path, m
 
     sandbox = _sections(describe_config())["sandbox"]
     assert sandbox.winner.kind == "default"
-    assert "providers.sandbox_provider" in sandbox.winner.where
+    assert "providers.sandbox_providers.sandbox_provider" in sandbox.winner.where
 
 
 def test_describing_a_packaged_config_does_not_write_beside_it(tmp_path, monkeypatch):
@@ -591,7 +618,7 @@ def test_a_section_name_used_as_a_key_inside_another_table_is_warned_about(tmp_p
     file becomes `[task_steps].envs` — a well-formed document that configures nothing. No
     shape rule can catch it: the section is simply absent. This bit me three times writing a
     chaos harness, which is how I know a user will hit it."""
-    path = _write_config(tmp_path, '[task_steps]\nimpls = []\nenvs = "pkg:CuaEnv"\n')
+    path = _write_config(tmp_path, '[task_steps]\nimpls = []\nenvs = "pkg:VmEnv"\n')
     monkeypatch.setenv("AGENT_ENV_CONFIG", str(path))
 
     report = describe_config()
@@ -643,7 +670,8 @@ one_plugin = ["pkg.plugins:Only"]
 
     assert "pkg.plugins:A" in out and "pkg.plugins:B" in out
     assert "deep=2" in out
-    assert "'" not in out                      # `from [explorer]` is the only bracket here
+    # `from [explorer]` is the only bracket here; the warnings naming the unread keys quote them
+    assert "'" not in "\n".join(line for line in out.splitlines() if "(warning)" not in line)
     # a single-entry list keeps its heading; inlined it would read as `impls=pkg.plugins:A`
     assert "one_plugin:" in out
 
@@ -758,10 +786,10 @@ impl = "pkg.providers:BetaProvider"
 impl = "pkg.providers:ModalVmProvider"
 [sandbox.attribution]
 product = "agent-env"
-team = "frontier-data"
+team = "my-team"
 
 [envs]
-impls = ["pkg.envs:CuaEnv", "pkg.envs:IosCuaEnv", "pkg.envs:RemoteEnv", "pkg.envs:FifthEnv"]
+impls = ["pkg.envs:VmEnv", "pkg.envs:BrowserEnv", "pkg.envs:RemoteEnv", "pkg.envs:FifthEnv"]
 
 [explorer]
 allowed_hosts = ["explorer.mybox.internal:8234", "a.b"]
@@ -771,11 +799,11 @@ allowed_hosts = ["explorer.mybox.internal:8234", "a.b"]
     out = render(describe_config())
 
     # every entry, in full -- no `+N` tail, no key-names-only summary
-    for impl in ("pkg.envs:CuaEnv", "pkg.envs:IosCuaEnv", "pkg.envs:RemoteEnv", "pkg.envs:FifthEnv"):
+    for impl in ("pkg.envs:VmEnv", "pkg.envs:BrowserEnv", "pkg.envs:RemoteEnv", "pkg.envs:FifthEnv"):
         assert impl in out
     assert "beta_scale  BetaProvider" in out and "modal_vm  ModalVmProvider" in out
     # the values of a nested scalar table, which the summarised form replaced with its keys
-    assert "product=agent-env" in out and "team=frontier-data" in out
+    assert "product=agent-env" in out and "team=my-team" in out
     # `class_name` is an rpartition on ":", so naming every string turned a documented
     # `allowed_hosts = ["host:8234"]` into its port.
     assert "explorer.mybox.internal:8234" in out

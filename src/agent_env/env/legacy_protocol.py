@@ -9,20 +9,50 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
+from agentenv_protocol import RPC_PATH, client as protocol_v1
+
+if TYPE_CHECKING:
+    from agent_env.env.env import DeployedEnv
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MCP_MAX_RETRIES = 5
 
 
-def environment_base_url(gateway_url: str, environment_name: str, mcp: bool = True) -> str:
+def environment_base_url(gateway_url: Optional[str], environment_name: str, mcp: bool = True) -> str:
     """Gateway path for a service: ``/svc/mcp-{name}`` (MCP) or ``/svc/{name}`` (website)."""
+    if not gateway_url:  # an env deployed without a gateway has no gateway paths
+        from agent_env.env.env import EnvNeedsGateway
+
+        raise EnvNeedsGateway(f"Reaching '{environment_name}' here")
     prefix = "mcp-" if mcp else ""
     return f"{gateway_url}/svc/{prefix}{environment_name}"
 
+
+async def v1_base_url(deployed: Optional[DeployedEnv], gateway_url: Optional[str], environment_name: str, mcp: bool = True) -> Optional[str]:
+    """A child env's v1 data-plane base from the stored env card, or None for legacy; without a stored card, the live probe decides."""
+    if deployed is None or not deployed.environment_card:
+        base_url = environment_base_url(gateway_url, environment_name, mcp=mcp)
+        return base_url if await protocol_v1.supports_v1(base_url) else None
+    child = deployed.get_child_env_card(environment_name)
+    return deployed.environment_url + child.get("url", RPC_PATH).removesuffix(RPC_PATH) if child else None
+
+
+
+async def child_env_card(deployed: Optional[DeployedEnv], gateway_url: Optional[str], environment_name: str, timeout: int = 10) -> tuple[str, Optional[dict]]:
+    """An MCP child env's card and the base its endpoints resolve against: from the stored env card, or without one a live read (None on 404)."""
+    if deployed is None or not deployed.environment_card:
+        base_url = environment_base_url((gateway_url or "").rstrip("/"), environment_name)
+        try:
+            return base_url, await protocol_v1.get_card(base_url, timeout=timeout)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return base_url, None
+            raise
+    return deployed.environment_url, deployed.get_child_env_card(environment_name)
 
 async def reset_via_rest(
     base_url: str,

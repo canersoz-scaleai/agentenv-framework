@@ -107,9 +107,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 .pybuilder/
 target/
@@ -123,8 +120,6 @@ notebook/static/*
 !notebook/static/favicons
 notebook/labextension
 notebook/schemas
-docs/source/changelog.md
-docs/source/contributing.md
 
 # IPython
 profile_default/

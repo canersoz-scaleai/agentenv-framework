@@ -22,6 +22,7 @@ import agent_env
 from agent_env.config import get_config, reset_config, snapshot
 from agent_env.config.errors import ConfigError
 from agent_env.config.runtime import Config
+from agent_env.plugins import settings
 
 SRC = pathlib.Path(agent_env.__file__).parent
 _PRIVATE_READS = {"load_config_file", "discover_config_path"}
@@ -133,12 +134,12 @@ def _read_task_steps():
 
 
 def _read_sandbox():
-    from agent_env.providers.sandbox_provider import _merge_config_toml_sandbox_providers
+    from agent_env.providers.sandbox_providers.sandbox_provider import _merge_config_toml_sandbox_providers
     _merge_config_toml_sandbox_providers({})
 
 
 def _read_state():
-    from agent_env.providers.state.env_state_provider import _merge_config_toml_state_providers
+    from agent_env.providers.env_state.env_state_provider import _merge_config_toml_state_providers
     _merge_config_toml_state_providers({})
 
 
@@ -153,6 +154,10 @@ def _read_model():
 
 def _read_agents():
     Config().get_default_a2a_agent_id()
+
+
+def _read_plugin_settings():
+    settings("agentenv-demo", config=Config())
 
 
 # Every file section, with a file a user would plausibly write and the reader that consumes
@@ -170,6 +175,7 @@ _SECTION_READERS = [
     ("explorer", '[explorer.plugins]\nimpls = []\n', _read_explorer_plugins),
     ("model", '[model]\nbase_url = "https://gw.example/v1"\n', _read_model),
     ("agents", '[agents]\ndefault_a2a_agent_id = "an-agent"\n', _read_agents),
+    ("plugins", '[plugins.agentenv-demo]\ntimeout = 1\n', _read_plugin_settings),
 ]
 _IDS = [name for name, _, _ in _SECTION_READERS]
 
@@ -228,7 +234,7 @@ def test_a_broken_document_fails_a_reader_instead_of_defaulting_it(tmp_path, mon
     """The regression that matters. On a malformed config.toml the sandbox reader used to
     raise; routing it through a snapshot that answered `{}` made it return the built-in
     `local` instead — a broken file quietly choosing a different backend."""
-    from agent_env.providers import sandbox_provider
+    from agent_env.providers.sandbox_providers import sandbox_provider
 
     monkeypatch.setenv("AGENT_ENV_CONFIG", str(_config_at(tmp_path, "stores = [[[\n")))
 
@@ -313,7 +319,7 @@ def test_re_pointing_the_config_env_var_needs_a_reset(tmp_path, monkeypatch):
 def test_a_reader_needs_a_reset_to_see_a_re_point(tmp_path, monkeypatch):
     """The same contract through a reader, which is where a consumer meets it: the sdk
     re-points per stage and pairs it with `reset_config()` for this reason."""
-    from agent_env.providers import sandbox_provider
+    from agent_env.providers.sandbox_providers import sandbox_provider
 
     good = _config_at(tmp_path / "good", '[envs]\nimpls = []\n')
     bad = _config_at(tmp_path / "bad", "stores = [[[\n")

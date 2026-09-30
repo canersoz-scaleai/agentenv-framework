@@ -3,17 +3,17 @@ to the explorer, through an ``agent_env.explorer_plugins`` entry point or ``[exp
 
 Plugins mount *before* the core routers (see ``create_app``), so a plugin may add a
 literal path under a core prefix (e.g. ``/api/v1/agents/trajectory-url``) that the core
-``/{entity_id}`` catch-all would otherwise shadow. There is no per-plugin config table
-yet — ``[explorer.plugins].impls`` is a flat list of ``module:Class`` strings — so this seam is
-for contributing routes/namespaces, not for configuring the plugins themselves.
+``/{entity_id}`` catch-all would otherwise shadow. ``[explorer.plugins].impls`` is a flat list of
+``module:Class`` strings, so this seam contributes routes; a plugin reads its own settings from
+``[plugins.<distribution name>]`` with ``agent_env.plugins.settings``.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Self
 
-from agent_env.plugins import _registration
+from agent_env.plugins import _registration, _report
 
 if TYPE_CHECKING:
     from fastapi import APIRouter
@@ -23,12 +23,12 @@ if TYPE_CHECKING:
 class ExplorerPlugin(ABC):
     """A named bundle of routes contributed to the explorer by an installed package."""
 
-    type: str = "explorer_plugin"
+    type: ClassVar[str] = "explorer_plugin"
 
     @classmethod
-    def from_config(cls) -> "ExplorerPlugin":
-        # No per-plugin config table yet: [explorer.plugins].impls is a flat list of
-        # 'module:Class' strings, so a plugin is constructed with no arguments.
+    def from_config(cls) -> Self:
+        # [explorer.plugins].impls is a flat list of 'module:Class' strings, so a plugin is
+        # constructed with no arguments and reads its settings with agent_env.plugins.settings.
         return cls()
 
     @property
@@ -75,15 +75,19 @@ def load_plugins(*, source: Config | None = None) -> list[ExplorerPlugin]:
             raise ConfigError(
                 f"[explorer.plugins] impl {impl!r} type {cls.type!r} is already registered by {seen[cls.type]!r}"
             )
+        if problem := _registration.unimplemented(cls, ExplorerPlugin):
+            raise ConfigError(f"[explorer.plugins] impl {impl!r}: {problem}")
         seen[cls.type] = impl
-        from_plugins.release(cls.type, f"[explorer.plugins] impl {impl!r}", cls)
+        if from_plugins.refuse(cls.type, f"[explorer.plugins] impl {impl!r}"):
+            continue
+        from_plugins.release(cls.type, "explorer.plugins", impl, cls)
         classes[cls.type] = cls
         built[cls.type] = cls.from_config()
     for name in from_plugins:
         try:
             instance = classes[name].from_config()
-        except Exception as exc:
-            from_plugins.reject(name, f"failed to construct: {exc!r}")
+        except (Exception, SystemExit) as exc:
+            from_plugins.reject(name, _report.LOAD_FAILED, f"failed to construct: {exc!r}")
             del built[name]
             continue
         built[name] = instance

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from agent_env.providers.sandbox_provider import SANDBOX_MODE_CONTAINER
+from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_CONTAINER
 from agent_env.config import get_config
 from agent_env.store.document_store import AbsentOrNull, Filter, Sort
+from agent_env.store.routing import refuse_local_derivation
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +83,15 @@ class EnvSnapshot:
         EnvSnapshot record.
         """
         from agent_env.artifact import DockerImageArtifact
-        from agent_env.env.env import Env
-        from agent_env.env.envs.multi_env import MultiEnv
+        from agent_env.env.env import DeployedSandboxEnv, Env
+        from agent_env.env.envs.multi_env import MultiEnv, _gateway_state_provider
         from agent_env.env.store import get_env_instance_store
 
         log = on_progress or (lambda step, msg, pct: None)
 
         log("validate", "Fetching env instance...", 5)
         deployed_env = get_env_instance_store().get(instance_id)
+        refuse_local_derivation(deployed_env.env_id, "env", "snapshotting")
         env = Env.get(deployed_env.env_id, deployed_env.env_version)
         if not isinstance(env, MultiEnv):
             raise ValueError(
@@ -96,22 +99,27 @@ class EnvSnapshot:
                 "only MultiEnv is supported"
             )
 
+        env_id = deployed_env.env_id
+        without_our_gateway = (f"Snapshot capture needs our gateway and its local Postgres store; env '{env_id}' was deployed by "
+                               f"env_provider_type '{deployed_env.env_provider_type}'")
+        if not isinstance(deployed_env, DeployedSandboxEnv):
+            raise NotImplementedError(without_our_gateway)
+
         environment_universe = get_env_instance_store().get_environment_universe(instance_id)
         if environment_universe is None:
             raise ValueError(f"Instance '{instance_id}' has no service_universe loaded")
-
-        env_id = deployed_env.env_id
         universe_id = environment_universe["id"]
         universe_version = environment_universe["version"]
-
         log("reconnect", f"Reconnecting to sandbox {deployed_env.sandbox_id}...", 10)
         multi_env = await MultiEnv.from_deployed_env(deployed_env)
+        if multi_env._sandbox is None:
+            raise NotImplementedError(without_our_gateway)
         if multi_env._sandbox.mode == SANDBOX_MODE_CONTAINER:
             raise NotImplementedError("Snapshot creation not supported on container mode")
 
         # Snapshot capture bakes the local servicedb container into an image (docker cp PGDATA →
         # image), so it's only meaningful for a backend that can also restore from that image
-        state_provider = multi_env._gateway_provider._state_provider if multi_env._gateway_provider else None
+        state_provider = _gateway_state_provider(multi_env)
         if state_provider is None or not state_provider.supports_restore_from_snapshot:
             raise NotImplementedError(
                 "Snapshot capture is only supported for the local Postgres backend "
@@ -162,7 +170,8 @@ class EnvSnapshot:
 async def _check_changelog_empty(sandbox) -> bool:
     """Return True if the _changelog table is empty (no modifications since data load)."""
     from agent_env.env.envs.service_db import DB_NAME, DB_USER
-    from agent_env.providers.gateway_provider import DATABASE_SERVICE_NAME, DOCKER_COMPOSE_PATH
+    from agent_env.env.envs.service_db import DATABASE_SERVICE_NAME
+    from agent_env.providers.env_providers.constants import DOCKER_COMPOSE_PATH
 
     cmd = (
         f"docker compose -f {DOCKER_COMPOSE_PATH} exec -T {DATABASE_SERVICE_NAME} "
@@ -178,7 +187,8 @@ async def _snapshot_servicedb(sandbox, env_id: str, environment_universe_id: str
 
     Returns the S3 URL of the uploaded tar.gz.
     """
-    from agent_env.providers.gateway_provider import DATABASE_SERVICE_NAME, DOCKER_COMPOSE_PATH
+    from agent_env.env.envs.service_db import DATABASE_SERVICE_NAME
+    from agent_env.providers.env_providers.constants import DOCKER_COMPOSE_PATH
 
     container_id_output = await sandbox.exec_script(
         f"docker compose -f {DOCKER_COMPOSE_PATH} ps -a -q {DATABASE_SERVICE_NAME}"
@@ -211,9 +221,12 @@ async def _snapshot_servicedb(sandbox, env_id: str, environment_universe_id: str
     logger.info("Saving Docker image to tar.gz on sandbox...")
     await sandbox.exec_script(f"docker save {image_tag} | gzip > /tmp/snapshot-image.tar.gz")
 
-    object_store = get_config().get_object_store()
-    object_url = object_store.object_url(f"env-snapshots/{env_id}/{environment_universe_id}/{image_tag}.tar.gz")
-    put_url = object_store.signed_put_url(object_url)
+    config = get_config()
+    object_store = config.get_object_store()
+    object_url = object_store.object_url(
+        f"{config.get_artifact_key_prefix()}env-snapshots/{env_id}/{environment_universe_id}/{image_tag}.tar.gz"
+    )
+    put_url = await asyncio.to_thread(object_store.signed_put_url, object_url)
     if put_url is None:
         raise RuntimeError(
             f"{type(object_store).__name__} can't presign uploads; env snapshots need a signable object store or local execution."

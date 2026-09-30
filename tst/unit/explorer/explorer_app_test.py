@@ -1,16 +1,23 @@
 """The explorer over a real SQLite store: list/get/versions semantics and a real run."""
 
+import dataclasses
+import gzip
+import tempfile
+
 import pytest
 
 pytest.importorskip("fastapi")  # the explorer is the optional [explorer] extra (fastapi, uvicorn)
 
 from fastapi.testclient import TestClient
 
-from agent_env.config import configure, get_config, reset_config, set_document_store, set_runner
+from agent_env.config import configure, get_config, reset_config, set_document_store, set_object_store, set_runner
 from agent_env.config.errors import ConfigError
 from agent_env.runner import store as run_store
 from agent_env.runner.local_runner import LocalRunner
+from agent_env.store.object_store.local_object_store import LocalFilesystemObjectStore
 from agent_env.store.document_store.sqlite_document_store import LocalSqliteDocumentStore
+from agent_env.explorer.routers import objects as objects_router
+from tst.unit.store.fakes import FakeObjectStore
 
 
 @pytest.fixture
@@ -400,6 +407,77 @@ def test_instance_content_serves_object_store_bytes(client, tmp_path):
         "/api/v1/objects/content", params={"object_url": "file:///etc/passwd"}
     )
     assert bad.status_code == 400
+
+
+def test_object_routes_serve_only_the_stores_own_urls(client, tmp_path):
+    """A bare path to an object in the local root is not one of the store's urls: both object
+    routes refuse it, and serve the file:// url."""
+    store = LocalFilesystemObjectStore(str(tmp_path / "obj"))
+    set_object_store(store)
+    url = store.put("a/b.txt", b"hi")
+    bare = url.removeprefix("file://")
+
+    for route in ("/api/v1/objects/content", "/api/v1/objects/metadata"):
+        assert client.get(route, params={"object_url": url}).status_code == 200
+        assert client.get(route, params={"object_url": bare}).status_code == 400
+
+
+def test_content_names_any_file_for_the_browser_and_leaves_no_temp_file(client, tmp_path, monkeypatch):
+    """Header values are Latin-1: a CJK name or a quote goes in ``filename*`` beside an ASCII
+    fallback, rather than failing the response after the download to a temp file."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    store = LocalFilesystemObjectStore(str(tmp_path / "obj"))
+    set_object_store(store)
+    url = store.put('out/报告 "v2".txt', b"hi", content_type="text/plain")
+
+    response = client.get("/api/v1/objects/content", params={"object_url": url})
+
+    assert (response.status_code, response.content) == (200, b"hi")
+    assert response.headers["content-disposition"] == (
+        "inline; filename=\"__ _v2_.txt\"; filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%22v2%22.txt"
+    )
+    assert list(scratch.iterdir()) == []
+
+
+def test_content_that_fails_before_its_response_exists_removes_its_temp_file(client, tmp_path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    store = LocalFilesystemObjectStore(str(tmp_path / "obj"))
+    set_object_store(store)
+    url = store.put("out/a.txt", b"hi")
+
+    def fail(*args):
+        raise RuntimeError("response could not be built")
+
+    monkeypatch.setattr(objects_router, "_streamed", fail)
+    with pytest.raises(RuntimeError, match="could not be built"):
+        client.get("/api/v1/objects/content", params={"object_url": url})
+    assert list(scratch.iterdir()) == []
+
+
+def test_object_routes_refuse_a_url_that_names_no_object(client):
+    set_object_store(FakeObjectStore())
+    for route in ("/api/v1/objects/content", "/api/v1/objects/metadata"):
+        response = client.get(route, params={"object_url": "fake://home/"})
+        assert response.status_code == 400
+        assert "names a bucket" in response.json()["detail"]
+
+
+def test_content_forwards_the_stored_content_encoding(client):
+    """Stores read the bytes as stored, so a gzip-encoded object reaches the browser as gzip
+    and the browser decodes it."""
+    store = FakeObjectStore()
+    set_object_store(store)
+    url = store.put("out/log.txt", gzip.compress(b"hello"), content_type="text/plain")
+    store._metadata[url] = dataclasses.replace(store._metadata[url], content_encoding="gzip")
+
+    response = client.get("/api/v1/objects/content", params={"object_url": url})
+
+    assert response.headers["content-encoding"] == "gzip"
+    assert response.content == b"hello"
 
 
 def test_content_sandboxes_active_types(client, tmp_path):

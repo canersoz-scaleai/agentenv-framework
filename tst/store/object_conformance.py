@@ -1,19 +1,25 @@
 """Backend-neutral ObjectStore conformance assertions.
 
 Each function takes ``(store, ns)`` — ``ns`` is a key-prefix that namespaces the
-case's objects (empty for the temp-dir local store; a unique prefix for the
-shared S3 bucket). Both `S3ObjectStore` and `LocalFilesystemObjectStore` must
-pass every case in ``CASES`` — that shared pass is the "it generalizes" proof.
+case's objects (empty for the temp-dir local store; a unique prefix for a
+shared bucket). Every built-in store must pass every case in ``CASES`` — that
+shared pass is the "it generalizes" proof.
+
+A store that sets ``supports_transfer_grants`` must also pass ``GRANT_CASES``, except a
+namespace case its ``issue_upload_policy`` declines with ``GrantUnavailableError``. They send
+the grants to the provider over HTTPS, so they run against a real store only.
 """
 
+import contextlib
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
-from agent_env.store import ObjectAlreadyExistsError
+from agent_env.store import NotFoundError, ObjectAlreadyExistsError, ObjectNotFoundError
 
 
 def put_get_roundtrip(store, ns):
@@ -90,6 +96,12 @@ def download_to_file_streams_to_dest(store, ns):
         shutil.rmtree(tmp)
 
 
+def open_streams_the_object(store, ns):
+    url = store.put(f"{ns}open/blob.bin", b"streamed bytes")
+    with contextlib.closing(store.open(url)) as body:
+        assert body.read(8) + body.read() == b"streamed bytes"
+
+
 def get_object_metadata_reflects_object(store, ns):
     assert store.get_object_metadata(f"{ns}md/absent") is None
     store.put(f"{ns}md/x", b"hello", content_type="application/json")
@@ -124,6 +136,73 @@ def list_at_matches_list(store, ns):
     assert got == {store.object_url(k) for k in store.list(f"{ns}lp/")}
 
 
+def owns_its_objects_and_prefixes(store, ns):
+    url = store.put(f"{ns}own/x.bin", b"v")
+    assert store.owns(url)
+    assert store.owns(store.object_url(f"{ns}own/"))
+    assert not store.owns(f"https://example.test/{ns}own/x.bin")
+
+
+def missing_object_reads_raise_object_not_found(store, ns):
+    """A key with no object (absent, a prefix, below an object) reads as missing everywhere."""
+    store.put(f"{ns}nf/dir/obj.bin", b"v")
+    assert store.get_object_metadata(f"{ns}nf/dir") is None
+    assert not store.exists(f"{ns}nf/dir")
+    tmp = tempfile.mkdtemp()
+    try:
+        for key in (f"{ns}nf/absent.bin", f"{ns}nf/dir", f"{ns}nf/dir/obj.bin/below"):
+            url = store.object_url(key)
+            with pytest.raises(ObjectNotFoundError) as raised:
+                store.get(url)
+            assert isinstance(raised.value, NotFoundError) and isinstance(raised.value, FileNotFoundError)
+            with pytest.raises(ObjectNotFoundError):
+                store.open(url)
+            with pytest.raises(ObjectNotFoundError):
+                store.download_to_file(url, os.path.join(tmp, "out.bin"))
+    finally:
+        shutil.rmtree(tmp)
+
+
+def read_grant_fetches_the_object(store, ns):
+    url = store.put(f"{ns}grant/read.bin", b"granted")
+    grant = store.issue_read_grant(url)
+    response = httpx.get(grant.url, headers=grant.headers)
+    assert response.status_code == 200
+    assert response.content == b"granted"
+
+
+def write_grant_uploads_with_the_signed_content_type(store, ns):
+    url = store.object_url(f"{ns}grant/write.json")
+    grant = store.issue_write_grant(url, media_type="application/json", max_bytes=64)
+    response = httpx.put(grant.url, headers=grant.headers, content=b"{}")
+    assert response.is_success
+    assert store.get(url) == b"{}"
+    assert store.get_object_metadata_at(url).content_type == "application/json"
+
+
+def namespace_grant_confines_uploads_to_its_root(store, ns):
+    policy = store.issue_upload_policy(
+        store.object_url(f"{ns}grant/namespace/"), max_object_bytes=8, expires_in=600
+    )
+    root = store.get_object_key(store.object_url(f"{ns}grant/namespace")).rstrip("/")
+
+    def post(path: str, data: bytes) -> httpx.Response:
+        write = policy.write
+        return httpx.post(
+            write.url,
+            data={"Content-Type": "application/octet-stream", **write.fields, write.path_field: path},
+            files={write.file_field: ("object", data, "application/octet-stream")},
+            headers=write.headers,
+        )
+
+    assert post(f"{root}/000000", b"inside").is_success
+    assert store.read(f"{ns}grant/namespace/000000") == b"inside"
+    assert post(f"{root}-sibling/000000", b"escaped").is_client_error
+    assert not store.exists(f"{ns}grant/namespace-sibling/000000")
+    assert post(f"{root}/000001", b"oversized").is_client_error
+    assert not store.exists(f"{ns}grant/namespace/000001")
+
+
 def _write_temp(data: bytes) -> str:
     fd, path = tempfile.mkstemp()
     with os.fdopen(fd, "wb") as f:
@@ -142,8 +221,17 @@ CASES = [
     object_url_matches_put,
     get_object_key_inverts_object_url,
     download_to_file_streams_to_dest,
+    open_streams_the_object,
     get_object_metadata_reflects_object,
     put_file_at_roundtrips,
     get_object_metadata_at_matches_key_variant,
     list_at_matches_list,
+    owns_its_objects_and_prefixes,
+    missing_object_reads_raise_object_not_found,
+]
+
+GRANT_CASES = [
+    read_grant_fetches_the_object,
+    write_grant_uploads_with_the_signed_content_type,
+    namespace_grant_confines_uploads_to_its_root,
 ]

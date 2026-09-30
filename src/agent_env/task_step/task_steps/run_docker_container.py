@@ -7,6 +7,7 @@ import logging
 import posixpath
 import shlex
 from typing import ClassVar, Optional
+from urllib.parse import urlparse
 
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
@@ -139,7 +140,7 @@ class RunDockerContainerTaskStep(TaskStep):
         )
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             SANDBOX_MODE_VM,
             build_sandbox_provider,
             get_sandbox_provider,
@@ -342,9 +343,15 @@ class RunDockerContainerTaskStep(TaskStep):
 
     @staticmethod
     async def _stage_zip_from_url(sandbox, url: str, work_dir: str) -> None:
-        from urllib.parse import urlparse
-
-        path = urlparse(url).path
+        """http(s) urls are fetched with curl; any other url is read through the configured
+        object store, which reaches whatever its backend can."""
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            raise ValueError(
+                f"docker_context_url={url!r} must be an object store url or an http(s) url"
+            )
+        from_store = parsed.scheme not in ("http", "https")
+        path = url.rsplit("/", 1)[-1] if from_store else parsed.path
         if path.endswith(".zip"):
             pass
         elif path.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
@@ -358,18 +365,12 @@ class RunDockerContainerTaskStep(TaskStep):
             )
 
         archive_path = posixpath.join(work_dir, "_context.zip")
-        parsed = urlparse(url)
         logger.info(f"Downloading docker context from {url} into {work_dir}")
-        if parsed.scheme == "s3":
+        if from_store:
             await sandbox.load_s3_file(url, archive_path)
-        elif parsed.scheme in ("http", "https"):
+        else:
             await sandbox.exec_script(
                 f"curl -fsSL {shlex.quote(url)} -o {shlex.quote(archive_path)}"
-            )
-        else:
-            raise ValueError(
-                f"Unsupported URL scheme {parsed.scheme!r} for docker_context_url={url!r}; "
-                f"supported: http, https, s3"
             )
 
         await sandbox.exec_script(

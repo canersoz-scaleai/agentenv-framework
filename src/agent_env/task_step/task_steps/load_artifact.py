@@ -265,7 +265,7 @@ class LoadArtifactTaskStep(TaskStep):
 
     async def _load_url_onto_vm(self, sandbox, url: str, destination_path: str) -> None:
         """Host counterpart of ``sandbox.load_s3_file``; ``write_file_from_url`` targets a container instead."""
-        from agent_env.providers.sandbox import CURL_RETRY_FLAGS
+        from agent_env.providers.sandbox_providers.sandbox import CURL_RETRY_FLAGS
 
         parent = posixpath.dirname(destination_path)
         if parent:
@@ -280,13 +280,14 @@ class LoadArtifactTaskStep(TaskStep):
         from agent_env.artifact import (
             Artifact,
             CliArtifact,
+            FileArtifact,
             FileArtifactUniverse,
             EnvironmentArtifact,
             EnvironmentUniverseArtifact,
         )
-        from agent_env.env.env import Env
-        from agent_env.providers.sandbox import VmSandbox
-        from agent_env.providers.sandbox_provider import (
+        from agent_env.env.env import Env, require_gateway_url
+        from agent_env.providers.sandbox_providers.sandbox import VmSandbox
+        from agent_env.providers.sandbox_providers.sandbox_provider import (
             build_sandbox_provider,
             get_agent_sandbox_provider,
             get_sandbox_provider,
@@ -335,7 +336,7 @@ class LoadArtifactTaskStep(TaskStep):
             # Split on the target, not the type: a service universe aimed at an
             # agent/container is a grading load (stage the frozen exports as files),
             # aimed at an env it still means restore into the live MCP services.
-            stage_as_files = isinstance(artifact, FileArtifactUniverse) or (
+            stage_as_files = isinstance(artifact, (FileArtifactUniverse, FileArtifact)) or (
                 isinstance(artifact, EnvironmentUniverseArtifact)
                 and deployed is None
                 and (
@@ -370,7 +371,7 @@ class LoadArtifactTaskStep(TaskStep):
                         f"{artifact.type} '{artifact.id}' requires exactly one of `env_id` or `agent_name`"
                     )
                 if self.env_id is not None:
-                    # Only a FileArtifactUniverse reaches here — `stage_as_files`
+                    # Only a FileArtifactUniverse or a FileArtifact reaches here — `stage_as_files`
                     # excludes a service universe whenever an env is targeted.
                     if env is None:
                         env_obj = Env.get(deployed.env_id, deployed.env_version)
@@ -446,9 +447,9 @@ class LoadArtifactTaskStep(TaskStep):
                         "container_name": self.container_name,
                         "destination_path": destination,
                         "file_count": len(files),
-                        # Cap the recorded list — TaskStepContext is heartbeated
-                        # to Temporal and stored in Mongo; a huge corpus must not
-                        # bloat the payload.
+                        # Cap the recorded list — TaskStepContext is persisted and
+                        # can be shipped to an external runner; a huge corpus must
+                        # not bloat the payload.
                         "files": files[:_ENVIRONMENT_PAYLOAD_MAX_RECORDED_FILES],
                     })
                     continue
@@ -480,7 +481,8 @@ class LoadArtifactTaskStep(TaskStep):
                 if agent is None or not agent.instance_id:
                     raise RuntimeError(f"Agent '{self.agent_name}' not found in context.deployed_agents (or missing instance_id)")
                 deployed_agent = get_a2a_agent_instance_store().get(agent.instance_id)
-                install_path = await A2AAgent.install_cli(deployed_agent, artifact, deployed.gateway_url)
+                gateway_url = require_gateway_url(deployed, "Installing a CliArtifact")
+                install_path = await A2AAgent.install_cli(deployed_agent, artifact, gateway_url)
                 agent_clis = context.metadata.setdefault("installed_clis", {}).setdefault(self.agent_name, {})
                 agent_clis[artifact.id] = {
                     "install_path": install_path,
@@ -545,7 +547,7 @@ class LoadArtifactTaskStep(TaskStep):
 
 
 # Cap on how many staged paths get recorded in TaskStepContext metadata
-# (heartbeated to Temporal + stored in Mongo) — `file_count` always carries
+# (persisted, and shipped to external runners) — `file_count` always carries
 # the real total.
 _ENVIRONMENT_PAYLOAD_MAX_RECORDED_FILES = 200
 
@@ -627,7 +629,7 @@ async def _stage_environment_payload_into_container(
     sandbox, container_name: Optional[str], environment_artifact, destination: str
 ) -> list[str]:
     """Expand an EnvironmentArtifact's payload into a file tree at ``destination`` — in the container, or on the VM host when ``container_name`` is None."""
-    from agent_env.providers.sandbox import VmSandbox
+    from agent_env.providers.sandbox_providers.sandbox import VmSandbox
 
     file_artifact = environment_artifact.get_file_artifact()
     token = uuid.uuid4().hex[:8]

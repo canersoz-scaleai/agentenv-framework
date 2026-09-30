@@ -170,9 +170,13 @@ class AwsSecretsManagerSecretStore(SecretStore):
             "secretsmanager", region_name=self._region_name, config=_BOTO_CONFIG
         )
         with suppress_aws_body_logging():
-            raw = client.get_secret_value(SecretId=self._secret_name)["SecretString"]
+            response = client.get_secret_value(SecretId=self._secret_name)
+        if "SecretString" not in response:
+            raise ValueError(
+                f"AWS secret {self._secret_name!r} holds binary data; expected a YAML/JSON mapping"
+            )
         try:
-            loaded = yaml.safe_load(raw) or {}
+            loaded = yaml.load(response["SecretString"], Loader=yaml.BaseLoader) or {}
         except yaml.YAMLError as exc:
             # YAML error marks embed the raw secret line: re-raise sanitized, context dropped.
             mark = getattr(exc, "problem_mark", None)

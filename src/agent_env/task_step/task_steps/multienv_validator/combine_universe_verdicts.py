@@ -84,7 +84,7 @@ class CombineUniverseVerdictsStep(TaskStep):
             logger.warning("combine: agent-judge verdict missing; persisting programmatic result UNGATED (agent_judge_skipped=True)")
 
         # Re-point the dual-written "environments" twin at the merged "services" dict. The two are
-        # aliased when built, but a Temporal heartbeat round-trip re-materializes them as separate
+        # aliased when built, but serializing the context re-materializes them as separate
         # dicts, and apply_judge_verdict only writes "services" — so without this the twin can
         # persist stale.
         if "services" in compat:
