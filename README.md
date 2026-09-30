@@ -1,8 +1,3 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/scaleapi/agentenv-framework/main/assets/brand/lockup-dark.png">
-  <img alt="AgentEnv Framework" src="https://raw.githubusercontent.com/scaleapi/agentenv-framework/main/assets/brand/lockup-light.png" width="360">
-</picture>
-
 # AgentEnv Framework
 
 AgentEnv Framework is a Python SDK and CLI for building, deploying and running agentic environments and the tasks that grade agents inside them. Environments are containerized servers that speak the open `agentenv-framework-protocol`; it builds them into versioned images, deploys them behind a gateway, points an agent at them, and scores what the agent did.
