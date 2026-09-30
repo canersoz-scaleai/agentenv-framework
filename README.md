@@ -11,15 +11,21 @@ agent-env is a Python SDK and CLI for building, deploying and running agentic en
 
 ## Install
 
-Neither package is on PyPI yet, so install both from a clone. You need Python 3.11 or newer, [uv](https://docs.astral.sh/uv/) and a running Docker daemon:
+Both packages are on PyPI. You need Python 3.11 or newer and, to run environments locally, a running Docker daemon:
+
+```bash
+pip install agentenv-framework
+```
+
+The distribution is named `agentenv-framework`, the import package is `agent_env` and the command is `agent-env`. It depends on `agentenv-framework-protocol`, whose import package is `agentenv_protocol`, and installs it too.
+
+To work on agent-env itself, install from a clone with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 git clone https://github.com/scaleapi/agentenv-framework && cd agentenv-framework
 uv sync --extra dev
 source .venv/bin/activate
 ```
-
-The distribution is named `agentenv-framework`, the import package is `agent_env` and the command is `agent-env`.
 
 ## Plugin contract
 
@@ -201,7 +207,7 @@ A contribution that is not `active` also has a code saying why, shown in bracket
 |---|---|---|---|
 | `load-failed` | `failed` | The plugin's code raised: when it was imported (`SystemExit` included), when an explorer plugin was constructed, or in a root option's callback with the flag absent | Install what it needs, or report it to the plugin's author |
 | `invalid-plugin` | `failed` | It imported but does not fit its group: not a subclass of the group's base class; a `type` that is missing, inherited or not the entry-point name; a method its base requires left unimplemented; not a `click.Command` or `click.Option`; a root option that is required or exposes a value; a command click refused; an extra artifact name that reads no document. A bundle is never imported: it is invalid when its value isn't an installed, unpacked package holding that folder, when its metadata can't be read, or when the folder isn't a valid bundle (with plugins loading, one whose step, env or artifact types don't resolve) | Report it to the plugin's author; for a bundle whose package is installed zipped, reinstall it unpacked. For an extra name whose class's own type is in conflict, settle that conflict |
-| `incompatible-core` | `failed` | The plugin's requirement on `agentenv-framework` or `agentenv-protocol` excludes the installed version, so it was not imported. See [Plugin compatibility](#plugin-compatibility) | Upgrade agent-env, or install a version of the plugin that fits |
+| `incompatible-core` | `failed` | The plugin's requirement on `agentenv-framework` or `agentenv-framework-protocol` excludes the installed version, so it was not imported. See [Plugin compatibility](#plugin-compatibility) | Upgrade agent-env, or install a version of the plugin that fits |
 | `builtin-name` | `skipped` | agent-env owns the name: a built-in type, a core command or a core root option | The plugin has to rename it |
 | `name-conflict` | `conflict`, `skipped` | More than one entry point claims the name, from two packages or twice from one; for bundles, only twice from one package (see `qualified-only`). In a type group none of them is registered, and the rest of the group loads; two different root options on one flag are each a `conflict`, and neither is attached. A CLI command whose name a plugin loaded earlier took is `skipped`, and the earlier one stays | Remove all but one: `agent-env plugin remove PACKAGE`. A package that declares a name twice has to be fixed by its author |
 | `replaced-by-config` | `replaced` | The config registers another class under the name | Nothing, unless you did not mean it |
@@ -296,7 +302,7 @@ agent-env ships `py.typed`, so mypy and pyright check a plugin against its annot
 
 **Declaring the agent-env your plugin needs.** Declare a floor, `agentenv-framework>=X`, where `X` is the oldest release you test against. Leave out a ceiling such as `<1`: before 1.0 it would not guard against a change in a 0.9 release, and it would keep your plugin from installing with the next major one. Pin exact versions in the application or image that installs your plugin, not in the plugin. If your plugin imports `agentenv_protocol` itself, declare that as well.
 
-**What agent-env checks.** Before it imports a plugin, agent-env compares the plugin's requirements on `agentenv-framework` and `agentenv-protocol` with the versions installed. A plugin they exclude is not loaded:
+**What agent-env checks.** Before it imports a plugin, agent-env compares the plugin's requirements on `agentenv-framework` and `agentenv-framework-protocol` with the versions installed. A plugin they exclude is not loaded:
 
 - `plugin list`, `show` and `check` report each of its contributions as `failed` with the code `incompatible-core`, with or without `--no-load`, and `check` exits 1;
 - using one of its types names the requirement, as in `needs agentenv-framework>=0.9.1220 (installed: 0.9.1218)`;
@@ -306,29 +312,29 @@ An installer that resolves dependencies never gets you there; `pip install --no-
 
 ## Contribute, release, license
 
-[CONTRIBUTING.md](CONTRIBUTING.md) is the contributor guide: open an issue before anything larger than a bug fix, one logical change per pull request with tests, pull request titles in the form `type(scope): summary`, an approving review from a code owner (`CODEOWNERS`) and green CI. [AGENTS.md](AGENTS.md) is the repository map and conventions file for contributors and coding agents; `CLAUDE.md` imports it.
+[CONTRIBUTING.md](https://github.com/scaleapi/agentenv-framework/blob/main/CONTRIBUTING.md) is the contributor guide: open an issue before anything larger than a bug fix, one logical change per pull request with tests, pull request titles in the form `type(scope): summary`, an approving review from a code owner (`CODEOWNERS`) and green CI. [AGENTS.md](https://github.com/scaleapi/agentenv-framework/blob/main/AGENTS.md) is the repository map and conventions file for contributors and coding agents; `CLAUDE.md` imports it.
 
 ### Documentation map
 
 | Document | Covers |
 |---|---|
 | [www.agentenvframework.com/docs](https://www.agentenvframework.com/docs) | the user guide: environments, artifacts, agents, tasks, the registry and plugins |
-| [`packages/agentenv-protocol/README.md`](packages/agentenv-protocol/README.md) | wire contract, environment server SDK, A2A agent framework |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | development setup, test tiers, CI jobs, pull request rules |
-| [`AGENTS.md`](AGENTS.md) | repository map, configuration and extension-point summary, conventions for contributors and coding agents |
-| [`SECURITY.md`](SECURITY.md) | private vulnerability reporting and supported versions |
-| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributor Covenant |
-| [`.agentenv/config.example.toml`](.agentenv/config.example.toml) | the all-local configuration to copy |
-| [`.env.example`](.env.example) | a commented reference of the `AGENT_ENV_*` variables; agent-env never loads this file, export what you need yourself. Its `AGENT_ENV_ENVIRONMENT` line is read only by an installed plugin, never by agent-env |
+| [`packages/agentenv-protocol/README.md`](https://github.com/scaleapi/agentenv-framework/blob/main/packages/agentenv-protocol/README.md) | wire contract, environment server SDK, A2A agent framework |
+| [`CONTRIBUTING.md`](https://github.com/scaleapi/agentenv-framework/blob/main/CONTRIBUTING.md) | development setup, test tiers, CI jobs, pull request rules |
+| [`AGENTS.md`](https://github.com/scaleapi/agentenv-framework/blob/main/AGENTS.md) | repository map, configuration and extension-point summary, conventions for contributors and coding agents |
+| [`SECURITY.md`](https://github.com/scaleapi/agentenv-framework/blob/main/SECURITY.md) | private vulnerability reporting and supported versions |
+| [`CODE_OF_CONDUCT.md`](https://github.com/scaleapi/agentenv-framework/blob/main/CODE_OF_CONDUCT.md) | Contributor Covenant |
+| [`.agentenv/config.example.toml`](https://github.com/scaleapi/agentenv-framework/blob/main/.agentenv/config.example.toml) | the all-local configuration to copy |
+| [`.env.example`](https://github.com/scaleapi/agentenv-framework/blob/main/.env.example) | a commented reference of the `AGENT_ENV_*` variables; agent-env never loads this file, export what you need yourself. Its `AGENT_ENV_ENVIRONMENT` line is read only by an installed plugin, never by agent-env |
 
 ### Versioning and compatibility
 
-The `agentenv-framework` distribution and `agentenv-protocol` are versioned separately (`0.9.x` and `0.1.x` today), both in their `pyproject.toml`; agent-env releases carry a `vX.Y.Z` tag, and agentenv-protocol is bumped in the same commit and has no separate tag today. There is no `agent_env.__version__` attribute; `agent-env --version` prints the installed version. Protocol extensions carry their version in the URI (`urn:agentenv:clock/v1`, `urn:agentenv:agent-config/v1`, `urn:agentenv:trajectory/v1`). One version can take more than one request shape: under `v1` the skill, trajectory, snapshot and changelog extensions accept object-transfer requests next to their older shapes, and the request field lists on an agent's card say which ones that agent takes. Renamed CLI commands are removed outright; no deprecated aliases exist at this version. What plugins may rely on, and how changes to it are made, is in [Plugin compatibility](#plugin-compatibility); the plugin commands' `--json` output has its own format version and rules ([Plugin report format](#plugin-report-format)). Beyond those, a written compatibility and deprecation policy does not exist yet.
+The `agentenv-framework` distribution and `agentenv-framework-protocol` are versioned separately (`0.9.x` and `0.1.x` today), both in their `pyproject.toml`; agent-env releases carry a `vX.Y.Z` tag, and agentenv-framework-protocol is bumped in the same commit and has no separate tag today. There is no `agent_env.__version__` attribute; `agent-env --version` prints the installed version. Protocol extensions carry their version in the URI (`urn:agentenv:clock/v1`, `urn:agentenv:agent-config/v1`, `urn:agentenv:trajectory/v1`). One version can take more than one request shape: under `v1` the skill, trajectory, snapshot and changelog extensions accept object-transfer requests next to their older shapes, and the request field lists on an agent's card say which ones that agent takes. Renamed CLI commands are removed outright; no deprecated aliases exist at this version. What plugins may rely on, and how changes to it are made, is in [Plugin compatibility](#plugin-compatibility); the plugin commands' `--json` output has its own format version and rules ([Plugin report format](#plugin-report-format)). Beyond those, a written compatibility and deprecation policy does not exist yet.
 
 ### Releases
 
-A release is a version bump in both `pyproject.toml` files plus a `vX.Y.Z` tag. Maintainers cut releases: the bump is automated when a labelled pull request merges, so contributors do not edit `version` or push tags (see the Releases section of [CONTRIBUTING.md](CONTRIBUTING.md)). Neither package is published to a public index yet, and there is no `CHANGELOG.md`.
+A release is a version bump in both `pyproject.toml` files plus a `vX.Y.Z` tag. Maintainers cut releases: the bump is automated when a labelled pull request merges, so contributors do not edit `version` or push tags (see the Releases section of [CONTRIBUTING.md](https://github.com/scaleapi/agentenv-framework/blob/main/CONTRIBUTING.md)). Neither package is published to a public index yet, and there is no `CHANGELOG.md`.
 
 ### Support, security, license
 
-Report bugs and gaps as issues against this repository, with the installed `agentenv-framework` version and the sandbox backend in use. Report vulnerabilities privately through the contact in [SECURITY.md](SECURITY.md), not in public issues; only the latest release is supported, so reproduce against it first. Contributors follow [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md); every pull request needs a code-owner review. agent-env and agentenv-protocol are licensed under the Apache License 2.0; see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Their third-party dependencies and those dependencies' licenses are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Report bugs and gaps as issues against this repository, with the installed `agentenv-framework` version and the sandbox backend in use. Report vulnerabilities privately through the contact in [SECURITY.md](https://github.com/scaleapi/agentenv-framework/blob/main/SECURITY.md), not in public issues; only the latest release is supported, so reproduce against it first. Contributors follow [CONTRIBUTING.md](https://github.com/scaleapi/agentenv-framework/blob/main/CONTRIBUTING.md) and the [Code of Conduct](https://github.com/scaleapi/agentenv-framework/blob/main/CODE_OF_CONDUCT.md); every pull request needs a code-owner review. agent-env and agentenv-framework-protocol are licensed under the Apache License 2.0; see [`LICENSE`](https://github.com/scaleapi/agentenv-framework/blob/main/LICENSE) and [`NOTICE`](https://github.com/scaleapi/agentenv-framework/blob/main/NOTICE). Their third-party dependencies and those dependencies' licenses are listed in [`THIRD_PARTY_NOTICES.md`](https://github.com/scaleapi/agentenv-framework/blob/main/THIRD_PARTY_NOTICES.md).
