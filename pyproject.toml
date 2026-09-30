@@ -62,7 +62,8 @@ agent-env = "agent_env.cli:cli"
 hello = "agent_env.examples"
 
 [project.urls]
-Homepage = "https://github.com/scaleapi/agentenv-framework"
+Homepage = "https://www.agentenvframework.com"
+Documentation = "https://www.agentenvframework.com/docs"
 Repository = "https://github.com/scaleapi/agentenv-framework"
 Issues = "https://github.com/scaleapi/agentenv-framework/issues"
 
