@@ -213,7 +213,7 @@ class VmSandbox(Sandbox):
             backoff = 2 ** attempt
             logger.warning(
                 f"exec_script exit {exit_code} ({'transient server error' if exit_code == -1 else 'retryable'}), "
-                f"retrying in {backoff}s (attempt {attempt + 1}/{max_retries + 1}); stderr: {clip_output(stderr, 200)!r}"
+                f"retrying in {backoff}s (attempt {attempt + 1}/{max_retries + 1}); output: {clip_output(stderr or stdout, 200)!r}"
             )
             await asyncio.sleep(backoff)
         raise AssertionError("unreachable")
