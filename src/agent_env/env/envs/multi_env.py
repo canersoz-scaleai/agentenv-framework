@@ -591,8 +591,12 @@ COMPOSE_EOF'''
 
         # Remove old servicedb container and its anonymous volume, then start fresh from snapshot image
         logger.info("Recreating servicedb container with snapshot image...")
+        # Compose has data races that end in a Go runtime panic (exit 2) while stopping or
+        # recreating containers. Both lifecycle commands below are idempotent, so a crashed
+        # attempt is re-run instead of failing the load.
         await self._sandbox.exec_script(
-            f"cd {GATEWAY_APP_DIR} && docker compose rm -sf -v {DATABASE_SERVICE_NAME} && docker compose up -d {DATABASE_SERVICE_NAME} 2>&1"
+            f"cd {GATEWAY_APP_DIR} && docker compose rm -sf -v {DATABASE_SERVICE_NAME} && docker compose up -d {DATABASE_SERVICE_NAME} 2>&1",
+            max_retries=2, retry_exit_codes=(2,),
         )
 
         # Wait for servicedb to be healthy
@@ -620,7 +624,8 @@ COMPOSE_EOF'''
         svc_list = " ".join(environment_names + [GATEWAY_SERVICE_NAME, PGWEB_SERVICE_NAME, DB_MCP_SERVICE_NAME])
         logger.info(f"Recreating services: {svc_list}")
         await self._sandbox.exec_script(
-            f"cd {GATEWAY_APP_DIR} && docker compose up -d --force-recreate {svc_list}"
+            f"cd {GATEWAY_APP_DIR} && docker compose up -d --force-recreate {svc_list}",
+            max_retries=2, retry_exit_codes=(2,),
         )
         await gw._wait_for_gateway(self._sandbox, AGENT_ENV_GATEWAY_MCP_PORT)
 
