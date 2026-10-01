@@ -44,10 +44,6 @@ def test_modal_tags_with_everything_supplied():
     assert _tags(product="p", customer="c", team="t") == {"product": "p", "customer": "c", "team": "t"}
 
 
-def test_a_dimension_modal_does_not_bill_on_is_not_an_app_tag():
-    assert "cost_center" not in _tags(cost_center="x")
-
-
 def test_modal_vm_shares_the_modal_sink():
     from agent_env.providers.sandbox_providers import modal_vm_sandbox
 
@@ -102,7 +98,7 @@ async def test_a_chain_forwards_the_dict_as_is():
             seen["kwargs"] = kwargs
             return SimpleNamespace(type="modern", network_policy=None)
 
-    attribution = {"team": "t", "cost_center": "x"}
+    attribution = {"team": "t"}
     await ChainedSandboxProvider([Provider()]).create_sandbox(attribution=attribution, cpu=2.0)
     assert seen == {"attribution": attribution, "kwargs": {"cpu": 2.0}}
 

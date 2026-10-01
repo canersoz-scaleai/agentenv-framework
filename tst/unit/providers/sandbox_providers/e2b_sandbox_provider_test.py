@@ -64,7 +64,6 @@ async def test_create_vm_uses_derived_template_and_preserves_attribution(
             "product": "product-a",
             "customer": "customer-b",
             "team": "team-c",
-            "cost_center": "cost-center-d",
         },
     )
 
