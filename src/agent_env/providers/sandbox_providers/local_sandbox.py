@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import glob
 import logging
 import os
@@ -113,8 +114,9 @@ class LocalSandbox(VmSandbox):
             port: port for port in (exposed_ports or [])
         }
         # Keyed by container port: callers index this with the well-known constants.
+        # 127.0.0.1, not localhost: ports are published on IPv4 loopback, and a client may try ::1 first.
         self.tunnel_urls = {
-            container: f"http://localhost:{host}" for container, host in self._port_map.items()
+            container: f"http://127.0.0.1:{host}" for container, host in self._port_map.items()
         }
         self.vnc_url = None
         self.mode = SANDBOX_MODE_VM
@@ -125,6 +127,11 @@ class LocalSandbox(VmSandbox):
     def host_port(self, port: int) -> int:
         """The allocated host port for a published container port (identity if unmapped)."""
         return self._port_map.get(port, port)
+
+    @property
+    def host_ips(self) -> tuple[str, ...]:
+        """Loopback, so a local deploy is not reachable from the network (see ``_host_ips``)."""
+        return _host_ips()
 
     @classmethod
     def find_work_dir(cls, sandbox_id: str) -> Path | None:
@@ -406,3 +413,26 @@ class LocalSandboxProvider(SandboxProvider):
         inside a container: ``host.docker.internal``. Docker Desktop and Rancher Desktop (macOS/Windows)
         resolve this themselves; on Linux ``EXTRA_CONTAINER_RUN_ARGS`` maps it via ``--add-host …:host-gateway``."""
         return url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
+
+
+@functools.cache
+def _host_ips() -> tuple[str, ...]:
+    """Loopback, plus on Linux the bridge gateway ``host-gateway`` resolves to, where containers reach the host."""
+    # Docker Desktop publishes through a host-side proxy, which can't bind the bridge address inside its VM.
+    if platform.system() != "Linux" or _docker("info", "--format", "{{.OperatingSystem}}") == "Docker Desktop":
+        return ("127.0.0.1",)
+    # Listing, unlike inspecting, answers a missing network with nothing rather than an error.
+    if not _docker("network", "ls", "--quiet", "--filter", "name=^bridge$"):
+        return ("127.0.0.1",)
+    return ("127.0.0.1", _docker("network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"))
+
+
+def _docker(*args: str) -> str:
+    """A docker CLI query's output. A failure raises, so the cache above never keeps it."""
+    run = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=_DOCKER_QUERY_SECONDS)
+    if run.returncode:
+        raise RuntimeError(f"docker {' '.join(args)} failed: {run.stderr.strip()}")
+    return run.stdout.strip()
+
+
+_DOCKER_QUERY_SECONDS = 30
