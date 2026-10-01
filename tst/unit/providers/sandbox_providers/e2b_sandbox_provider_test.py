@@ -64,7 +64,7 @@ async def test_create_vm_uses_derived_template_and_preserves_attribution(
             "product": "product-a",
             "customer": "customer-b",
             "team": "team-c",
-            "project_id": "project-d",
+            "cost_center": "cost-center-d",
         },
     )
 
@@ -79,7 +79,6 @@ async def test_create_vm_uses_derived_template_and_preserves_attribution(
             "product": "product-a",
             "customer": "customer-b",
             "team": "team-c",
-            "project_id": "project-d",
             "agent_env_exposed_ports": "8080,9000",
         },
         network={"allow_public_traffic": True},

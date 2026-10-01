@@ -30,9 +30,9 @@ def _context(instance_id=None, **metadata):
 
 def test_pipeline_step_is_task_id_and_step_id():
     attribution = deploy_attribution(
-        _step("deploy_env", {"project_id": "p"}), _context(task_id="my-pipeline"),
+        _step("deploy_env", {"team": "t"}), _context(task_id="my-pipeline"),
     )
-    assert attribution == {"project_id": "p", PIPELINE_STEP_KEY: "my-pipeline_deploy_env"}
+    assert attribution == {"team": "t", PIPELINE_STEP_KEY: "my-pipeline_deploy_env"}
 
 
 def test_no_task_id_means_no_pipeline_step():
@@ -59,20 +59,20 @@ def test_a_task_authored_pipeline_step_wins():
 
 
 def test_deploy_attribution_does_not_mutate_the_step():
-    step = _step(attribution={"project_id": "p"})
+    step = _step(attribution={"team": "t"})
     deploy_attribution(step, _context(task_id="t"))
-    assert step.metadata["attribution"] == {"project_id": "p"}
+    assert step.metadata["attribution"] == {"team": "t"}
 
 
 # --- _build_sandbox_tags --------------------------------------------------------
 
 
 def test_sandbox_tags_empty_without_pipeline_step():
-    assert _build_sandbox_tags({"project_id": "p"}) == {}
+    assert _build_sandbox_tags({"team": "t"}) == {}
 
 
 def test_sandbox_tags_carry_both_keys():
-    assert _build_sandbox_tags({PIPELINE_STEP_KEY: "t_s", RUN_ID_KEY: "inst-1", "project_id": "p"}) == {
+    assert _build_sandbox_tags({PIPELINE_STEP_KEY: "t_s", RUN_ID_KEY: "inst-1", "team": "t"}) == {
         PIPELINE_STEP_KEY: "t_s", RUN_ID_KEY: "inst-1",
     }
 

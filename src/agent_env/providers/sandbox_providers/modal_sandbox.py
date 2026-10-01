@@ -203,9 +203,7 @@ class ModalSandboxProvider(SandboxProvider):
         # cannot attach a GPU. V1 has no ``i6pn``, so a GPU sandbox has no private-IPv6
         # east-west networking (fine for a single sandbox; not for an i6pn mesh).
         self._gpu = gpu
-        # One Modal App per attribution scope (keyed by project_id), looked up on demand.
-        # Billing aggregates per App and the dashboard is browsable by App name, so a
-        # scope-named, scope-tagged App is what makes cost both attributable and findable.
+        # Looked up on demand and cached by name.
         self._apps: dict[str, modal.App] = {}
 
     async def _get_client(self) -> modal.Client:
@@ -255,12 +253,9 @@ class ModalSandboxProvider(SandboxProvider):
         effective = self.effective_network_policy(network_policy)
         attribution = dict(attribution or {})
 
-        # Place the sandbox under a per-project App: Modal billing aggregates cost per App and
-        # the dashboard is browsable by App name, so a scope-named, scope-tagged App is what
-        # makes cost both attributable and findable. We attribute at the App level only —
-        # sandbox-level tags don't show up in billing.
+        # Modal billing breaks cost down by App tags; sandbox-level tags don't show up in billing.
         app_tags = _build_cost_attribution_tags(attribution)
-        app_name = _app_name_for_project(self._app_name, app_tags.get("project_id"))
+        app_name = self._app_name
         app = await self._get_app(app_name, app_tags)
         # Not in billing (see above); makes sandboxes filterable by the step that deployed them.
         sandbox_tags = _build_sandbox_tags(attribution)
@@ -406,28 +401,6 @@ class ModalSandboxProvider(SandboxProvider):
         return self._sandbox_cls(sb, tunnel_urls, i6pn_address=i6pn_address)
 
 
-def _app_name_for_project(base: str, project_id: Optional[str]) -> str:
-    """Map a project_id to a stable Modal App name for per-project cost attribution.
-
-    The app name is what shows up (and is searchable) in the Modal dashboard, so it encodes
-    the project. Names are sanitized to ``[a-zA-Z0-9._-]``, kept under Modal's 64-char limit,
-    and not double-prefixed when ``project_id`` already starts with ``base``. Falls back to
-    ``base`` when no project_id is available.
-    """
-    if not project_id:
-        return base
-    slug = re.sub(r"[^a-zA-Z0-9._-]", "-", project_id).strip("-") or base
-    name = slug if (slug == base or slug.startswith(f"{base}-")) else f"{base}-{slug}"
-    if len(name) > 64:
-        logger.warning(
-            f"Modal app name for project_id={project_id!r} exceeds 64 chars; truncating to "
-            f"{name[:64]!r}. Distinct project_ids that share this prefix will be cost-attributed "
-            f"together."
-        )
-        name = name[:64]
-    return name
-
-
 def _build_cost_attribution_tags(attribution: Attribution) -> dict[str, str]:
     """Build the Modal App tag set used for cost attribution.
 
@@ -439,7 +412,7 @@ def _build_cost_attribution_tags(attribution: Attribution) -> dict[str, str]:
     resolved = apply_default_attribution(attribution)
     return {
         name: resolved[name]
-        for name in ("product", "customer", "team", "project_id")
+        for name in ("product", "customer", "team")
         if resolved.get(name) is not None
     }
 
