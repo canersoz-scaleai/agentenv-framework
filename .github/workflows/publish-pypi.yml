@@ -101,7 +101,7 @@ jobs:
           grep -q "\"agentenv-framework-protocol==${protocol}\"" pyproject.toml
           uv build --no-sources --out-dir dist
       - name: Check the wheel carries the explorer UI
-        run: unzip -l dist/*.whl | grep -q 'agent_env/explorer/static/index.html' || { echo "::error::the wheel has no agent_env/explorer/static/index.html"; exit 1; }
+        run: python .github/scripts/check_explorer_ui.py dist/*.whl
       - name: Check its metadata renders
         run: uvx --index-url https://pypi.org/simple twine check --strict dist/*
       - name: Publish agentenv-framework

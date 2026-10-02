@@ -83,7 +83,7 @@ jobs:
           python -m pip install --quiet --index-url https://pypi.org/simple uv
           cp -R src/agent_env/explorer/ui/out src/agent_env/explorer/static
           uv build --no-sources --out-dir dist
-          unzip -l dist/*.whl | grep -q 'agent_env/explorer/static/index.html' || { echo "::error::the wheel has no agent_env/explorer/static/index.html"; exit 1; }
+          python .github/scripts/check_explorer_ui.py dist/*.whl
           if tar tzf dist/*.tar.gz | grep -q '/explorer/ui/'; then echo "::error::the sdist includes the UI's source tree"; exit 1; fi
 
   integration-local:
