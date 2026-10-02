@@ -84,7 +84,7 @@ jobs:
           cp -R src/agent_env/explorer/ui/out src/agent_env/explorer/static
           uv build --no-sources --out-dir dist
           unzip -l dist/*.whl | grep -q 'agent_env/explorer/static/index.html' || { echo "::error::the wheel has no agent_env/explorer/static/index.html"; exit 1; }
-          if tar tzf dist/*.tar.gz | grep -q '/explorer/ui/node_modules/'; then echo "::error::the sdist includes the UI's node_modules"; exit 1; fi
+          if tar tzf dist/*.tar.gz | grep -q '/explorer/ui/'; then echo "::error::the sdist includes the UI's source tree"; exit 1; fi
 
   integration-local:
     runs-on: ubuntu-latest

@@ -94,8 +94,9 @@ artifacts = ["src/agent_env/explorer/static"]
 
 [tool.hatch.build.targets.sdist]
 only-include = ["src", "tst", "packages/agentenv-protocol", ".github/scripts"]
-# Hatch reads only the root .gitignore, so a UI build's leftovers would otherwise land in the sdist.
-exclude = ["src/agent_env/explorer/ui/node_modules", "src/agent_env/explorer/ui/.next", "src/agent_env/explorer/ui/out"]
+# The UI ships as its built export, as in the wheel; its source stays in the repository. Hatch reads only the root
+# .gitignore, so including ui/ would pack a working tree's node_modules, build output and .env.local.
+exclude = ["src/agent_env/explorer/ui"]
 artifacts = ["src/agent_env/explorer/static"]
 
 [tool.uv.workspace]
