@@ -253,11 +253,9 @@ class ModalSandboxProvider(SandboxProvider):
         effective = self.effective_network_policy(network_policy)
         attribution = dict(attribution or {})
 
-        # Modal billing breaks cost down by App tags; sandbox-level tags don't show up in billing.
-        app_tags = _build_cost_attribution_tags(attribution)
+        app_tags = _build_app_tags()
         app_name = self._app_name
         app = await self._get_app(app_name, app_tags)
-        # Not in billing (see above); makes sandboxes filterable by the step that deployed them.
         sandbox_tags = _build_sandbox_tags(attribution)
 
         image_store = get_config().get_image_store_at(image_name)
@@ -401,33 +399,27 @@ class ModalSandboxProvider(SandboxProvider):
         return self._sandbox_cls(sb, tunnel_urls, i6pn_address=i6pn_address)
 
 
-def _build_cost_attribution_tags(attribution: Attribution) -> dict[str, str]:
-    """Build the Modal App tag set used for cost attribution.
+def _build_app_tags() -> dict[str, str]:
+    """Modal App tags: the deployment-wide config.toml ``[sandbox.attribution]`` defaults.
 
-    Unset dimensions fall back to config.toml ``[sandbox.attribution]``; a dimension with
-    no value anywhere is omitted rather than emitted as a null tag. Returns a flat
-    ``dict[str, str]`` for ``modal.App.set_tags``. (priority is a scheduling concern,
-    not attribution, so it is not included here.)
-    """
-    resolved = apply_default_attribution(attribution)
-    return {
-        name: resolved[name]
-        for name in ("product", "customer", "team")
-        if resolved.get(name) is not None
-    }
+    Modal's billing report breaks cost down by App tags, and one App serves every run with its
+    tags set on first lookup, so per-run attribution goes on sandbox tags instead."""
+    return _modal_tags(apply_default_attribution({}))
 
 
 def _build_sandbox_tags(attribution: Attribution) -> dict[str, str]:
-    """Build the Modal Sandbox tag set: ``pipeline_step`` and ``run_id``, each when set.
+    """Modal Sandbox tags: the run's attribution, unset keys filled from ``[sandbox.attribution]``,
+    including ``pipeline_step`` and ``run_id`` when the deploy step set them."""
+    return _modal_tags(apply_default_attribution(attribution))
 
-    Modal rejects the whole create on an invalid tag, so values are sanitized to
-    ``[a-zA-Z0-9._-]``; past Modal's 63-char limit a value keeps a prefix plus a hash of the
-    full value, so steps of a long-named task still get distinct tags.
-    """
+
+def _modal_tags(attribution: Attribution) -> dict[str, str]:
+    """Modal rejects a whole create on one invalid tag: keys and values are made Modal-valid and a
+    value that is unset or empty is left out, since Modal has no empty tag."""
     return {
-        key: _modal_tag_value(attribution[key])
-        for key in (PIPELINE_STEP_KEY, RUN_ID_KEY)
-        if attribution.get(key)
+        _modal_tag_value(key): _modal_tag_value(str(value))
+        for key, value in attribution.items()
+        if value is not None and str(value) != ""
     }
 
 
@@ -457,7 +449,8 @@ async def _log_sandbox_started(
             "modal_sandbox_id": sb.object_id,
             "modal_container_id": container_id,
             "modal_app_name": app_name,
-            **sandbox_tags,
+            "modal_sandbox_tags": sandbox_tags,
+            **{key: sandbox_tags[key] for key in (PIPELINE_STEP_KEY, RUN_ID_KEY) if key in sandbox_tags},
             "cpu": cpu,
             "memory_mb": memory,
             "gpu": gpu,
@@ -466,6 +459,8 @@ async def _log_sandbox_started(
 
 
 def _modal_tag_value(value: str) -> str:
+    """``value`` within Modal's ``[a-zA-Z0-9._-]{1,63}``: other characters become ``-``, and past
+    63 characters a prefix plus a hash of the full value keeps long values distinct."""
     slug = re.sub(r"[^a-zA-Z0-9._-]", "-", value)
     if len(slug) > _MODAL_TAG_MAX_LEN:
         digest = hashlib.sha256(value.encode()).hexdigest()[:8]

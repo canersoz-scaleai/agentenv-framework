@@ -19,11 +19,11 @@ def test_attribution_of_reads_the_reserved_metadata_key_only():
 
 
 def test_attribution_of_ignores_flat_attributes_on_the_step():
-    step = _step(cost_center="research", metadata={"attribution": {"team": "t"}})
-    assert attribution_of(step) == {"team": "t"}
+    step = _step(cost_center="research", metadata={"attribution": {"group": "g"}})
+    assert attribution_of(step) == {"group": "g"}
 
 
 def test_attribution_of_returns_a_copy():
-    metadata = {"attribution": {"team": "t"}}
-    attribution_of(_step(metadata=metadata))["team"] = "mutated"
-    assert metadata["attribution"] == {"team": "t"}
+    metadata = {"attribution": {"group": "g"}}
+    attribution_of(_step(metadata=metadata))["group"] = "mutated"
+    assert metadata["attribution"] == {"group": "g"}

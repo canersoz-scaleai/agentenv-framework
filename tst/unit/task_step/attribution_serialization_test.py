@@ -20,7 +20,7 @@ from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.deploy_env import DeployEnvTaskStep
 from agent_env.task_step.task_steps.deploy_sandbox import DeploySandboxTaskStep
 
-ATTRIBUTION = {"cost_center": "research", "team": "platform"}
+ATTRIBUTION = {"cost_center": "research", "group": "platform"}
 
 
 def _deploy_env(**kwargs):

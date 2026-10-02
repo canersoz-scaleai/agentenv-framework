@@ -30,6 +30,13 @@ class _AsyncSandboxSdk:
 
 
 @pytest.fixture(autouse=True)
+def _no_configured_defaults(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    monkeypatch.setenv("AGENT_ENV_CONFIG", str(cfg))
+
+
+@pytest.fixture(autouse=True)
 def reset_sdk_mock_calls():
     _AsyncSandboxSdk.create.reset_mock()
     _AsyncSandboxSdk.connect.reset_mock()
@@ -60,11 +67,7 @@ async def test_create_vm_uses_derived_template_and_preserves_attribution(
         disk_size_gb=99,
         timeout=123,
         exposed_ports=[8080, 9000],
-        attribution={
-            "product": "product-a",
-            "customer": "customer-b",
-            "team": "team-c",
-        },
+        attribution={"group": "g1", "batch": "b2"},
     )
 
     assert isinstance(sandbox, E2BSandbox)
@@ -74,15 +77,38 @@ async def test_create_vm_uses_derived_template_and_preserves_attribution(
         template="agent-env-v1-2c-4096m",
         timeout=123,
         api_key="e2b-secret",
-        metadata={
-            "product": "product-a",
-            "customer": "customer-b",
-            "team": "team-c",
-            "agent_env_exposed_ports": "8080,9000",
-        },
+        metadata={"group": "g1", "batch": "b2", "agent_env_exposed_ports": "8080,9000"},
         network={"allow_public_traffic": True},
     )
     sandbox_setup.assert_awaited_once_with([8080, 9000])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ports, recorded", [([8080], "8080"), ([], None)], ids=["ports", "no-ports"])
+async def test_an_attribution_key_never_stands_in_for_the_exposed_ports(sandbox_setup, ports, recorded):
+    provider = E2BSandboxProvider(
+        api_key="e2b-secret", base_template="agent-env-v1", template_resolver=_Resolver(),
+        sandbox_cls=_AsyncSandboxSdk,
+    )
+    await provider.create_vm(
+        exposed_ports=ports, attribution={"group": "g1", "agent_env_exposed_ports": "1,2,3"},
+    )
+    metadata = _AsyncSandboxSdk.create.call_args.kwargs["metadata"]
+    assert metadata.get("agent_env_exposed_ports") == recorded
+    assert metadata["group"] == "g1"
+
+
+@pytest.mark.asyncio
+async def test_configured_defaults_fill_unset_attribution_keys(sandbox_setup, tmp_path, monkeypatch):
+    cfg = tmp_path / "defaults.toml"
+    cfg.write_text('[sandbox.attribution]\ngroup = "g0"\nowner = "o0"\n')
+    monkeypatch.setenv("AGENT_ENV_CONFIG", str(cfg))
+    provider = E2BSandboxProvider(
+        api_key="e2b-secret", base_template="agent-env-v1", template_resolver=_Resolver(),
+        sandbox_cls=_AsyncSandboxSdk,
+    )
+    await provider.create_vm(attribution={"group": "explicit"})
+    assert _AsyncSandboxSdk.create.call_args.kwargs["metadata"] == {"group": "explicit", "owner": "o0"}
 
 
 @pytest.mark.asyncio
