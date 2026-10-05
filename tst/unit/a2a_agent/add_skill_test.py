@@ -53,7 +53,11 @@ def _card(
 
 
 def _deployed(
-    *, bundle: bool, legacy: bool | None = None, config_key: str = "params"
+    *,
+    bundle: bool,
+    legacy: bool | None = None,
+    config_key: str = "params",
+    sandbox_type: str = "local",
 ) -> DeployedA2AAgent:
     return DeployedA2AAgent(
         agent_id="agent",
@@ -61,6 +65,7 @@ def _deployed(
         a2a_url="https://agent.example.test",
         sandbox_id="sandbox",
         agent_card=_card(bundle=bundle, legacy=legacy, config_key=config_key),
+        sandbox_type=sandbox_type,
     )
 
 
@@ -193,6 +198,20 @@ async def test_an_object_skill_on_a_store_without_grants_is_refused_before_any_r
         )
 
     assert agent.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_object_skill_is_refused_when_the_stores_grants_do_not_reach_the_agent(
+    store: GrantingObjectStore, prefix: str, agent: _Agent
+) -> None:
+    with pytest.raises(RuntimeError, match="grants do not reach agents on the 'modal' sandbox provider"):
+        await A2AAgent.add_skill(
+            _deployed(bundle=True, sandbox_type="modal"),
+            Skill(name="review", description="Review work", s3_url=prefix),
+        )
+
+    assert agent.requests == []
+    assert store.granted == []
 
 
 @pytest.mark.asyncio

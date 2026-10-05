@@ -97,6 +97,7 @@ class VerifyA2ASkillConfigStep(TaskStep):
                     name=name,
                     description=description,
                     object_url=object_url,
+                    sandbox_type=deployed_agent.sandbox_type,
                 )
             except RuntimeError as exc:
                 logger.info("Skill bundle request: not sent (%s)", exc)

@@ -38,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 from agent_env.a2a_agent.protocol import raise_for_extension_status
 from agent_env.store.base import GrantUnavailableError
 from agent_env.store.object_store import DEFAULT_CONTENT_TYPE, ObjectStore
+from agent_env.store.object_store.local.grant_server import unreachable_hint
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ TransferMode = Literal["objects", "legacy"]
 _Response = TypeVar("_Response", bound=BaseModel)
 _MEDIA_TYPE = re.compile(r"[!#$&^_.+\-|~0-9a-z]+/[!#$&^_.+\-|~0-9a-z]+")
 _INCREMENT_NAME = re.compile(r"^(?P<sequence>[0-9]{6})(?:\.[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+_TRANSFER_UNAVAILABLE = "transfer_unavailable"  # the SDK's code for a store it could not reach
 
 # The time budget of one transfer, outermost first: a grant outlives agent-env's wait for the
 # agent's answer, which outlasts the SDK's retries of stalled connections
@@ -97,13 +99,20 @@ def choose_transfer(
     objects: Collection[str] | None = None,
     legacy: Collection[str] | None = None,
     store: ObjectStore,
+    sandbox_type: str | None,
 ) -> TransferMode | None:
     """How one extension call moves its objects, given the fields each form it can take sends.
 
-    Objects need a store that issues grants. A method without a declared request predates
-    variant negotiation and takes the legacy form. None: the agent takes neither form.
+    Objects need a store that issues grants reaching the agent's sandbox, of ``sandbox_type``
+    (None: unknown). A method without a declared request predates variant negotiation and takes
+    the legacy form. None: the agent takes neither form.
     """
-    if objects is not None and _accepts(method, objects) and store.supports_transfer_grants:
+    if (
+        objects is not None
+        and _accepts(method, objects)
+        and store.supports_transfer_grants
+        and store.grants_reach(sandbox_type)
+    ):
         return "objects"
     if legacy is not None and (
         method is None or "request" not in method or _accepts(method, legacy)
@@ -123,13 +132,19 @@ def _require_object_form(
     store: ObjectStore,
     *,
     operation: str,
+    sandbox_type: str | None,
 ) -> None:
-    """Refuse ``operation`` unless the agent takes its object form and the store issues the
-    grants that form carries: agent-env moves objects no other way."""
+    """Refuse ``operation`` unless the agent takes its object form and the store issues grants
+    that reach the agent's sandbox, of ``sandbox_type``: agent-env moves objects no other way."""
     if not _accepts(method, _fields(model)):
         raise RuntimeError(f"{operation}: the agent does not advertise the object form")
     if not store.supports_transfer_grants:
         raise RuntimeError(f"{operation}: the object store does not issue transfer grants")
+    if not store.grants_reach(sandbox_type):
+        raise RuntimeError(
+            f"{operation}: the object store's grants do not reach agents on the "
+            f"{sandbox_type or 'unknown'!r} sandbox provider"
+        )
 
 
 @dataclass(frozen=True)
@@ -155,7 +170,13 @@ async def invoke_transfer(
     async with httpx.AsyncClient() as client:
         send = client.post if verb == "POST" else client.put
         resp = await send(url, json=call.payload, timeout=timeout)
-    raise_for_extension_status(resp, operation=operation, include_body=call.mode == "legacy")
+    try:
+        raise_for_extension_status(resp, operation=operation, include_body=call.mode == "legacy")
+    except httpx.HTTPStatusError as exc:
+        hint = unreachable_hint(call.payload) if call.mode == "objects" else None
+        if hint is None or not str(exc).endswith(f": {_TRANSFER_UNAVAILABLE}"):
+            raise
+        raise httpx.HTTPStatusError(f"{exc}. {hint}", request=exc.request, response=exc.response) from exc
     body = resp.json()
     if call.mode == "objects" and response_model is not None:
         return parse_response(response_model, body, operation=operation)
@@ -283,18 +304,23 @@ def skill_add_call(
     description: str,
     skill_md: str | None = None,
     object_url: str | None = None,
+    sandbox_type: str | None,
 ) -> TransferCall:
     """The skill ``add`` call for a skill given as SKILL.md text, sent inline, or as the objects
     under ``object_url``, sent as a bundle of read grants."""
     base = {"name": name, "description": description}
     if object_url is not None:
-        _require_object_form(method, BundleSkillRequest, store, operation="skill add")
+        _require_object_form(
+            method, BundleSkillRequest, store, operation="skill add", sandbox_type=sandbox_type
+        )
         request = skill_bundle_request(
             store, name=name, description=description, object_url=object_url
         )
         return TransferCall("objects", request.model_dump(mode="json"))
     if skill_md is not None:
-        if choose_transfer(method, legacy=_fields(InlineSkillRequest), store=store) is None:
+        if choose_transfer(
+            method, legacy=_fields(InlineSkillRequest), store=store, sandbox_type=sandbox_type
+        ) is None:
             raise RuntimeError("Agent does not advertise the inline skill variant")
         return TransferCall("legacy", {**base, "skill_md": skill_md})
     return TransferCall("legacy", base)
@@ -307,6 +333,7 @@ def snapshot_save_call(
     agent_name: str,
     context_id: str,
     capture_prefix: str,
+    sandbox_type: str | None,
 ) -> TransferCall:
     """The snapshot ``save`` call that writes one capture below ``capture_prefix``."""
     _require_object_form(
@@ -314,6 +341,7 @@ def snapshot_save_call(
         ObjectSnapshotSaveRequest,
         store,
         operation=f"snapshot save on agent '{agent_name}'",
+        sandbox_type=sandbox_type,
     )
     objects = {
         name: write_object(store, url, media_type=_OPAQUE, max_bytes=max_bytes)
@@ -333,6 +361,7 @@ def snapshot_load_call(
     bundle_url: str,
     file_names: Collection[str],
     target_context_id: str | None,
+    sandbox_type: str | None,
 ) -> TransferCall:
     """The snapshot ``load`` call that restores the capture at ``bundle_url``. Only a portable
     capture can be restored; an older one holds the runtime's own files."""
@@ -341,7 +370,9 @@ def snapshot_load_call(
         raise RuntimeError(
             f"{operation}: {bundle_url} is not a portable snapshot, so it cannot be restored"
         )
-    _require_object_form(method, ObjectSnapshotLoadRequest, store, operation=operation)
+    _require_object_form(
+        method, ObjectSnapshotLoadRequest, store, operation=operation, sandbox_type=sandbox_type
+    )
     objects = {
         name: read_object(store, url, media_type=_OPAQUE, max_bytes=max_bytes)
         for name, url, max_bytes in _snapshot_objects(store, bundle_url)
@@ -368,11 +399,18 @@ def changelog_enable_call(
     agent_name: str,
     namespace_url: str,
     expires_in: int,
+    sandbox_type: str | None,
 ) -> TransferCall:
     """The ``enable-changelog`` call that captures below ``namespace_url``. Raises
     GrantUnavailableError when the store cannot sign a namespace grant that lasts ``expires_in``."""
     operation = f"changelog enable on agent '{agent_name}'"
-    _require_object_form(method, NamespaceChangelogEnableRequest, store, operation=operation)
+    _require_object_form(
+        method,
+        NamespaceChangelogEnableRequest,
+        store,
+        operation=operation,
+        sandbox_type=sandbox_type,
+    )
     try:
         grant = namespace_grant(
             store, namespace_url, limits=CHANGELOG_LIMITS, expires_in=expires_in
@@ -394,6 +432,7 @@ def changelog_apply_call(
     up_to_tool_call_exclusive: int | None = None,
     resume_conversation: bool = False,
     target_context_id: str | None = None,
+    sandbox_type: str | None,
 ) -> TransferCall:
     """The ``apply-changelog`` call that replays the capture at ``source_url``: read grants for
     its increments before the cutoff, in sequence order, and none when the cutoff precedes the
@@ -403,6 +442,7 @@ def changelog_apply_call(
         ObjectChangelogApplyRequest,
         store,
         operation=f"changelog apply on agent '{agent_name}'",
+        sandbox_type=sandbox_type,
     )
     cutoff = math.inf if up_to_tool_call_exclusive is None else up_to_tool_call_exclusive
     described = read_objects_under(
@@ -453,12 +493,17 @@ def trajectory_mode(
     store: ObjectStore,
     *,
     by: Literal["task_id", "context_id"],
+    sandbox_type: str | None,
 ) -> TransferMode | None:
     """How a trajectory ``get`` selecting by ``by`` moves the trajectory: uploaded by the agent
     through a grant, or returned inline."""
     objects_model, inline_model = _TRAJECTORY_FORMS[by]
     return choose_transfer(
-        method, objects=_fields(objects_model), legacy=_fields(inline_model), store=store
+        method,
+        objects=_fields(objects_model),
+        legacy=_fields(inline_model),
+        store=store,
+        sandbox_type=sandbox_type,
     )
 
 

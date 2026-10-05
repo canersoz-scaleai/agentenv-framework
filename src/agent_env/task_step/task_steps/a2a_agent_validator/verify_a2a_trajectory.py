@@ -89,7 +89,8 @@ class VerifyA2ATrajectoryStep(TaskStep):
         config = get_config()
         store = config.get_object_store()
         probe_prefix = f"{config.get_artifact_key_prefix()}a2a_validator_trajectories/{self.a2a_agent_id}/"
-        if trajectory_mode(get_method, store, by="task_id") == "objects":
+        sandbox_type = deployed_agent.sandbox_type
+        if trajectory_mode(get_method, store, by="task_id", sandbox_type=sandbox_type) == "objects":
             try:
                 prefix = store.object_url(probe_prefix)
                 upload = await asyncio.to_thread(

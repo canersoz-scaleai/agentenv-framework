@@ -62,6 +62,7 @@ async def capture_workspace(
     a2a_context_id: str,
     artifact_id: str,
     timeout_seconds: float,
+    sandbox_type: str | None,
 ) -> WorkspaceCapture:
     """Capture the agent's workspace below a fresh prefix and wrap it as a universe.
 
@@ -91,6 +92,7 @@ async def capture_workspace(
         agent_name=agent_name,
         context_id=a2a_context_id,
         capture_prefix=capture_prefix,
+        sandbox_type=sandbox_type,
     )
     await invoke_transfer(
         a2a_url + save_path,
@@ -144,6 +146,7 @@ async def read_partial_trajectory(
     context_id: str,
     timeout_seconds: float,
     trajectory_output_prefix: str,
+    sandbox_type: str | None,
 ) -> TrajectoryCapture:
     """Read the trajectory-so-far for an in-progress run.
 
@@ -172,7 +175,7 @@ async def read_partial_trajectory(
     if "request" not in get_method:
         return TrajectoryCapture(reason="trajectory_context_unsupported")
     store = get_config().get_object_store()
-    mode = trajectory_mode(get_method, store, by="context_id")
+    mode = trajectory_mode(get_method, store, by="context_id", sandbox_type=sandbox_type)
     if mode is None:
         return TrajectoryCapture(reason="trajectory_context_unsupported")
 

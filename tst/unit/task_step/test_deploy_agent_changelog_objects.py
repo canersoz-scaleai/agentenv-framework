@@ -116,7 +116,7 @@ async def test_enable_prefers_a_bounded_namespace_grant(monkeypatch, store):
     context = _run_context()
 
     await _step(enable_agent_changelog=True)._configure_agent_changelog(
-        "https://agent", _card(), context, expires_in=28_800
+        "https://agent", _card(), context, expires_in=28_800, sandbox_type="local"
     )
 
     sent = requests[0]
@@ -147,7 +147,7 @@ async def test_the_changelog_namespace_is_under_the_fixture_prefix(monkeypatch, 
     context = _run_context()
 
     await _step(enable_agent_changelog=True)._configure_agent_changelog(
-        "https://agent", _card(), context, expires_in=600
+        "https://agent", _card(), context, expires_in=600, sandbox_type="local"
     )
 
     assert requests[0]["json"]["write_namespace"]["root_path"] == f"fx/{NAMESPACE_KEY}"
@@ -174,6 +174,7 @@ async def test_enable_fails_when_the_store_cannot_grant_the_lifetime(
             _card(enable_legacy=enable_legacy),
             _run_context(),
             expires_in=28_800,
+         sandbox_type="local",
         )
 
     assert not requests
@@ -187,7 +188,7 @@ async def test_enable_on_a_store_without_grants_is_refused(monkeypatch, store, e
 
     with pytest.raises(RuntimeError, match="does not issue transfer grants"):
         await _step(enable_agent_changelog=True)._configure_agent_changelog(
-            "https://agent", _card(enable_legacy=enable_legacy), _run_context(), expires_in=7_200
+            "https://agent", _card(enable_legacy=enable_legacy), _run_context(), expires_in=7_200, sandbox_type="local"
         )
 
     assert not requests
@@ -200,7 +201,7 @@ async def test_enable_is_refused_for_an_agent_without_the_object_form(monkeypatc
 
     with pytest.raises(RuntimeError, match="does not advertise the object form"):
         await _step(enable_agent_changelog=True)._configure_agent_changelog(
-            "https://agent", _card(enable_objects=False), _run_context(), expires_in=7_200
+            "https://agent", _card(enable_objects=False), _run_context(), expires_in=7_200, sandbox_type="local"
         )
 
     assert not requests
@@ -223,7 +224,7 @@ async def test_apply_lists_validates_and_sends_ordered_read_grants(monkeypatch, 
     context = TaskStepContext()
 
     event_loop_thread = threading.get_ident()
-    await step._apply_agent_changelog("https://agent", _card(), context)
+    await step._apply_agent_changelog("https://agent", _card(), context, sandbox_type="local")
 
     sent = requests[0]["json"]
     assert [item["sequence"] for item in sent["increments"]] == [0, 1]
@@ -246,7 +247,7 @@ async def test_apply_uses_absolute_tool_call_positions_for_the_cutoff(monkeypatc
         agent_changelog_toolcall_position_exclusive=7,
     )
 
-    await step._apply_agent_changelog("https://agent", _card(), TaskStepContext())
+    await step._apply_agent_changelog("https://agent", _card(), TaskStepContext(), sandbox_type="local")
 
     assert [item["sequence"] for item in requests[0]["json"]["increments"]] == [2, 4]
     assert _granted_names(store) == ["000002.tar", "000004.tar"]
@@ -261,7 +262,7 @@ async def test_apply_allows_a_cutoff_beyond_the_last_tool_call(monkeypatch, stor
         agent_changelog_toolcall_position_exclusive=99,
     )
 
-    await step._apply_agent_changelog("https://agent", _card(), TaskStepContext())
+    await step._apply_agent_changelog("https://agent", _card(), TaskStepContext(), sandbox_type="local")
 
     assert [item["sequence"] for item in requests[0]["json"]["increments"]] == [2, 4]
 
@@ -273,7 +274,7 @@ async def test_apply_rejects_duplicate_tool_call_positions(monkeypatch, store):
 
     with pytest.raises(ValueError, match="strictly increasing"):
         await _step(agent_changelog_object_url=namespace)._apply_agent_changelog(
-            "https://agent", _card(), TaskStepContext()
+            "https://agent", _card(), TaskStepContext(), sandbox_type="local"
         )
     assert not requests
 
@@ -285,7 +286,7 @@ async def test_apply_rejects_unsequenced_objects_in_a_portable_namespace(monkeyp
 
     with pytest.raises(ValueError, match="zero-padded sequence names"):
         await _step(agent_changelog_object_url=namespace)._apply_agent_changelog(
-            "https://agent", _card(), TaskStepContext()
+            "https://agent", _card(), TaskStepContext(), sandbox_type="local"
         )
     assert not requests
     assert store.granted == []
@@ -308,7 +309,7 @@ async def test_apply_sends_the_empty_baseline_when_no_increment_is_selected(
         agent_changelog_toolcall_position_exclusive=cutoff,
     )
 
-    await step._apply_agent_changelog("https://agent", _card(), context)
+    await step._apply_agent_changelog("https://agent", _card(), context, sandbox_type="local")
 
     assert requests[0]["json"]["increments"] == []
     assert store.granted == []
@@ -320,7 +321,7 @@ _APPLY_OBJECTS = {"request": {"required": ["increments"]}}
 
 def _apply_call(store, source_url):
     return changelog_apply_call(
-        _APPLY_OBJECTS, store, agent_name="solver", source_url=source_url
+        _APPLY_OBJECTS, store, agent_name="solver", source_url=source_url, sandbox_type="local"
     )
 
 
@@ -367,7 +368,7 @@ async def test_a_source_is_not_sent_to_an_agent_without_the_object_apply_form(mo
 
     with pytest.raises(RuntimeError, match="does not advertise the object form"):
         await _step(agent_changelog_object_url=namespace)._apply_agent_changelog(
-            "https://agent", _card(apply_objects=False), TaskStepContext()
+            "https://agent", _card(apply_objects=False), TaskStepContext(), sandbox_type="local"
         )
 
     assert not requests

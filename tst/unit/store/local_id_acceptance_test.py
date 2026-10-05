@@ -21,6 +21,11 @@ from agent_env.env.envs.mcp_server import MCPServerEnv
 from agent_env.env.envs.multi_env import MultiEnv
 from agent_env.env.envs.website import WebsiteEnv
 from agent_env.env.snapshot_store import EnvSnapshot
+from agent_env.providers.sandbox_providers.sandbox_provider import (
+    SandboxProvider,
+    reset_agent_sandbox_provider,
+    set_agent_sandbox_provider,
+)
 from agent_env.store import Filter, LocalSqliteDocumentStore, VersionedEntityStore
 from agent_env.store.base import NotFoundError
 from agent_env.store.ids import fs_safe, key_segment
@@ -164,14 +169,26 @@ def test_validating_an_local_entity_writes_its_task_under_it_to_the_local_store(
     assert not _documents().path.exists() or _documents().count("tasks", Filter()) == 0
 
 
-def test_validating_an_local_agent_stops_at_the_local_store_it_cannot_sign_with_before_writing_a_task(
-    local_stores, cli_routing, tmp_path,
+class _RemoteProvider(SandboxProvider):
+    async def create_sandbox(self, **kwargs):
+        raise NotImplementedError
+
+
+@pytest.fixture
+def remote_agents():
+    set_agent_sandbox_provider(_RemoteProvider())
+    yield
+    reset_agent_sandbox_provider()
+
+
+def test_validating_an_local_agent_stops_at_a_local_store_its_sandbox_cannot_reach_before_writing_a_task(
+    local_stores, cli_routing, remote_agents, tmp_path,
 ):
     configured = SigningObjectStore(str(tmp_path / "configured-objects"))
     set_object_store(configured)
     agent = A2AAgent(id="@local/~/bundle/agents/a", version=1, docker_image_artifact=MagicMock())
 
-    with pytest.raises(RuntimeError, match="A2A validation requires a signable object store"):
+    with pytest.raises(RuntimeError, match="signs URLs or issues grants"):
         asyncio.run(A2AAgentValidator.validate(agent))
 
     fixtures = f"a2a_validator/probe_fixtures/{key_segment(agent.id)}-v1"
