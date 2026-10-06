@@ -662,12 +662,9 @@ async def _stage_environment_payload_into_container(
                 )
             else:
                 await sandbox.exec_script(
-                    f"sudo docker exec -u 0 {shlex.quote(container_name)} mkdir -p {shlex.quote(destination)}"
+                    f"docker exec -u 0 {shlex.quote(container_name)} mkdir -p {shlex.quote(destination)}"
                 )
-                await sandbox.exec_script(
-                    f"sudo docker cp {shlex.quote(vm_stage)}/. "
-                    f"{shlex.quote(container_name)}:{shlex.quote(destination)}"
-                )
+                await sandbox.docker_cp(f"{vm_stage}/.", f"{container_name}:{destination}")
         finally:
             try:
                 await sandbox.exec_script(f"rm -rf {shlex.quote(vm_payload)} {shlex.quote(vm_stage)}")
@@ -747,7 +744,7 @@ async def _load_universe_into_container(sandbox, container_name: str, universe, 
         return []
 
     await sandbox.exec_script(
-        f"sudo docker exec {shlex.quote(container_name)} mkdir -p {shlex.quote(destination)}"
+        f"docker exec {shlex.quote(container_name)} mkdir -p {shlex.quote(destination)}"
     )
     loaded: list[str] = []
     total = len(file_artifacts)
@@ -764,12 +761,8 @@ async def _load_universe_into_container(sandbox, container_name: str, universe, 
         await sandbox.load_s3_file(fa.object_url, vm_temp)
         if parent and parent != destination:
             await sandbox.exec_script(
-                f"sudo docker exec {shlex.quote(container_name)} mkdir -p {shlex.quote(parent)}"
+                f"docker exec {shlex.quote(container_name)} mkdir -p {shlex.quote(parent)}"
             )
-        await sandbox.exec_script(
-            f"sudo docker cp {shlex.quote(vm_temp)} "
-            f"{shlex.quote(container_name)}:{shlex.quote(dest_path)} && "
-            f"rm -f {shlex.quote(vm_temp)}"
-        )
+        await sandbox.docker_cp(vm_temp, f"{container_name}:{dest_path}", remove_source=True)
         loaded.append(filename)
     return loaded

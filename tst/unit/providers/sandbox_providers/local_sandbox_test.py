@@ -686,6 +686,17 @@ async def test_exec_leaves_a_docker_exec_script_naming_the_containers_app_alone(
     assert spawned == [("bash", "-c", script)]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source, destination, ran", [
+    ("/app/_artifact_staging/x", "c:/app/x", ("/tmp/agent-env-work/_artifact_staging/x", "c:/app/x")),
+    ("c:/app/out.txt", "/app/out.txt", ("c:/app/out.txt", "/tmp/agent-env-work/out.txt")),
+])
+async def test_docker_cp_points_only_the_host_side_at_the_work_dir(spawned, source, destination, ran):
+    await LocalSandbox(work_dir=Path("/tmp/agent-env-work")).docker_cp(source, destination)
+
+    assert spawned == [("bash", "-c", 'docker cp "$1" "$2"', "docker-cp", *ran)]
+
+
 @pytest.mark.parametrize("script", ["ls ~/app/x", "cat ${HOME}/app/x", "cat $(pwd)/app/x", "cat $APP/app/x"])
 def test_rewrite_app_script_keeps_app_after_an_expansion(script):
     assert LocalSandbox(work_dir=Path("/tmp/agent-env-work"))._rewrite_app_script(script) == script
