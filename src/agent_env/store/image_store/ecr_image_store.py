@@ -7,10 +7,8 @@ import binascii
 import logging
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
-
 from agent_env.config.errors import ConfigError
+from agent_env.config.loader import install_hint
 from agent_env.store.image_store.image_store import OciRegistryImageStore
 from agent_env.store.image_store.oci_registry_credentials import (
     OciRegistryCredentials,
@@ -65,6 +63,10 @@ class EcrCredentials(OciRegistryCredentials):
                     "EcrCredentials has no region: configure it on the store's "
                     "credentials (e.g. [stores.image.config] region)."
                 )
+            try:
+                import boto3  # the aws extra: imported here so EcrCredentials(client=...) needs none
+            except ModuleNotFoundError as e:
+                raise ConfigError(f"EcrCredentials cannot build an ECR client: {e}{install_hint(e)}") from e
             if self._access_key is None:
                 self._client = boto3.client("ecr", region_name=self._region)
             else:
@@ -123,7 +125,7 @@ class EcrImageStore(OciRegistryImageStore):
             logger.info(f"Created ECR repository {name}")
         except self._ecr.exceptions.RepositoryAlreadyExistsException:
             pass
-        except ClientError as e:
+        except self._ecr.exceptions.ClientError as e:
             if e.response["Error"]["Code"] != "AccessDeniedException":
                 raise
             logger.info(

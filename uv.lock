@@ -48,7 +48,6 @@ source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk" },
     { name = "agentenv-framework-protocol" },
-    { name = "boto3" },
     { name = "certifi" },
     { name = "click" },
     { name = "cryptography" },
@@ -67,7 +66,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+aws = [
+    { name = "boto3" },
+    { name = "botocore" },
+]
 dev = [
+    { name = "boto3" },
+    { name = "botocore" },
     { name = "fastapi" },
     { name = "google-api-core" },
     { name = "google-auth" },
@@ -100,9 +105,10 @@ gcp = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", specifier = "==0.3.26" },
-    { name = "agentenv-framework", extras = ["explorer", "gcp"], marker = "extra == 'dev'" },
+    { name = "agentenv-framework", extras = ["aws", "explorer", "gcp"], marker = "extra == 'dev'" },
     { name = "agentenv-framework-protocol", editable = "packages/agentenv-protocol" },
-    { name = "boto3", specifier = ">=1.35.0" },
+    { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.35.0" },
+    { name = "botocore", marker = "extra == 'aws'", specifier = ">=1.35.0" },
     { name = "certifi", specifier = ">=2024.2.2" },
     { name = "click", specifier = ">=8.0.0" },
     { name = "cryptography", specifier = ">=42" },
@@ -135,7 +141,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.47" },
     { name = "uvicorn", marker = "extra == 'explorer'", specifier = ">=0.29" },
 ]
-provides-extras = ["explorer", "gcp", "dev"]
+provides-extras = ["aws", "explorer", "gcp", "dev"]
 
 [[package]]
 name = "agentenv-framework-protocol"

@@ -159,7 +159,7 @@ def load_impl(impl: str | type, abc: type) -> type:
     try:
         cls = getattr(importlib.import_module(module_path), attr)
     except ImportError as e:
-        raise ConfigError(f"Cannot import impl {impl!r}: {e}{_install_hint(_missing_module(e))}") from e
+        raise ConfigError(f"Cannot import impl {impl!r}: {e}{install_hint(e)}") from e
     except AttributeError as e:
         raise ConfigError(f"Cannot import impl {impl!r}: {e}") from e
     if not (isinstance(cls, type) and issubclass(cls, abc)):
@@ -176,17 +176,24 @@ def _missing_module(error: ImportError) -> str | None:
     return f"{error.name}.{name_from}" if error.name and name_from else error.name
 
 
-def _install_hint(module: str | None) -> str:
-    """Name the smallest extra of this distribution with a requirement named for the missing
-    ``module``: by name, because the missing distribution's files are not installed to read.
+def install_hint(error: ImportError) -> str:
+    """How to install the module ``error`` failed to find, when an extra of this distribution has it."""
+    extra = missing_extra(error)
+    return f"; it needs the {extra!r} extra, as in pip install '{DISTRIBUTION}[{extra}]'" if extra else ""
+
+
+def missing_extra(error: ImportError) -> str | None:
+    """The smallest extra of this distribution with a requirement named for the module ``error``
+    failed to find: by name, because the missing distribution's files are not installed to read.
     Separators are dropped before comparing, as ``google-cloud-secret-manager`` installs
     ``google.cloud.secretmanager``."""
+    module = _missing_module(error)
     if not module:
-        return ""
+        return None
     try:
         package = metadata(DISTRIBUTION)
     except PackageNotFoundError:
-        return ""
+        return None
     wanted = _NAME_SEPARATORS.sub("", module).lower()
     sizes: dict[str, int] = {}
     matches: set[str] = set()
@@ -199,10 +206,7 @@ def _install_hint(module: str | None) -> str:
                 sizes[extra] = sizes.get(extra, 0) + 1
                 if _NAME_SEPARATORS.sub("", requirement.name).lower() == wanted:
                     matches.add(extra)
-    if not matches:
-        return ""
-    extra = min(matches, key=lambda e: (sizes[e], e))
-    return f"; it needs the {extra!r} extra, as in pip install '{DISTRIBUTION}[{extra}]'"
+    return min(matches, key=lambda e: (sizes[e], e)) if matches else None
 
 
 def build_store(section: dict, abc: type, *, secret_resolver: Optional[SecretResolver] = None):

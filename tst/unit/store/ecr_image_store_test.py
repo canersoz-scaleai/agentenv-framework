@@ -34,9 +34,7 @@ def test_ecr_from_config_requires_explicit_aws_credentials():
 
 
 def test_ecr_from_config_builds_the_keyed_client():
-    with patch(
-        "agent_env.store.image_store.ecr_image_store.boto3.client"
-    ) as boto_client:
+    with patch("boto3.client") as boto_client:
         credentials = EcrCredentials.from_config(
             region="us-west-2",
             access_key="access",
@@ -54,9 +52,7 @@ def test_ecr_from_config_builds_the_keyed_client():
 
 
 def test_region_only_credentials_use_the_default_aws_chain():
-    with patch(
-        "agent_env.store.image_store.ecr_image_store.boto3.client"
-    ) as boto_client:
+    with patch("boto3.client") as boto_client:
         credentials = EcrCredentials(region="us-west-2")
 
         assert credentials.client is boto_client.return_value
