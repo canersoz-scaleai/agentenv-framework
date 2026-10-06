@@ -22,6 +22,7 @@ from agent_env.a2a_agent.object_transfer import (
     invoke_transfer,
     snapshot_load_call,
 )
+from agent_env.a2a_agent.staging import StagedObjectStore, transfer_store
 from agent_env.config import get_config
 from agent_env.env.env import DeployedEnv, DeployedSandboxEnv, Env
 from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url, sandbox_request_headers_for_url
@@ -230,6 +231,17 @@ class DeployAgentTaskStep(TaskStep):
         )
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
+        # An agent is recorded in the context only once it is configured, so one that fails on the way there
+        # (a snapshot or changelog that can't be loaded, say) is closed here, or no teardown would find it.
+        deployed: list = []
+        try:
+            return await self._execute(context, deployed)
+        except BaseException:
+            for agent in deployed:
+                await agent.close()
+            raise
+
+    async def _execute(self, context: TaskStepContext, deployed_agents: list) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent
         from agent_env.a2a_agent.a2a_agent import DEFAULT_A2A_PORT
         from agent_env.providers.sandbox_providers.sandbox_provider import (
@@ -314,6 +326,7 @@ class DeployAgentTaskStep(TaskStep):
         if linked_sandbox is not None:
             deploy_kwargs["sandbox"] = linked_sandbox
         deployed = await agent.deploy(**deploy_kwargs)
+        deployed_agents.append(agent)
         a2a_url = deployed.a2a_url
         card = deployed.agent_card
         logger.info(f"A2A agent '{a2a_agent_id}' deployed at {a2a_url}")
@@ -467,7 +480,7 @@ class DeployAgentTaskStep(TaskStep):
         instance_id = (context.instance_id or "noinstance").replace("/", "_")
         agent_name = self.agent_name.replace("/", "_")
         config = get_config()
-        store = config.get_object_store()
+        store = transfer_store(config.get_object_store(), a2a_url, card, sandbox_type=sandbox_type)
         namespace_url = store.object_url(f"{config.get_artifact_key_prefix()}agent_changelog/{instance_id}/{agent_name}")
         call = await asyncio.to_thread(
             changelog_enable_call,
@@ -485,13 +498,19 @@ class DeployAgentTaskStep(TaskStep):
             operation="changelog enable",
             timeout=REPLY_TIMEOUT_SECONDS,
             response_model=NamespaceChangelogEnableResponse,
+            store=store,
         )
-        context.metadata.setdefault("agent_changelog", []).append({
+        entry = {
             "agent_name": self.agent_name,
             "roots": answer.roots,
             "transfer_mode": call.mode,
             "object_url": namespace_url,
-        })
+        }
+        if isinstance(store, StagedObjectStore):
+            # The increments wait on the agent until they are drained into the store.
+            entry["staging_url"] = store.namespaces[-1].staging_url
+            entry["staging_max_object_bytes"] = store.namespaces[-1].max_object_bytes
+        context.metadata.setdefault("agent_changelog", []).append(entry)
         logger.info(f"agent-changelog capture enabled on '{self.agent_name}': {namespace_url}")
 
     async def _apply_agent_changelog(
@@ -507,7 +526,7 @@ class DeployAgentTaskStep(TaskStep):
                 f"Agent '{self.agent_name}' does not support the snapshot "
                 f"'{A2AAgent.SNAPSHOT_METHOD_APPLY_CHANGELOG}' method; cannot apply agent changelog"
             )
-        store = get_config().get_object_store()
+        store = transfer_store(get_config().get_object_store(), a2a_url, card, sandbox_type=sandbox_type)
         source_url = self.agent_changelog_object_url
         call = await asyncio.to_thread(
             changelog_apply_call,
@@ -527,6 +546,7 @@ class DeployAgentTaskStep(TaskStep):
             operation="changelog apply",
             timeout=TRANSFER_TIMEOUT_SECONDS,
             response_model=ObjectChangelogApplyResponse,
+            store=store,
         )
         check_changelog_applied(answer, call, agent_name=self.agent_name)
         context_id = answer.context_id
@@ -571,10 +591,11 @@ class DeployAgentTaskStep(TaskStep):
                 "snapshot universes must be created via put_existing or put_bundled"
             )
         load_method, load_path = A2AAgent.operation(snapshot_ext, "load")
+        store = transfer_store(get_config().get_object_store(), a2a_url, card, sandbox_type=sandbox_type)
         call = await asyncio.to_thread(
             snapshot_load_call,
             load_method,
-            get_config().get_object_store(),
+            store,
             agent_name=self.agent_name,
             bundle_url=universe.bundle_object_url,
             file_names=set((universe.file_artifact_refs or universe.file_artifact_ids or {}).keys()),
@@ -588,6 +609,7 @@ class DeployAgentTaskStep(TaskStep):
             operation="snapshot load",
             timeout=TRANSFER_TIMEOUT_SECONDS,
             response_model=ObjectSnapshotLoadResponse,
+            store=store,
         )
         loaded_context_id = answer.context_id
         logger.info(

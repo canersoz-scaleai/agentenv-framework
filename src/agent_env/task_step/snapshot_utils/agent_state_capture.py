@@ -27,6 +27,7 @@ from agent_env.a2a_agent.object_transfer import (
     snapshot_save_call,
     trajectory_mode,
 )
+from agent_env.a2a_agent.staging import transfer_store
 from agent_env.config import get_config
 from agent_env.store.ids import key_segment
 
@@ -82,7 +83,7 @@ async def capture_workspace(
     capture_key_prefix = (
         f"{config.get_artifact_key_prefix()}agent_snapshots/{key_segment(artifact_id)}/{snapshot_version}-{uuid.uuid4().hex[:8]}/"
     )
-    store = config.get_object_store()
+    store = transfer_store(config.get_object_store(), a2a_url, a2a_card, sandbox_type=sandbox_type)
     capture_prefix = store.object_url(capture_key_prefix)
 
     call = await asyncio.to_thread(
@@ -101,6 +102,7 @@ async def capture_workspace(
         operation="snapshot save",
         timeout=timeout_seconds,
         response_model=ObjectSnapshotSaveResponse,
+        store=store,
     )
 
     # The agent's answer is only a claim: a snapshot missing either object cannot be restored.
@@ -174,7 +176,7 @@ async def read_partial_trajectory(
     # none may be task_id-only, and would 400 on every tick.
     if "request" not in get_method:
         return TrajectoryCapture(reason="trajectory_context_unsupported")
-    store = get_config().get_object_store()
+    store = transfer_store(get_config().get_object_store(), a2a_url, a2a_card, sandbox_type=sandbox_type)
     mode = trajectory_mode(get_method, store, by="context_id", sandbox_type=sandbox_type)
     if mode is None:
         return TrajectoryCapture(reason="trajectory_context_unsupported")
@@ -189,7 +191,7 @@ async def read_partial_trajectory(
             return TrajectoryCapture(reason="trajectory_grant_unavailable")
     try:
         fetched = await fetch_trajectory(
-            a2a_url + get_path, {"context_id": context_id}, upload=upload, timeout=timeout_seconds
+            a2a_url + get_path, {"context_id": context_id}, upload=upload, timeout=timeout_seconds, store=store
         )
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:

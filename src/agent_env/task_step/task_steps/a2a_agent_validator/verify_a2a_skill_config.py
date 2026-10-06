@@ -16,6 +16,7 @@ from agent_env.a2a_agent.object_transfer import (
     parse_response,
     skill_add_call,
 )
+from agent_env.a2a_agent.staging import transfer_store
 from agent_env.config import get_config
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -82,13 +83,16 @@ class VerifyA2ASkillConfigStep(TaskStep):
         results = rubric_result.get("results", [])
         inline_passed = any(r.get("id") == "secret_code_inline" and r.get("score") == 1.0 for r in results)
         add_method, add_path = A2AAgent.operation(skill_ext, "add")
-        store = get_config().get_object_store()
         a2a_url = deployed_agent.a2a_url or deployed_agent.api_url
 
         async def probe_bundle(name: str, description: str, object_url: str | None) -> bool:
             """Whether the agent registers an object-backed skill sent as a bundle."""
             if object_url is None:
                 return False
+            store = transfer_store(
+                get_config().get_object_store(), a2a_url, deployed_agent.a2a_card,
+                sandbox_type=deployed_agent.sandbox_type,
+            )
             try:
                 call = await asyncio.to_thread(
                     skill_add_call,
@@ -112,6 +116,7 @@ class VerifyA2ASkillConfigStep(TaskStep):
                     verb="POST",
                     operation="skill add (bundle)",
                     timeout=TRANSFER_TIMEOUT_SECONDS,
+                    store=store,
                 )
                 result = parse_response(SkillAddResponse, answer, operation="skill add (bundle)")
                 if result.name != name:
