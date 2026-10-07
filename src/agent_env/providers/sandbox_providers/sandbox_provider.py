@@ -123,7 +123,7 @@ class SandboxProvider(ABC):
             await self._start_container(sandbox, image_name=image_name, port=port, env=env)
             sandbox.mode = SANDBOX_MODE_CONTAINER
             return sandbox
-        except Exception:
+        except BaseException:
             try:
                 await sandbox.terminate()
             except Exception:
@@ -222,6 +222,7 @@ _BUILTIN_SANDBOX_PROVIDERS: dict[str, str] = {
     "modal": "agent_env.providers.sandbox_providers.modal_sandbox:ModalSandboxProvider",
     "modal_vm": "agent_env.providers.sandbox_providers.modal_vm_sandbox:ModalVmSandboxProvider",
     "e2b": "agent_env.providers.sandbox_providers.e2b:E2BSandboxProvider",
+    "sail_vm": "agent_env.providers.sandbox_providers.sail_vm.provider:SailVmSandboxProvider",
     "local": "agent_env.providers.sandbox_providers.local_sandbox:LocalSandboxProvider",
 }
 
