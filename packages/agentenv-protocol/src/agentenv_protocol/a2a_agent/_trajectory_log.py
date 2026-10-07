@@ -11,9 +11,7 @@ from .tasks.v1 import TrajectoryLog
 
 logger = logging.getLogger(__name__)
 
-MAX_CACHED_TRAJECTORY_BYTES = 256 * 1024 * 1024
 MAX_CACHED_CONTEXTS = 1_024
-MAX_TRAJECTORY_READ_EVENTS = 1_000
 MAX_TRAJECTORY_READ_BYTES = 4 * 1024 * 1024
 
 
@@ -32,10 +30,6 @@ class _TaskRecord:
             return self.final_state
         return TrajectoryState.RUNNING if len(self.log) else TrajectoryState.PENDING
 
-    @property
-    def size_bytes(self) -> int:
-        return self.log._size_bytes + len(self.native or b"")
-
 
 @dataclass(frozen=True, slots=True)
 class TrajectoryPage:
@@ -50,17 +44,13 @@ class TrajectoryPage:
 class TaskTrajectories:
     """Each task's log and final record, grouped by context in execution order.
 
-    A whole context is the unit of eviction, least recently used first, so positions in a
-    context read never shift; a context with a task pending or running is never evicted."""
+    Past ``max_contexts``, whole contexts are evicted, least recently used first, so
+    positions in a context read never shift. A context with a task pending or running is
+    never evicted, nor is the one whose task just ended, so its final record is readable."""
 
-    def __init__(
-        self,
-        max_bytes: int = MAX_CACHED_TRAJECTORY_BYTES,
-        max_contexts: int = MAX_CACHED_CONTEXTS,
-    ) -> None:
-        if max_bytes < 1 or max_contexts < 1:
-            raise ValueError("trajectory cache bounds must be positive")
-        self._max_bytes = max_bytes
+    def __init__(self, max_contexts: int = MAX_CACHED_CONTEXTS) -> None:
+        if max_contexts < 1:
+            raise ValueError("max_contexts must be positive")
         self._max_contexts = max_contexts
         self._tasks: dict[str, _TaskRecord] = {}
         self._contexts: OrderedDict[str, list[str]] = OrderedDict()
@@ -113,7 +103,8 @@ class TaskTrajectories:
             record.native = native
         record.log._sealed = True
         record.final_state = TrajectoryState.CANCELED if record.cancel_requested else state
-        self._evict()
+        self._touch(record.context_id)
+        self._evict(keep=record.context_id)
 
     def final(self, task_id: str) -> bytes | None:
         """The ended task's final trajectory as a JSON array, or None if there is none yet."""
@@ -211,17 +202,18 @@ class TaskTrajectories:
         if context_id in self._contexts:
             self._contexts.move_to_end(context_id)
 
-    def _evict(self) -> None:
-        total = sum(record.size_bytes for record in self._tasks.values())
+    def _evict(self, *, keep: str) -> None:
         for context_id in tuple(self._contexts):
-            if total <= self._max_bytes and len(self._contexts) <= self._max_contexts:
+            if len(self._contexts) <= self._max_contexts:
                 return
             task_ids = self._contexts[context_id]
-            if any(self._tasks[task_id].final_state is None for task_id in task_ids):
+            if context_id == keep or any(
+                self._tasks[task_id].final_state is None for task_id in task_ids
+            ):
                 continue
             del self._contexts[context_id]
             for task_id in task_ids:
-                total -= self._tasks.pop(task_id).size_bytes
+                del self._tasks[task_id]
 
 
 def _page(

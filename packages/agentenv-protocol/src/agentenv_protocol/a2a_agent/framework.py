@@ -28,14 +28,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from ._trajectory_log import (
-    MAX_TRAJECTORY_READ_BYTES,
-    MAX_TRAJECTORY_READ_EVENTS,
-    TaskTrajectories,
-)
+from ._trajectory_log import MAX_TRAJECTORY_READ_BYTES, TaskTrajectories
 from ._triggers import TriggerEngine, TriggerError
 from .extensions import (
     AGENT_CONFIG_V1,
+    MAX_TRAJECTORY_READ_EVENTS,
     MCP_CONFIG_V1,
     SKILL_CONFIG_V1,
     TRAJECTORY_V1,
@@ -770,9 +767,7 @@ class _SdkServices:
     def _trajectory_events(
         self, request: TaskEventsTrajectoryRequest | ContextEventsTrajectoryRequest
     ) -> TrajectoryEventsResponse:
-        max_events = min(
-            request.limit or MAX_TRAJECTORY_READ_EVENTS, MAX_TRAJECTORY_READ_EVENTS
-        )
+        max_events = request.limit or MAX_TRAJECTORY_READ_EVENTS
         if isinstance(request, TaskEventsTrajectoryRequest):
             page = self.task_trajectories.task_page(
                 request.task_id, request.after, max_events, MAX_TRAJECTORY_READ_BYTES

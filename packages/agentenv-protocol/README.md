@@ -347,8 +347,9 @@ Both answer `{context_id, task_id, state, format, events, next, has_more}`
 - `events` are the events from position `after`, zero-based. `next` is
   `after` plus the number returned, the position to read from next; `has_more`
   says more events are already readable past this page. A page holds at most
-  1,000 events and about 4 MiB, but always at least one event when one exists;
-  `limit` lowers the event count. `after` past the last event is HTTP 400.
+  `limit` events (1 to 1,000, default 1,000) and about 4 MiB, but always at
+  least one event when one exists. A `limit` outside 1 to 1,000, or `after` past
+  the last event, is HTTP 400.
 - `state` is `pending` before the first event, `running` while the task runs,
   then `completed`, `failed` or `canceled`. A terminal state is reported only
   once the log can no longer change, so a reader that has reached `has_more:
@@ -369,10 +370,10 @@ overrides the whole `get` operation must accept the cursor requests too.
 Clients detect live support from the card, with
 `card_request_accepts(get_request, {"task_id", "after"})`.
 
-The logs are kept in memory, up to 256 MiB and 1,024 contexts. Past that, whole
-contexts are dropped, least recently used first; a context with a task still
-pending or running is never dropped. A running task's log is logged as a warning
-once it passes 100 MiB.
+The logs are kept in memory for up to 1,024 contexts. Past that, whole contexts
+are dropped, least recently used first; a context with a task still pending or
+running is never dropped, nor is the one whose task has just ended. A running
+task's log is logged as a warning once it passes 100 MiB.
 
 `enable(..., description="...")` is reserved for declarations carrying
 configuration or metadata. It preserves the agent-specific extension prose

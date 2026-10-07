@@ -144,16 +144,19 @@ class TrajectoryState(str, Enum):
     CANCELED = "canceled"
 
 
+MAX_TRAJECTORY_READ_EVENTS = 1_000
+
+
 class TaskEventsTrajectoryRequest(ExtensionRequest):
     task_id: str
     after: StrictInt = Field(ge=0)
-    limit: StrictInt | None = Field(default=None, ge=1)
+    limit: StrictInt | None = Field(default=None, ge=1, le=MAX_TRAJECTORY_READ_EVENTS)
 
 
 class ContextEventsTrajectoryRequest(ExtensionRequest):
     context_id: str
     after: StrictInt = Field(ge=0)
-    limit: StrictInt | None = Field(default=None, ge=1)
+    limit: StrictInt | None = Field(default=None, ge=1, le=MAX_TRAJECTORY_READ_EVENTS)
 
 
 class TrajectoryEventsResponse(ExtensionResponse):

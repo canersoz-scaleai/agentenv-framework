@@ -227,6 +227,8 @@ def test_unknown_ids_are_not_found(payload: dict[str, Any]) -> None:
         {"task_id": "task", "after": "3"},
         {"task_id": "task", "after": -1},
         {"task_id": "task", "after": 0, "limit": 0},
+        {"task_id": "task", "after": 0, "limit": 1_001},
+        {"context_id": "context", "after": 0, "limit": 1_001},
     ],
 )
 def test_cursor_fields_are_strict(payload: dict[str, Any]) -> None:
@@ -473,20 +475,32 @@ def test_a_task_that_starts_later_moves_without_shifting_positions() -> None:
     assert page.task_id == "running"
 
 
-def test_the_byte_cap_evicts_completed_contexts_but_never_running_ones() -> None:
-    trajectories = TaskTrajectories(max_bytes=50)
+def test_eviction_drops_completed_contexts_but_never_running_ones() -> None:
+    trajectories = TaskTrajectories(max_contexts=2)
     running = trajectories.register("running", "context-running")
     trajectories.start("running")
-    running.append({"padding": "x" * 60})
-    for number in (1, 2):
+    running.append({"step": 1})
+    for number in (1, 2, 3):
         trajectories.register(f"done-{number}", f"context-{number}")
-        trajectories.seal(
-            f"done-{number}", TrajectoryState.COMPLETED, native=b"[" + b"1" * 30 + b"]"
-        )
+        trajectories.seal(f"done-{number}", TrajectoryState.COMPLETED, native=b"[1]")
 
     assert trajectories.task_page("running", 0, 10, 1_000) is not None
     assert trajectories.final("done-1") is None
     assert trajectories.final("done-2") is None
+    assert trajectories.final("done-3") == b"[1]"
+
+
+def test_the_context_whose_task_just_ended_is_kept_for_its_final_read() -> None:
+    trajectories = TaskTrajectories(max_contexts=1)
+    log = trajectories.register("ending", "context-ending")
+    trajectories.start("ending")
+    log.append({"step": 1})
+    for number in (1, 2):
+        trajectories.register(f"queued-{number}", f"context-queued-{number}")
+
+    trajectories.seal("ending", TrajectoryState.COMPLETED)
+
+    assert trajectories.final("ending") == b'[{"step":1}]'
 
 
 def test_a_large_running_trajectory_warns_once(
