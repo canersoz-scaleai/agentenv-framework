@@ -473,8 +473,9 @@ def test_local_never_shares_network_and_externalizes_localhost():
 
 def test_host_gateway_flag_only_where_nothing_provides_the_alias():
     """Only Linux lacks a native host.docker.internal; on Rancher an explicit mapping would break it."""
-    expected = "--add-host host.docker.internal:host-gateway" if platform.system() == "Linux" else ""
-    assert LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS == expected
+    linux = platform.system() == "Linux"
+    assert LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS == ("--add-host host.docker.internal:host-gateway" if linux else "")
+    assert LocalSandbox.extra_hosts == (("host.docker.internal:host-gateway",) if linux else ())
 
 
 @pytest.mark.asyncio
@@ -934,6 +935,22 @@ async def test_an_agent_placed_on_a_local_vm_sandbox_gets_the_local_ca(tmp_path,
         assert (LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS in script) if LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS else True
     else:
         assert copies == [] and "sleep 2" in script
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_an_agent_placed_on_a_local_vm_sandbox_maps_the_host_alias(tmp_path, monkeypatch, trusted):
+    """Whether or not the store hands out local grants, the agent reaches this machine by name on Linux."""
+    monkeypatch.setattr(a2a_agent_module, "local_grant_trust", (lambda: local_ca().trust_dir) if trusted else (lambda: None))
+    monkeypatch.setattr(a2a_agent_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_RecordingLocalSandbox, "extra_hosts", ("host.docker.internal:host-gateway",))
+    sandbox = _RecordingLocalSandbox(work_dir=tmp_path)
+    agent = A2AAgent.__new__(A2AAgent)
+    agent._sandbox = sandbox
+
+    await agent._run_container("img:v1", 8000, {"K": "v"})
+
+    assert "--add-host host.docker.internal:host-gateway" in sandbox.scripts[0]
 
 
 async def _no_sleep(_seconds):

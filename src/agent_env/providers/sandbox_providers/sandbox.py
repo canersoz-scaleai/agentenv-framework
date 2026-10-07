@@ -146,6 +146,8 @@ class Sandbox(ABC):
     network_policy: NetworkPolicy | None = None
     # Host IPs published ports bind to; empty binds every interface.
     host_ips: tuple[str, ...] = ()
+    # ``name:address`` entries the containers started on this sandbox add to their hosts file.
+    extra_hosts: tuple[str, ...] = ()
 
     _VM_READY_TIMEOUT = 1200      # wait_for_vm wall-clock budget (s)
     _VM_READY_POLL_INTERVAL = 30  # sparse polling (s)

@@ -59,7 +59,12 @@ default stores are local.
   sandboxes for envs and agents. MongoDB, S3, Cloud Storage, ECR, AWS Secrets Manager, Google Cloud
   Secret Manager, Modal and E2B exist as implementations and are selected by config.
 - The model endpoint is unset until `[model] base_url` / `api_key` (or `LITELLM_BASE_URL` /
-  `LITELLM_API_KEY`) is configured.
+  `LITELLM_API_KEY`) is configured. A loopback URL handed into a `local` container (the model
+  endpoint, an agent, peer or gateway on this machine) becomes `host.docker.internal`. On Linux that
+  name is the Docker bridge address (`docker0`, usually `172.17.0.1`), not loopback, so a service on
+  this machine that local containers call, a model proxy say, has to listen there: bind it to the
+  bridge address and use that address in its URL. Binding `0.0.0.0` also works, but exposes the
+  service to the network.
 - `[agents] default_a2a_agent_id`: the agent a `deploy_agent` step without an id deploys; built-in
   `a2a-default`, overridable by `configure(default_a2a_agent_id=...)`.
 - Secrets never live in the file: use `secret:KEY` or `env:NAME` references, resolved through

@@ -216,8 +216,9 @@ async def test_a_store_context_that_is_not_a_zip_is_refused(fake_store):
 class _RunSandbox:
     sandbox_id = "local-1"
 
-    def __init__(self):
+    def __init__(self, extra_hosts: tuple[str, ...] = ()):
         self.scripts: list[str] = []
+        self.extra_hosts = extra_hosts
 
     async def exec_script(self, script):
         self.scripts.append(script)
@@ -240,3 +241,21 @@ async def test_what_it_starts_is_labeled_with_its_sandbox(monkeypatch):
     for command in ("docker build", "docker run -d", "docker network create"):
         (script,) = [s for s in sandbox.scripts if command in s]
         assert "--label agentenv.sandbox=local-1" in script, command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_hosts", [(), ("host.docker.internal:host-gateway",)])
+async def test_what_it_starts_maps_the_sandboxs_extra_hosts(monkeypatch, extra_hosts):
+    """On Linux a local sandbox maps host.docker.internal, so the container reaches URLs on this machine."""
+    sandbox = _RunSandbox(extra_hosts)
+    monkeypatch.setattr(sandbox_provider, "build_sandbox_provider",
+                        lambda _type: SimpleNamespace(get_sandbox=AsyncMock(return_value=sandbox)))
+    monkeypatch.setattr(Step, "_stage_from_universe", AsyncMock())
+    context = TaskStepContext(deployed_sandboxes=[
+        DeployedSandbox(sandbox_name="h", sandbox_id="local-1", sandbox_mode="vm", sandbox_type="local"),
+    ])
+
+    await _step().execute(context)
+
+    (run,) = [s for s in sandbox.scripts if "docker run -d" in s]
+    assert ("--add-host host.docker.internal:host-gateway" in run) is bool(extra_hosts)

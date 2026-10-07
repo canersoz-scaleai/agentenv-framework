@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import uvicorn
+import yaml
 from mcp.server.fastmcp import FastMCP
 from pytest_socket import enable_socket
 
@@ -25,6 +26,7 @@ from agent_env.env.envs.multi_env import MultiEnv
 from agent_env.env.envs.service_db import SERVICE_DB_PORT
 from agent_env.env.envs.website import WebsiteEnv
 from agent_env.providers.env_providers import env_gateway_provider, env_provider
+from agent_env.providers.env_providers.constants import GATEWAY_SERVICE_NAME
 from agent_env.providers.env_providers.env_gateway_provider import (
     DeployedGateway,
     MCPServerConfig,
@@ -713,6 +715,24 @@ def test_compose_local_still_renders_servicedb():
     )
     assert "  servicedb:" in compose
     assert "condition: service_healthy" in compose
+
+
+@pytest.mark.parametrize("extra_hosts", [(), ("host.docker.internal:host-gateway",)])
+def test_compose_maps_extra_hosts_into_the_gateway(extra_hosts):
+    """The gateway calls out to agents, as a trigger's executor, so it carries the sandbox's host mappings."""
+    from agent_env.env.envs.service_db import ServiceDBConfig
+
+    compose = EnvironmentGatewayProvider().create_docker_compose(
+        mcp_servers=[MCPServerConfig(image="mcp-slack", environment_name="slack")],
+        gateway_image="agent-gateway",
+        state_provider=LocalPostgresStateProvider(service_db_config=ServiceDBConfig()),
+        state_instance=LocalPostgresStateProvider.default_instance(),
+        extra_hosts=extra_hosts,
+    )
+
+    services = yaml.safe_load(compose)["services"]
+    mapped = {name: service["extra_hosts"] for name, service in services.items() if "extra_hosts" in service}
+    assert mapped == ({GATEWAY_SERVICE_NAME: list(extra_hosts)} if extra_hosts else {})
 
 
 # --- sidecar rendering --------------------------------------------------------

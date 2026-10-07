@@ -33,6 +33,7 @@ import time
 import uuid
 from typing import Any, ClassVar, Optional
 
+from agent_env.providers.sandbox_providers.local_sandbox import host_url_for
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     all_sandbox_container_env,
     registered_sandbox_provider_classes,
@@ -66,6 +67,7 @@ _RESERVED_ENV_KEYS = frozenset({
     "LITELLM_BASE_URL", "ANTHROPIC_BASE_URL",
     "PATH", "HOME",
 })
+_MODEL_URL_KEYS = frozenset({"LITELLM_BASE_URL", "ANTHROPIC_BASE_URL"})
 
 
 class RunContainerUnitTestsVerifierTaskStep(TaskStep):
@@ -253,6 +255,8 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         command, extra_env = self._resolve_command(context)
         merged_env.update(self.env_vars)
         merged_env.update(extra_env)
+        for key in _MODEL_URL_KEYS & merged_env.keys():
+            merged_env[key] = host_url_for(merged_env[key], sandbox.type)
         env_flags = " ".join(f"-e {k}={shlex.quote(v)}" for k, v in merged_env.items())
 
         # 3. Run setup_commands (fail loud)
