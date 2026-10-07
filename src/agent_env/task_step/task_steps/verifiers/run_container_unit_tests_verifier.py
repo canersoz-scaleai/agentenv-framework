@@ -67,6 +67,7 @@ _RESERVED_ENV_KEYS = frozenset({
     "LITELLM_BASE_URL", "ANTHROPIC_BASE_URL",
     "PATH", "HOME",
 })
+_MODEL_URL_KEYS = frozenset({"LITELLM_BASE_URL", "ANTHROPIC_BASE_URL"})
 
 
 class RunContainerUnitTestsVerifierTaskStep(TaskStep):
@@ -245,7 +246,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         except (KeyError, ConfigError):
             logger.warning("LITELLM_API_KEY unavailable; verifier won't have LLM creds")
         try:
-            litellm_url = host_url_for(config.get_litellm_base_url(), sandbox.type)
+            litellm_url = config.get_litellm_base_url()
             merged_env["LITELLM_BASE_URL"] = litellm_url
             merged_env["ANTHROPIC_BASE_URL"] = litellm_url
         except (KeyError, ConfigError):
@@ -254,6 +255,8 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         command, extra_env = self._resolve_command(context)
         merged_env.update(self.env_vars)
         merged_env.update(extra_env)
+        for key in _MODEL_URL_KEYS & merged_env.keys():
+            merged_env[key] = host_url_for(merged_env[key], sandbox.type)
         env_flags = " ".join(f"-e {k}={shlex.quote(v)}" for k, v in merged_env.items())
 
         # 3. Run setup_commands (fail loud)

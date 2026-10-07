@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_env.env.env import DeployedEnv
-from agent_env.providers.sandbox_providers.local_sandbox import host_url_for
+from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, host_url_for
 from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url
 from agent_env.utils.deprecation import warn_deprecated
 
@@ -83,10 +83,13 @@ class DeployedAgent:
             on_host=bool(data.get("on_host", False)),
         )
 
-    def url_for(self, sandbox_type: str | None) -> str:
-        """This agent's A2A URL as a container on ``sandbox_type`` reaches it. An agent outside our sandboxes, a
-        human say, is at a URL this machine reaches."""
+    def url_for(self, sandbox_type: str | None, *, on_host: bool = False) -> str:
+        """This agent's A2A URL as an agent on ``sandbox_type`` reaches it, in a container there or, ``on_host``, on
+        the sandbox's host. A local sandbox's host is this machine, which reaches the URL as it is. An agent outside
+        our sandboxes, a human say, is at a URL this machine reaches."""
         url = self.a2a_url or self.api_url
+        if on_host and sandbox_type == LocalSandbox.type:
+            return url
         if not self.sandbox_id:
             return host_url_for(url, sandbox_type)
         return reachable_url(url, from_sandbox_type=self.sandbox_type, to_sandbox_type=sandbox_type)

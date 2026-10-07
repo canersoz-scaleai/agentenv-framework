@@ -117,10 +117,8 @@ class _VerifierSandbox:
         return 0, "ok", ""
 
 
-@pytest.mark.parametrize("sandbox_type, expected", [("local", MODEL_IN_CONTAINER), ("modal_vm", MODEL)])
-def test_a_unit_test_verifier_gets_the_model_endpoint_its_container_reaches(
-    monkeypatch, local_stores, model_endpoint, sandbox_type, expected,
-):
+def _run_verifier(monkeypatch, sandbox_type: str, **step_fields) -> str:
+    """The verifier's test command, as it ran on a sandbox of ``sandbox_type``."""
     sandbox = _VerifierSandbox(sandbox_type)
     provider = types.SimpleNamespace(get_sandbox=lambda sandbox_id: asyncio.sleep(0, result=sandbox))
     monkeypatch.setattr(sandbox_provider, "build_sandbox_provider", lambda name: provider)
@@ -133,10 +131,25 @@ def test_a_unit_test_verifier_gets_the_model_endpoint_its_container_reaches(
         DeployedSandbox(sandbox_name="h", sandbox_id="sb-1", sandbox_mode="vm", sandbox_type=sandbox_type))
 
     asyncio.run(RunContainerUnitTestsVerifierTaskStep(
-        id="tests", version=None, sandbox_name="h", container_name="c", command="true").execute(context))
+        id="tests", version=None, sandbox_name="h", container_name="c", command="true", **step_fields).execute(context))
 
     [run] = [c for c in sandbox.commands if "timeout --kill-after" in c]
+    return run
+
+
+@pytest.mark.parametrize("sandbox_type, expected", [("local", MODEL_IN_CONTAINER), ("modal_vm", MODEL)])
+def test_a_unit_test_verifier_gets_the_model_endpoint_its_container_reaches(
+    monkeypatch, local_stores, model_endpoint, sandbox_type, expected,
+):
+    run = _run_verifier(monkeypatch, sandbox_type)
+
     assert f"-e LITELLM_BASE_URL={expected} " in run and f"-e ANTHROPIC_BASE_URL={expected} " in run
+
+
+def test_a_model_endpoint_the_verifier_sets_itself_is_reached_through_the_host(monkeypatch, local_stores, model_endpoint):
+    run = _run_verifier(monkeypatch, "local", env_vars={"LITELLM_BASE_URL": "http://127.0.0.1:5001"})
+
+    assert "-e LITELLM_BASE_URL=http://host.docker.internal:5001 " in run
 
 
 @pytest.mark.parametrize("sandbox_type, expected", [
@@ -197,6 +210,18 @@ async def test_a_local_agent_reaches_its_peers_on_this_machine_through_the_host(
         "human": "http://host.docker.internal:18000/api/v1/a2a/human/instance/i-1",
         "remote": "https://peer.modal.run",
     }
+
+
+@pytest.mark.asyncio
+async def test_an_agent_installed_on_a_local_sandboxs_host_gets_peer_urls_as_they_are(monkeypatch):
+    sent = _record_posts(monkeypatch)
+    context = _peering_context("local")
+    context.deployed_agents[0].on_host = True
+
+    await PeerAgentsTaskStep(id="peers", version=None, peerings=[
+        {"source_agent_name": "source", "peer_agent_names": ["local", "human"]}]).execute(context)
+
+    assert [peer["url"] for peer in json.loads(sent[0].content)["peers"]] == ["http://127.0.0.1:41001", _HUMAN]
 
 
 @pytest.mark.asyncio
