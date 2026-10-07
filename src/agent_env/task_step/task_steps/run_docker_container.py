@@ -218,10 +218,11 @@ class RunDockerContainerTaskStep(TaskStep):
         device_flags = " ".join(f"--device {shlex.quote(d)}" for d in self.devices)
         cap_flags = " ".join(f"--cap-add {shlex.quote(c)}" for c in self.cap_add)
         volume_flags = " ".join(f"-v {shlex.quote(v)}" for v in self.volumes)
+        host_flags = " ".join(f"--add-host {shlex.quote(entry)}" for entry in sandbox.extra_hosts)
         extra_flags = " ".join(f for f in (
             "--privileged" if self.privileged else "",
             f"--shm-size {shlex.quote(self.shm_size)}" if self.shm_size else "",
-            device_flags, cap_flags, volume_flags,
+            device_flags, cap_flags, volume_flags, host_flags,
         ) if f)
         entrypoint_flag = ""
         if self.command_override:

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_env.env.env import DeployedEnv
+from agent_env.providers.sandbox_providers.local_sandbox import host_url_for
+from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url
 
 _REDACTED_KEYS = {
     "litellm_api_key", "judge_litellm_api_key", "usersim_api_key", "remote_tokens", "cf_access_client_secret",
@@ -79,6 +81,14 @@ class DeployedAgent:
             network_policy=data.get("network_policy"),
             on_host=bool(data.get("on_host", False)),
         )
+
+    def url_for(self, sandbox_type: str | None) -> str:
+        """This agent's A2A URL as a container on ``sandbox_type`` reaches it. An agent outside our sandboxes, a
+        human say, is at a URL this machine reaches."""
+        url = self.a2a_url or self.api_url
+        if not self.sandbox_id:
+            return host_url_for(url, sandbox_type)
+        return reachable_url(url, from_sandbox_type=self.sandbox_type, to_sandbox_type=sandbox_type)
 
 
 @dataclass

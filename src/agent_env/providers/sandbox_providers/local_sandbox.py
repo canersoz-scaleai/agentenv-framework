@@ -20,8 +20,10 @@ import signal
 import socket
 import subprocess
 import tempfile
+from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from agent_env import config
@@ -41,6 +43,11 @@ if TYPE_CHECKING:
     from agent_env.store.object_store import ObjectStore
 
 logger = logging.getLogger(__name__)
+
+# The name a container on this machine reaches it by. Only Linux lacks it natively; on Rancher Desktop an explicit
+# mapping would point it at the VM.
+_HOST_ALIAS = "host.docker.internal"
+_EXTRA_HOSTS = (f"{_HOST_ALIAS}:host-gateway",) if platform.system() == "Linux" else ()
 
 _APP_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./~})$-])/app(?=(?:/|:|[\s'\";)&|]|$))")
 _IN_CONTAINER_SCRIPT = re.compile(r"\s*(?:sudo\s+)?docker\s+exec\b")
@@ -116,6 +123,7 @@ class LocalSandbox(VmSandbox):
     """
 
     type = "local"
+    extra_hosts = _EXTRA_HOSTS
 
     def __init__(self, exposed_ports: list[int] | None = None, work_dir: Path | None = None, sandbox_id: str | None = None,
                  port_map: dict[int, int] | None = None):
@@ -368,8 +376,7 @@ def remove_local_work_dir(sandbox_id: str) -> Path | None:
 class LocalSandboxProvider(SandboxProvider):
     """SandboxProvider that runs VM-style gateway deployments on local Docker."""
 
-    # Only Linux lacks a native host.docker.internal; on Rancher Desktop this mapping would point it at the VM.
-    EXTRA_CONTAINER_RUN_ARGS = "--add-host host.docker.internal:host-gateway" if platform.system() == "Linux" else ""
+    EXTRA_CONTAINER_RUN_ARGS = " ".join(f"--add-host {entry}" for entry in _EXTRA_HOSTS)
 
     async def create_vm(
         self,
@@ -492,10 +499,34 @@ class LocalSandboxProvider(SandboxProvider):
 
     @classmethod
     def get_external_url(cls, url: str) -> str:
-        """Rewrite a ``localhost`` URL (a published host port) to the form a workload reaches from
-        inside a container: ``host.docker.internal``. Docker Desktop and Rancher Desktop (macOS/Windows)
-        resolve this themselves; on Linux ``EXTRA_CONTAINER_RUN_ARGS`` maps it via ``--add-host …:host-gateway``."""
-        return url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
+        """``url`` as a container on this machine reaches it: a loopback host (a published host port, or a
+        service on this machine) becomes ``host.docker.internal``, and anything else is left alone. Docker
+        Desktop and Rancher Desktop resolve that name themselves; on Linux ``extra_hosts`` maps it to the
+        bridge gateway, so a service there must listen on more than loopback."""
+        parts = urlsplit(url)
+        if not _is_loopback(parts.hostname):
+            return url
+        userinfo, at, _ = parts.netloc.rpartition("@")
+        port = f":{parts.port}" if parts.port is not None else ""
+        return urlunsplit(parts._replace(netloc=f"{userinfo}{at}{_HOST_ALIAS}{port}"))
+
+
+def host_url_for(url: str, sandbox_type: Optional[str]) -> str:
+    """``url``, which this machine reaches, as a container on ``sandbox_type`` reaches it: only a local
+    sandbox's containers run on this machine, and they reach its loopback by another name."""
+    return LocalSandboxProvider.get_external_url(url) if sandbox_type == LocalSandbox.type else url
+
+
+def _is_loopback(host: Optional[str]) -> bool:
+    """Whether ``host`` names this machine from itself: ``localhost``, a loopback address, or the unspecified
+    address a server listening everywhere prints."""
+    if host == "localhost":
+        return True
+    try:
+        address = ip_address(host or "")
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 @functools.cache

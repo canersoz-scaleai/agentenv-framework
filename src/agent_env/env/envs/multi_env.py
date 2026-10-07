@@ -610,6 +610,7 @@ class MultiEnv(Env):
             state_provider=gw._state_provider,  # local-only, set above
             state_instance=gw._state_instance,
             host_ips=self._sandbox.host_ips,
+            extra_hosts=self._sandbox.extra_hosts,
             mcp_server_name=self._mcp_server_name or self.name,
         )
         compose_content = compose_content.replace(

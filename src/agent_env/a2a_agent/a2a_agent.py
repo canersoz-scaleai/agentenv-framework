@@ -413,18 +413,22 @@ class A2AAgent:
             disk_size_gb = float(self.metadata.get("min_disk_size_gb") or 10)
 
         config = get_config()
+        provider = None if sandbox is not None else (
+            build_sandbox_provider(sandbox_type) if sandbox_type else get_agent_sandbox_provider()
+        )
         resolved_env = dict(env_vars) if env_vars else {}
         if "LITELLM_API_KEY" not in resolved_env and "LITELLM_API_KEY" not in self.default_env_vars:
             resolved_env["LITELLM_API_KEY"] = config.get_litellm_api_key()
         if "LITELLM_BASE_URL" not in resolved_env and "LITELLM_BASE_URL" not in self.default_env_vars:
             resolved_env["LITELLM_BASE_URL"] = config.get_litellm_base_url()
+        if "LITELLM_BASE_URL" in resolved_env and isinstance(provider or sandbox, (LocalSandboxProvider, LocalSandbox)):
+            resolved_env["LITELLM_BASE_URL"] = LocalSandboxProvider.get_external_url(resolved_env["LITELLM_BASE_URL"])
 
         merged_env = await asyncio.to_thread(self._build_merged_env, resolved_env, a2a_port)
         image_name = self.docker_image_artifact.image_name
 
         try:
-            if sandbox is None:
-                provider = build_sandbox_provider(sandbox_type) if sandbox_type else get_agent_sandbox_provider()
+            if provider is not None:
                 logger.info(f"Provisioning sandbox for A2A agent '{self.id}' via {type(provider).__name__}...")
                 self._sandbox = await provider.create_sandbox(
                     image_name=image_name, port=a2a_port, env=merged_env,
@@ -504,9 +508,7 @@ class A2AAgent:
         trust_dir = await asyncio.to_thread(local_grant_trust) if isinstance(self._sandbox, LocalSandbox) else None
         agent_env = dict(merged_env) if trust_dir is None else {**LOCAL_TRUST_ENV, **merged_env}
         setup_script = ""
-        network_flag = "" if trust_dir is None or not LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS else (
-            f"{LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS} \\\n    "
-        )
+        network_flag = "".join(f"--add-host {entry} \\\n    " for entry in self._sandbox.extra_hosts)
         if enable_docker:
             logger.info("enable_docker: starting rootless Docker-in-Docker sidecar for the agent (no host socket)")
             setup_script = self._dind_setup_script()

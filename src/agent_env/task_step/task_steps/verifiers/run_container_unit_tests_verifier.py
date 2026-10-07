@@ -33,6 +33,7 @@ import time
 import uuid
 from typing import Any, ClassVar, Optional
 
+from agent_env.providers.sandbox_providers.local_sandbox import host_url_for
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     all_sandbox_container_env,
     registered_sandbox_provider_classes,
@@ -244,7 +245,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         except (KeyError, ConfigError):
             logger.warning("LITELLM_API_KEY unavailable; verifier won't have LLM creds")
         try:
-            litellm_url = config.get_litellm_base_url()
+            litellm_url = host_url_for(config.get_litellm_base_url(), sandbox.type)
             merged_env["LITELLM_BASE_URL"] = litellm_url
             merged_env["ANTHROPIC_BASE_URL"] = litellm_url
         except (KeyError, ConfigError):
