@@ -6,7 +6,9 @@ config field so the agent-config negotiation and its redaction on read-back can 
 
 It also moves files both ways. After the echo it adds a ``read <name> over <scheme>: <text>`` line for
 each file part it is sent, fetching only inline bytes and HTTP(S) URLs (``could not read ...`` otherwise),
-and it answers each ``send-file <uri>`` line of its prompt with a file part naming that URI.
+and it answers each ``send-file <uri>`` line of its prompt with a file part naming that URI. A
+``fail-with <text>`` line makes it print the text to its log and fail the task, as an agent that logs
+what it was doing when it failed does.
 """
 
 import base64
@@ -31,6 +33,7 @@ from agentenv_protocol.a2a_agent import (
 )
 
 SEND_FILE = "send-file "
+FAIL_WITH = "fail-with "
 READ_TIMEOUT_SECONDS = 120
 
 
@@ -70,6 +73,9 @@ class EchoAgent(AgentEnvAgent):
     async def run(self, request: TaskRequest[EchoAgentConfig]) -> TaskResult:
         prompt = "\n".join(part.text for part in request.parts if isinstance(part, TextPart))
         reply = f"Echo: {prompt}"
+        if failing := [line.removeprefix(FAIL_WITH) for line in prompt.splitlines() if line.startswith(FAIL_WITH)]:
+            print(*failing, sep="\n", flush=True)
+            return TaskResult.failure("asked_to_fail", "the prompt asked the agent to fail")
         reply = "\n".join([reply, *[await _read(part) for part in request.parts if isinstance(part, FilePart)]])
         sends = [line.removeprefix(SEND_FILE).strip() for line in prompt.splitlines() if line.startswith(SEND_FILE)]
         files = [FilePart(uri=uri, name=uri.rsplit("/", 1)[-1], mime_type="text/plain") for uri in sends]
