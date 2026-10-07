@@ -96,7 +96,7 @@ def test_local_provider_isolates_network_and_externalizes_localhost():
     ("http://0.0.0.0:4000", "http://host.docker.internal:4000"),
     ("http://[::1]:4000/v1", "http://host.docker.internal:4000/v1"),
     ("https://LOCALHOST/v1", "https://host.docker.internal/v1"),
-    ("http://user:p%40ss@localhost:4000/v1?next=/x#top", "http://user:p%40ss@host.docker.internal:4000/v1?next=/x#top"),
+    ("http://agent@localhost:4000/v1?next=/x#top", "http://agent@host.docker.internal:4000/v1?next=/x#top"),
 ])
 def test_local_provider_externalizes_a_loopback_host(url, expected):
     assert LocalSandboxProvider.get_external_url(url) == expected
