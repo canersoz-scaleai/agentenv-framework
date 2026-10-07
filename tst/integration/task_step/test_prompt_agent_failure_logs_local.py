@@ -15,6 +15,7 @@ import pytest
 from agent_env.artifact.store import reset_artifact_store
 from agent_env.config import configure, reset_config, set_image_store
 from agent_env.store.image_store import LocalRegistryImageStore
+from agent_env.store.object_store.local.grant_server import grant_server
 from agent_env.task import Task
 from agent_env.task_step.task_steps.deploy_agent import DeployAgentTaskStep
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
@@ -39,6 +40,7 @@ def _free_port() -> int:
 def local_registry(monkeypatch, tmp_path):
     sandboxes = tmp_path / "sandboxes"
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("AGENT_ENV_DOCUMENT_STORE", "local")
     monkeypatch.setenv("AGENT_ENV_OBJECT_STORE", "local")
     monkeypatch.setenv("AGENT_ENV_IMAGE_STORE", "local")
@@ -48,14 +50,17 @@ def local_registry(monkeypatch, tmp_path):
     started = _docker("run", "-d", "--rm", "--name", name, "-p", f"127.0.0.1:{port}:5000", "registry:2")
     assert started.returncode == 0, started.stderr
     host = f"localhost:{port}"
-    deadline = time.time() + REGISTRY_READY_SECONDS
-    while time.time() < deadline:
+    deadline, ready = time.time() + REGISTRY_READY_SECONDS, False
+    while not ready and time.time() < deadline:
         try:
-            if httpx.get(f"http://{host}/v2/", timeout=2).status_code in (200, 401):
-                break
+            ready = httpx.get(f"http://{host}/v2/", timeout=2).status_code in (200, 401)
         except httpx.HTTPError:
             pass
-        time.sleep(0.5)
+        if not ready:
+            time.sleep(0.5)
+    if not ready:
+        _docker("rm", "-f", name)
+        pytest.fail(f"the local registry did not answer within {REGISTRY_READY_SECONDS}s")
     configure()
     set_image_store(LocalRegistryImageStore(host))
     reset_artifact_store()
@@ -69,6 +74,9 @@ def local_registry(monkeypatch, tmp_path):
                 _docker("rm", "-f", f"agent-{m.group(1)}")
         _docker("rm", "-f", name)
         shutil.rmtree(sandboxes, ignore_errors=True)
+        # The agent trusted this process's grant server, whose certificate is from this test's state root; a later
+        # test's agents trust another root's CA, so it must start afresh.
+        grant_server(None, None).close()
         reset_artifact_store()
         reset_config()
 
