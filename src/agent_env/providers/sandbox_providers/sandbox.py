@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import posixpath
 import shlex
+import tempfile
 import time
 import uuid
 import weakref
@@ -48,6 +50,11 @@ SANDBOX_LABEL = "agentenv.sandbox"
 # remote signer's whole retry window, and a connection from its session's pool.
 _CONCURRENT_SIGNS = 8
 _sign_slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+
+# A VM file is read off its host one range per exec, whose base64 every provider's exec returns in one response. A
+# provider serves each exec a fraction of its bandwidth, so many ranges are in flight.
+_READ_RANGE_BYTES = 4 * 1024 * 1024
+_READS_IN_FLIGHT = 16
 
 
 class NetworkPolicyUnsupportedError(NotImplementedError):
@@ -376,8 +383,6 @@ class VmSandbox(Sandbox):
 
     async def _write_bytes_to_vm_path(self, data: bytes, vm_path: str) -> None:
         """Stream bytes from agent-env onto the VM host at vm_path (base64 over exec)."""
-        import base64
-
         encoded = base64.b64encode(data).decode()
         if len(encoded) <= self._WFT_CHUNK_BYTES:
             await self.exec_script(f"base64 -d <<'ENDB64' > {shlex.quote(vm_path)}\n{encoded}\nENDB64")
@@ -437,3 +442,49 @@ async def stage_files_into_container(sandbox: Sandbox, file_artifacts: dict[str,
 
     await asyncio.gather(*(_stage(fn, fa) for fn, fa in file_artifacts.items()))
     return loaded
+
+
+async def read_vm_file(sandbox: VmSandbox, vm_path: str, local_path: str) -> None:
+    """Copy ``vm_path`` off the VM host into ``local_path``, a range at a time, base64 over exec, so memory holds only
+    the ranges in flight. A range shorter than it should be fails the copy rather than leave a truncated file."""
+    quoted = shlex.quote(vm_path)
+    reported = (await sandbox.exec_script(f"wc -c < {quoted}")).strip()
+    if not reported.isdigit():
+        raise RuntimeError(f"the VM reported {reported!r} as the size of {vm_path}; refusing to copy it")
+    size = int(reported)
+    gate = asyncio.Semaphore(_READS_IN_FLIGHT)
+    with open(local_path, "wb") as out:
+        out.truncate(size)
+
+        async def copy(offset: int) -> None:
+            length = min(_READ_RANGE_BYTES, size - offset)
+            async with gate:
+                encoded = await sandbox.exec_script(f"tail -c +{offset + 1} {quoted} | head -c {length} | base64")
+            data = base64.b64decode(encoded)
+            if len(data) != length:
+                raise RuntimeError(f"read {len(data)} of {length} bytes at offset {offset} of {vm_path}; "
+                                   "refusing a truncated copy")
+            out.seek(offset)
+            out.write(data)
+
+        copies = [asyncio.ensure_future(copy(offset)) for offset in range(0, size, _READ_RANGE_BYTES)]
+        try:
+            await asyncio.gather(*copies)
+        finally:
+            for pending in copies:
+                pending.cancel()
+            await asyncio.gather(*copies, return_exceptions=True)
+
+
+async def upload_vm_file(sandbox: VmSandbox, vm_path: str, store: ObjectStore, object_url: str) -> None:
+    """Put ``vm_path`` from the VM host into ``store`` at ``object_url``. The VM uploads it to a presigned URL when the
+    store signs one; otherwise agent-env copies it off the VM and puts it, since a sandbox can't reach a store on this
+    machine."""
+    put_url = await asyncio.to_thread(store.signed_put_url, object_url)
+    if put_url is not None:
+        await sandbox.exec_script(f'curl -fsSL -X PUT --upload-file {shlex.quote(vm_path)} "{put_url}"')
+        return
+    with tempfile.TemporaryDirectory(prefix="agentenv-vm-file-") as directory:
+        local_path = os.path.join(directory, posixpath.basename(vm_path))
+        await read_vm_file(sandbox, vm_path, local_path)
+        await asyncio.to_thread(store.put_file_at, object_url, local_path)
