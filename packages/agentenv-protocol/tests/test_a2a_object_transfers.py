@@ -857,6 +857,20 @@ def test_grant_urls_are_redacted_however_httpx_formats_its_log_call(
     assert "secret" not in caplog.text and "pw" not in caplog.text
 
 
+def test_redact_urls_keeps_each_urls_scheme_and_host_and_leaves_the_rest_of_the_text() -> None:
+    text = (
+        f"GET {_SIGNED_URL} 404\n"
+        "staged at https://agent.example.test/ext/staging/c4ll-1d/0 and http://127.0.0.1:8000/a2a, "
+        '"POST /a2a HTTP/1.1" 200 OK'
+    )
+
+    assert transfers.redact_urls(text) == (
+        "GET https://objects.example.test/<redacted> 404\n"
+        "staged at https://agent.example.test/<redacted> and http://127.0.0.1:8000/<redacted> "
+        '"POST /a2a HTTP/1.1" 200 OK'
+    )
+
+
 def test_trajectory_object_request_fixes_json_media_type() -> None:
     request = TaskObjectTrajectoryRequest(
         task_id="task-1", objects=TrajectoryWriteObjects(trajectory=_write_object())

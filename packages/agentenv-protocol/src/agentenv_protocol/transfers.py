@@ -210,13 +210,19 @@ _URL = re.compile(
 )
 
 
+def redact_urls(text: str) -> str:
+    """``text`` with each HTTP(S) URL in it cut to its scheme and host. A grant's URL carries what lets
+    anyone use it, in its query (a signature) or its path (a staging call), so what is logged or kept
+    names only where it pointed."""
+
+    return _URL.sub(r"\g<scheme>://\g<host>/<redacted>", text)
+
+
 class _RequestUrlRedactor(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         # The formatted message, not httpx's arguments: it holds however httpx logs.
         if _REDACT_REQUEST_URLS.get():
-            record.msg = _URL.sub(
-                r"\g<scheme>://\g<host>/<redacted>", record.getMessage()
-            )
+            record.msg = redact_urls(record.getMessage())
             record.args = None
         return True
 

@@ -49,6 +49,18 @@ def install(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_urls_in_the_logs_are_cut_to_their_host_even_where_the_tail_cuts_the_log(install):
+    signed = "https://bucket.s3.amazonaws.com/run/x.png?X-Amz-Credential=AKIA&X-Amz-Signature=deadbeef"
+    padding = "x" * (sandbox_utils._STREAM_TAIL_CHARS - 30)
+    sandbox = FakeSandbox(rows=[("c1", "agent-api")], logs={"c1": (f"GET {signed} 404", f"{signed} {padding}")})
+
+    out = await fetch_container_logs(install(sandbox))
+
+    assert "https://bucket.s3.amazonaws.com/<redacted>" in out
+    assert "X-Amz" not in out and "deadbeef" not in out and "AKIA" not in out
+
+
+@pytest.mark.asyncio
 async def test_tails_only_the_agents_own_container(install):
     sandbox = FakeSandbox(
         rows=[("c1", "agent-api"), ("c2", "agent-dind"), ("c3", "agent-other")],

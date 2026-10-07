@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from agentenv_protocol.transfers import redact_urls
+
 from agent_env.providers.sandbox_providers.sandbox_provider import build_sandbox_provider, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
@@ -31,7 +33,8 @@ async def fetch_container_logs(agent, tail: int = 500) -> Optional[str]:
     The agent's own container is the one named ``sandbox.container_name``. When none is, the
     containers are tailed up to ``_FALLBACK_CONTAINER_LIMIT``, agent-named ones first. Best
     effort: None on any failure, including a sandbox with no docker, so it never masks the
-    task's own failure.
+    task's own failure. URLs in the logs are cut to their scheme and host (``redact_urls``): the
+    tail is logged and kept with the run, and an agent may have logged the grant URLs it was sent.
     """
     sandbox_id = getattr(agent, "sandbox_id", None)
     if not sandbox_id:
@@ -60,8 +63,9 @@ async def fetch_container_logs(agent, tail: int = 500) -> Optional[str]:
                     "sudo", "docker", "logs", "--tail", str(tail), cid,
                 )
                 parts = []
-                out_tail = (out or "").strip()[-_STREAM_TAIL_CHARS:]
-                err_tail = (err or "").strip()[-_STREAM_TAIL_CHARS:]
+                # Redacted before it is cut, so the cut can't leave part of a URL behind unredacted.
+                out_tail = redact_urls((out or "").strip())[-_STREAM_TAIL_CHARS:]
+                err_tail = redact_urls((err or "").strip())[-_STREAM_TAIL_CHARS:]
                 if out_tail:
                     parts.append(f"[stdout]\n{out_tail}")
                 if err_tail:
