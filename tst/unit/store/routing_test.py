@@ -255,6 +255,9 @@ def test_default_local_users_keep_the_local_namespace_in_its_own_file(cli_routin
     router.insert("envs", {"id": "rocket", "version": 1})
     assert _ids(router.local, "envs") == {LOCAL_ENV}
     assert _ids(router.configured, "envs") == {"rocket"}
+    page, total = router.latest_per_id_page("envs", Filter(), limit=0)
+    assert {doc["id"] for doc in page} == {LOCAL_ENV, "rocket"}
+    assert total == 2
     with run_scope(LOCAL_TASK):
         assert isinstance(config.get_object_store(), LocalFilesystemObjectStore)
         with pytest.raises(LocalRunWriteError):
@@ -467,6 +470,11 @@ def test_an_id_recorded_in_both_stores_reduces_to_one_latest_row(stores):
     ]
     assert [d["id"] for d in router.latest_per_id("env_snapshots", Filter(), sort=by_time, limit=1, offset=1)] == ["local-only"]
     assert router.count_distinct("env_snapshots", Filter()) == 3
+    page, total = router.latest_per_id_page(
+        "env_snapshots", Filter(), sort=by_time, limit=1, offset=1,
+    )
+    assert [doc["id"] for doc in page] == ["local-only"]
+    assert total == 3
     with run_scope(LOCAL_TASK):
         assert {d["id"]: d.get("from") for d in router.latest_per_id("env_snapshots", Filter())}["tied"] == "local"
 
@@ -509,6 +517,19 @@ def test_a_raw_entity_write_is_checked_like_a_versioned_one(stores, entity_id, r
         router.update("envs", Filter.of(id=entity_id, version=1), UpdateSpec(set={"x": 1}), upsert=True)
     assert configured.count("envs", Filter()) == 0
     assert not (state_root() / "document_store" / "local.db").exists()
+
+
+def test_batch_instance_lookup_keeps_the_first_routed_copy(stores):
+    router, configured, local = stores
+    configured.ensure_index("task_instances", ["instance_id"], unique=True)
+    local.ensure_index("task_instances", ["instance_id"], unique=True)
+    configured.insert("task_instances", {"instance_id": "shared", "current_step": 2})
+    local.insert("task_instances", {"instance_id": "shared", "current_step": 7})
+
+    for scope in (nullcontext(), run_scope(LOCAL_TASK)):
+        with scope:
+            expected = router.find_one("task_instances", Filter.of(instance_id="shared"))
+            assert router.find_many_by_id("task_instances", "instance_id", ["shared"]) == [expected]
 
 
 def test_an_entity_store_defined_outside_core_is_routed_by_id(stores):

@@ -245,6 +245,13 @@ class DocumentStore(ABC):
     def count(self, collection: str, filter: Filter) -> int:
         """Return the number of matching documents."""
 
+    def find_many_by_id(self, collection: str, id_field: str, ids: list[str]) -> list[dict]:
+        """First document for each distinct top-level string identity, in requested order; missing IDs are omitted."""
+        return [
+            doc for identity in dict.fromkeys(ids)
+            if (doc := self.find_one(collection, Filter.of(**{id_field: identity}))) is not None
+        ]
+
     def latest_per_id(
         self,
         collection: str,
@@ -272,6 +279,37 @@ class DocumentStore(ABC):
         if limit:
             docs = docs[:limit]
         return docs
+
+    def latest_per_id_page(
+        self,
+        collection: str,
+        filter: Filter,
+        *,
+        id_field: str = "id",
+        version_field: str = "version",
+        sort: Optional[Sort] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """Return a latest-per-id page and its total, sharing generic query work.
+
+        Backends with custom pagination or counts retain those implementations
+        unless they override this combined operation.
+        """
+        if (
+            type(self).latest_per_id is not DocumentStore.latest_per_id
+            or type(self).count_distinct is not DocumentStore.count_distinct
+        ):
+            page = self.latest_per_id(
+                collection, filter, id_field=id_field, version_field=version_field,
+                sort=sort, limit=limit, offset=offset,
+            )
+            return page, self.count_distinct(collection, filter, id_field=id_field)
+        docs = _reduce_to_latest(self.query(collection, filter), id_field, version_field)
+        docs = _apply_sort(docs, sort)
+        total = len(docs)
+        end = offset + limit if limit else None
+        return docs[offset:end], total
 
     def count_distinct(self, collection: str, filter: Filter, *, id_field: str = "id") -> int:
         """Number of distinct ``id_field`` values among matching documents.
