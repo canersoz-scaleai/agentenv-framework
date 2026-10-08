@@ -167,6 +167,20 @@ class TestUrlsOntoVm:
         assert not [c for c in calls if c[0] == "container_url"]
         assert ctx.metadata["loaded_urls"][0]["sandbox_name"] == "mk"
 
+    @pytest.mark.asyncio
+    async def test_a_named_url_is_curled_to_its_filename(self, vm):
+        ctx, calls = vm
+        step = LoadArtifactTaskStep(
+            id="stage", version=None, sandbox_name="mk", destination_path="/app/seeds",
+            urls=[{"url": "https://files.example/objects/obj-4f9c2a", "filename": "repo.tar.gz"}],
+        )
+        ctx = await step.execute(ctx)
+
+        curls = [c[1] for c in calls if c[0] == "exec" and c[1].startswith("curl -fsSL")]
+        assert len(curls) == 1, curls
+        assert "https://files.example/objects/obj-4f9c2a" in curls[0] and curls[0].endswith("-o /app/seeds/repo.tar.gz")
+        assert ctx.metadata["loaded_urls"][0]["files"] == ["repo.tar.gz"]
+
 
 class TestContainerPathUnchanged:
     @pytest.mark.asyncio

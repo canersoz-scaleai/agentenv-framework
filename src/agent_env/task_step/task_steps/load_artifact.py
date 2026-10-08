@@ -29,13 +29,90 @@ _STEP_ARTIFACT_SOURCES: tuple[tuple[str, Callable[[dict], Optional[dict]]], ...]
     ("env_snapshotted_universes", lambda entry: entry),
 )
 
+# A `urls` entry: a bare URL, saved under the name its path ends in, or
+# {"url": ..., "filename": ...}, saved under that filename verbatim.
+UrlEntry = str | dict[str, str]
+_URL_ENTRY_KEYS = frozenset({"url", "filename"})
+
+
+def _named_download(step_id: str, entry: dict) -> tuple[str, str]:
+    """The ``(url, filename)`` of an object entry, rejecting anything but a plain file name for ``filename``."""
+    unknown = sorted(set(entry) - _URL_ENTRY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"load_artifact '{step_id}': urls entry {entry!r} has unknown key(s) {unknown}; "
+            f"an object entry takes only 'url' and 'filename'"
+        )
+    url, filename = entry.get("url"), entry.get("filename")
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"load_artifact '{step_id}': urls entry {entry!r} needs a non-empty string 'url'")
+    if not isinstance(filename, str) or not filename:
+        raise ValueError(
+            f"load_artifact '{step_id}': urls entry {entry!r} needs a non-empty string 'filename' "
+            f"(a bare URL string is saved under the name its path ends in)"
+        )
+    try:
+        validate_relative_filename(filename)
+    except ValueError as e:
+        raise ValueError(f"load_artifact '{step_id}': urls entry {entry!r}: {e}") from e
+    if "/" in filename or "\\" in filename or filename == ".":
+        raise ValueError(
+            f"load_artifact '{step_id}': urls entry {entry!r}: filename must be a plain file name, not a path"
+        )
+    return url, filename
+
+
+def _url_downloads(step_id: str, urls: list[UrlEntry]) -> list[tuple[str, str]]:
+    """Each ``urls`` entry as ``(url, filename)``, the name it is saved under in the destination.
+
+    A bare URL takes its last path segment, a repeat suffixed ``-1``, ``-2``, ...; an explicit
+    filename is never renamed, so one given twice, or matching a bare URL's name, raises.
+    """
+    explicit: dict[str, str] = {}
+    for entry in urls:
+        if isinstance(entry, dict):
+            url, filename = _named_download(step_id, entry)
+            if filename in explicit:
+                raise ValueError(
+                    f"load_artifact '{step_id}': filename {filename!r} is given to more than one urls entry "
+                    f"({explicit[filename]!r} and {url!r})"
+                )
+            explicit[filename] = url
+        elif not isinstance(entry, str):
+            raise ValueError(
+                f"load_artifact '{step_id}': urls entry {entry!r} must be a URL string or an object "
+                f"with 'url' and 'filename'"
+            )
+
+    downloads: list[tuple[str, str]] = []
+    seen: dict[str, int] = {}
+    for entry in urls:
+        if isinstance(entry, dict):
+            downloads.append((entry["url"], entry["filename"]))
+            continue
+        base = unquote(os.path.basename(urlparse(entry).path)) or "downloaded"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        if count == 0:
+            filename = base
+        else:
+            stem, ext = os.path.splitext(base)
+            filename = f"{stem}-{count}{ext}"
+        if filename in explicit:
+            raise ValueError(
+                f"load_artifact '{step_id}': {entry!r} would be saved as {filename!r}, the filename given to "
+                f"{explicit[filename]!r}; give it a 'filename' of its own"
+            )
+        downloads.append((entry, filename))
+    return downloads
+
 
 @dataclass
 class _LoadInputs:
     """What a load_artifact step loads and where, after per-run overrides."""
 
     artifacts: list[dict]
-    urls: list[str]
+    downloads: list[tuple[str, str]]
     destination_path: Optional[str]
 
 
@@ -56,7 +133,7 @@ class LoadArtifactTaskStep(TaskStep):
         artifacts: Optional[list[dict]] = None,
         artifact_id: Optional[str] = None,
         artifact_version: Optional[int] = None,
-        urls: Optional[list[str]] = None,
+        urls: Optional[list[UrlEntry]] = None,
         collected_artifacts_step_id: Optional[str] = None,
         artifact_from_step_id: Optional[str] = None,
         destination_path: Optional[str] = None,
@@ -108,6 +185,8 @@ class LoadArtifactTaskStep(TaskStep):
         self.env_step_id = env_step_id
         self.artifacts = artifacts or []
         self.urls = list(urls or [])
+        # Stored urls fail here, at construction; a per-run `urls` override is checked in `_resolve_inputs`.
+        _url_downloads(self.id, self.urls)
         # Superseded by the producer-agnostic `artifact_from_step_id`, but kept
         # readable/writable: it is persisted on existing task-step documents.
         self.collected_artifacts_step_id = collected_artifacts_step_id
@@ -224,10 +303,11 @@ class LoadArtifactTaskStep(TaskStep):
         return matches[0] if matches else None
 
     def _resolve_inputs(self, context: TaskStepContext) -> _LoadInputs:
-        """Resolve ``(artifacts, urls, destination_path)``, honoring per-run
+        """Resolve ``(artifacts, downloads, destination_path)``, honoring per-run
         ``step_overrides``. An override wins over the stored value; an explicit
         artifact override also wins over ``artifact_from_step_id`` /
-        ``collected_artifacts_step_id`` wiring.
+        ``collected_artifacts_step_id`` wiring. A ``urls`` override is named and
+        validated here, before anything is loaded.
         Topology (env_id/agent_name/container_name) is not overridable here.
         """
         overrides = self.step_param_overrides(context)
@@ -258,11 +338,12 @@ class LoadArtifactTaskStep(TaskStep):
 
         # `or []` so a `{"urls": null}` override cleanly clears rather than crashing on list(None).
         urls = list(overrides["urls"] or []) if "urls" in overrides else list(self.urls)
+        downloads = _url_downloads(self.id, urls)
         destination_path = overrides.get("destination_path", self.destination_path)
 
         if overrides:
             logger.info("load '%s': applying step_overrides for %s", self.id, sorted(overrides))
-        return _LoadInputs(artifacts=resolved_artifacts, urls=urls, destination_path=destination_path)
+        return _LoadInputs(artifacts=resolved_artifacts, downloads=downloads, destination_path=destination_path)
 
     async def _load_url_onto_vm(self, sandbox, url: str, destination_path: str) -> None:
         """Host counterpart of ``sandbox.load_object_file``; ``write_file_from_url`` targets a container instead."""
@@ -303,7 +384,7 @@ class LoadArtifactTaskStep(TaskStep):
 
         inputs = self._resolve_inputs(context)
         resolved_artifacts = inputs.artifacts
-        urls = inputs.urls
+        downloads = inputs.downloads
         destination_path = inputs.destination_path
 
         # With container_name it hosts that container; alone it is the target itself.
@@ -502,7 +583,7 @@ class LoadArtifactTaskStep(TaskStep):
             else:
                 raise ValueError(f"Unsupported artifact type for loading: '{artifact.type}'")
 
-        if urls:
+        if downloads:
             if self.sandbox_name is not None:
                 sandbox = target_sandbox
             else:
@@ -516,19 +597,6 @@ class LoadArtifactTaskStep(TaskStep):
                 )
                 sandbox = await provider.get_sandbox(agent.sandbox_id)
             destination = (destination_path or "/tmp/file_artifacts").rstrip("/") or "/"
-
-            files: list[str] = []
-            seen: dict[str, int] = {}
-            for url in urls:
-                base = unquote(os.path.basename(urlparse(url).path)) or "downloaded"
-                count = seen.get(base, 0)
-                seen[base] = count + 1
-                if count == 0:
-                    files.append(base)
-                else:
-                    stem, ext = os.path.splitext(base)
-                    files.append(f"{stem}-{count}{ext}")
-
             semaphore = asyncio.Semaphore(8)
 
             async def _load_one(url: str, filename: str) -> None:
@@ -541,13 +609,13 @@ class LoadArtifactTaskStep(TaskStep):
                     target_desc = f"VM sandbox '{self.sandbox_name}'" if onto_vm_host else "agent"
                     logger.info(f"Loaded URL into {target_desc}: {url} -> {dest}")
 
-            await asyncio.gather(*(_load_one(u, f) for u, f in zip(urls, files)))
+            await asyncio.gather(*(_load_one(u, f) for u, f in downloads))
             context.metadata.setdefault("loaded_urls", []).append({
                 "step_id": self.id,
                 "agent_name": None if self.sandbox_name is not None else self.agent_name,
                 "sandbox_name": self.sandbox_name,
                 "destination_path": destination,
-                "files": files,
+                "files": [filename for _, filename in downloads],
             })
 
         return context
