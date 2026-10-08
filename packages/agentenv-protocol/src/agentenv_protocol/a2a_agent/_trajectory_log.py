@@ -186,7 +186,10 @@ class TaskTrajectories:
             context_id=context_id,
             task_id=task_ids[current],
             state=state,
-            format=records[current].log.format,
+            format=next(
+                (record.log.format for record in reversed(records) if record.log.format),
+                None,
+            ),
             events=page,
             total=sum(lengths),
         )

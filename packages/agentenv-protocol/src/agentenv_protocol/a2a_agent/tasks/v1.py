@@ -159,10 +159,12 @@ class TrajectoryLog:
         self._format = format
 
     def append(self, event: Mapping[str, Any]) -> None:
-        """Record one complete event, a JSON object."""
+        """Record one complete event, a JSON object, after ``set_format`` has named its format."""
         if not isinstance(event, Mapping):
             raise TypeError("a trajectory event must be a JSON object")
         self._ensure_open()
+        if self._format is None:
+            raise RuntimeError("call set_format(...) before appending trajectory events")
         encoded = json.dumps(dict(event), separators=(",", ":"), allow_nan=False).encode()
         self._events.append(encoded)
         self._size_bytes += len(encoded)

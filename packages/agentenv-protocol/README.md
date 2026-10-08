@@ -326,7 +326,7 @@ class MyAgent(AgentEnvAgent):
 never changes after it is appended and a read never returns part of one. It does
 no I/O; call it from one thread at a time. After the task ends the log refuses
 further events. `set_format` names the events' versioned format, which readers
-use to parse them.
+use to parse them; call it before the first `append`, which otherwise raises.
 
 The framework keeps each task's log and serves it while the task runs. When the
 result carries no `native_trajectory`, the log is the task's final trajectory:
@@ -357,7 +357,8 @@ Both answer `{context_id, task_id, state, format, events, next, has_more}`
   before the task's terminal A2A status, so the completed-task reads succeed as
   soon as a client sees the task end.
 - A context read reports the context's current task, the running one or else the
-  latest, with its `format`; its `state` is `running` while any task runs.
+  latest, and the most recent `format` any of its tasks set; its `state` is
+  `running` while any task runs.
 - A task or context the agent has not seen, or no longer keeps, is HTTP 404. A
   task is known from the moment `message/send` returns its id, so a 404 for an
   id that was readable means it was evicted, and any cursor held for it, or for

@@ -128,6 +128,12 @@ def _within(seconds: float, condition) -> bool:
     return True
 
 
+def _open(trajectories: TaskTrajectories, task_id: str, context_id: str) -> TrajectoryLog:
+    log = trajectories.register(task_id, context_id)
+    log.set_format("test-events/1")
+    return log
+
+
 def _events(text: str, count: int) -> list[dict[str, Any]]:
     return [{"text": text, "index": index} for index in range(count)]
 
@@ -253,6 +259,7 @@ def test_cancel_seals_the_log_canceled_with_its_cleanup_events() -> None:
     @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1, live=True),))
     class Agent(AgentEnvAgent):
         async def run(self, request: TaskRequest) -> TaskResult:
+            request.trajectory.set_format("test-events/1")
             request.trajectory.append({"step": "working"})
             try:
                 await asyncio.Event().wait()
@@ -277,7 +284,7 @@ def test_cancel_seals_the_log_canceled_with_its_cleanup_events() -> None:
 def test_a_cancel_the_agent_swallows_still_seals_canceled() -> None:
     services = _SdkServices((enable(TRAJECTORY_V1, live=True),), None)
     trajectories = services.task_trajectories
-    log = trajectories.register("task-1", "context-1")
+    log = _open(trajectories, "task-1", "context-1")
     trajectories.start("task-1")
     log.append({"step": 1})
 
@@ -292,6 +299,7 @@ def test_a_native_trajectory_is_the_final_record(caplog: pytest.LogCaptureFixtur
     @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1, live=True),))
     class Agent(AgentEnvAgent):
         async def run(self, request: TaskRequest) -> TaskResult:
+            request.trajectory.set_format("test-events/1")
             request.trajectory.append({"live": True})
             return (
                 TaskResult.builder()
@@ -344,6 +352,7 @@ def test_an_agent_context_handler_wins_over_the_framework() -> None:
     @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1, live=True),))
     class Agent(AgentEnvAgent):
         async def run(self, request: TaskRequest) -> TaskResult:
+            request.trajectory.set_format("test-events/1")
             request.trajectory.append({"live": True})
             return TaskResult.text("done")
 
@@ -366,6 +375,7 @@ def test_a_streaming_run_appends_the_same_way() -> None:
     @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1, live=True),))
     class Agent(AgentEnvAgent):
         async def run(self, request: TaskRequest) -> AsyncIterator[Any]:
+            request.trajectory.set_format("test-events/1")
             request.trajectory.append({"step": 1})
             yield TaskProgress.text("working")
             request.trajectory.append({"step": 2})
@@ -382,7 +392,7 @@ def test_a_streaming_run_appends_the_same_way() -> None:
 @pytest.mark.asyncio
 async def test_default_handlers_delegate_the_cursor_read() -> None:
     services = _SdkServices((enable(TRAJECTORY_V1, live=True),), None)
-    log = services.task_trajectories.register("task-1", "context-1")
+    log = _open(services.task_trajectories, "task-1", "context-1")
     services.task_trajectories.start("task-1")
     log.append({"step": 1})
 
@@ -396,6 +406,7 @@ async def test_default_handlers_delegate_the_cursor_read() -> None:
 
 def test_an_appended_event_never_changes() -> None:
     log = TrajectoryLog()
+    log.set_format("test-events/1")
     event = {"nested": {"value": 1}}
     log.append(event)
     event["nested"]["value"] = 2
@@ -413,7 +424,7 @@ def test_an_appended_event_never_changes() -> None:
 
 def test_a_sealed_log_refuses_more_events() -> None:
     trajectories = TaskTrajectories()
-    log = trajectories.register("task-1", "context-1")
+    log = _open(trajectories, "task-1", "context-1")
     log.append({"step": 1})
     trajectories.seal("task-1", TrajectoryState.COMPLETED)
 
@@ -426,7 +437,7 @@ def test_a_sealed_log_refuses_more_events() -> None:
 
 def test_reads_never_return_a_partial_event() -> None:
     trajectories = TaskTrajectories()
-    log = trajectories.register("task-1", "context-1")
+    log = _open(trajectories, "task-1", "context-1")
     trajectories.start("task-1")
     seen: list[bytes] = []
     for index in range(50):
@@ -446,7 +457,7 @@ def test_reads_never_return_a_partial_event() -> None:
 
 def test_the_byte_budget_still_returns_one_event() -> None:
     trajectories = TaskTrajectories()
-    log = trajectories.register("task-1", "context-1")
+    log = _open(trajectories, "task-1", "context-1")
     trajectories.start("task-1")
     log.append({"big": "x" * 100})
     log.append({"big": "y" * 100})
@@ -458,8 +469,8 @@ def test_the_byte_budget_still_returns_one_event() -> None:
 
 def test_a_task_that_starts_later_moves_without_shifting_positions() -> None:
     trajectories = TaskTrajectories()
-    queued = trajectories.register("queued", "context-1")
-    running = trajectories.register("running", "context-1")
+    queued = _open(trajectories, "queued", "context-1")
+    running = _open(trajectories, "running", "context-1")
     trajectories.start("running")
     running.append({"from": "running"})
     trajectories.start("queued")
@@ -477,7 +488,7 @@ def test_a_task_that_starts_later_moves_without_shifting_positions() -> None:
 
 def test_eviction_drops_completed_contexts_but_never_running_ones() -> None:
     trajectories = TaskTrajectories(max_contexts=2)
-    running = trajectories.register("running", "context-running")
+    running = _open(trajectories, "running", "context-running")
     trajectories.start("running")
     running.append({"step": 1})
     for number in (1, 2, 3):
@@ -492,7 +503,7 @@ def test_eviction_drops_completed_contexts_but_never_running_ones() -> None:
 
 def test_the_context_whose_task_just_ended_is_kept_for_its_final_read() -> None:
     trajectories = TaskTrajectories(max_contexts=1)
-    log = trajectories.register("ending", "context-ending")
+    log = _open(trajectories, "ending", "context-ending")
     trajectories.start("ending")
     log.append({"step": 1})
     for number in (1, 2):
@@ -507,10 +518,37 @@ def test_a_large_running_trajectory_warns_once(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(tasks_v1, "_LARGE_LIVE_TRAJECTORY_BYTES", 10)
-    log = TaskTrajectories().register("task-1", "context-1")
+    log = _open(TaskTrajectories(), "task-1", "context-1")
 
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
             log.append({"padding": "x" * 20})
 
     assert caplog.text.count("trajectory of running task task-1 exceeds") == 1
+
+
+def test_appending_before_set_format_is_refused() -> None:
+    log = TrajectoryLog()
+
+    with pytest.raises(RuntimeError, match="set_format"):
+        log.append({"step": 1})
+    assert len(log) == 0
+
+
+def test_a_context_read_keeps_the_format_while_a_new_turn_is_pending() -> None:
+    trajectories = TaskTrajectories()
+    first = _open(trajectories, "first", "context-1")
+    trajectories.start("first")
+    first.append({"step": 1})
+    trajectories.seal("first", TrajectoryState.COMPLETED)
+    trajectories.register("second", "context-1")
+    trajectories.start("second")
+
+    page = trajectories.context_page("context-1", 0, 10, 1_000)
+
+    assert page is not None
+    assert (page.task_id, page.state, page.format) == (
+        "second",
+        TrajectoryState.PENDING,
+        "test-events/1",
+    )
