@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Self
 
 from agent_env.store.base import NotFoundError
 from agent_env.config import get_config
-from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Lte, Ne, Sort, UpdateSpec, VersionedEntityStore, VersionedEntityStoreCache, compare_and_swap
+from agent_env.store.document_store import DocumentStore, DuplicateKeyError, Filter, Lte, Ne, Sort, SortKey, UpdateSpec, VersionedEntityStore, VersionedEntityStoreCache, compare_and_swap
 from agent_env.store.query import QueryBuilder, to_document_query
 from agent_env.task.step_journal import (
     _RESERVED_STEP_IDS,
@@ -257,6 +257,16 @@ def _new_instance_doc(
     }
 
 
+# A run records only the minute it started, so the instance id orders runs of one minute and pages never overlap.
+# Both keys descend so Mongo reads the sort from the (task_id, created_at_utc, instance_id) index scanned backward;
+# a mixed-direction sort matches no index and sorts every run's whole document in memory.
+_NEWEST_FIRST = Sort((SortKey("created_at_utc", descending=True), SortKey("instance_id", descending=True)))
+
+
+def _task_filter(task_id: str, task_version: int | None) -> Filter:
+    return Filter.of(task_id=task_id) if task_version is None else Filter.of(task_id=task_id, task_version=task_version)
+
+
 class TaskInstanceStore:
     def __init__(self) -> None:
         self._indexed = None
@@ -271,8 +281,8 @@ class TaskInstanceStore:
         if self._indexed is not store:
             store.ensure_index(TASK_INSTANCES_COLLECTION, ["instance_id"], unique=True)
             store.ensure_index(TASK_INSTANCES_COLLECTION, ["task_id"])
-            store.ensure_index(TASK_INSTANCES_COLLECTION, ["task_id", "created_at_utc"])
-            store.ensure_index(TASK_INSTANCES_COLLECTION, ["task_id", "task_version", "created_at_utc"])
+            store.ensure_index(TASK_INSTANCES_COLLECTION, ["task_id", "created_at_utc", "instance_id"])
+            store.ensure_index(TASK_INSTANCES_COLLECTION, ["task_id", "task_version", "created_at_utc", "instance_id"])
             store.ensure_index(TASK_STEP_JOURNAL_COLLECTION, ["instance_id", "step_id"], unique=True)
             store.ensure_index(TASK_STEP_JOURNAL_COLLECTION, ["instance_id", "seq"])
             self._indexed = store
@@ -374,6 +384,18 @@ class TaskInstanceStore:
         if not doc:
             raise NotFoundError(f"TaskInstance '{instance_id}' not found")
         return TaskInstance.from_dict(doc)
+
+    def find(
+        self, task_id: str, *, task_version: int | None = None, limit: int | None = None, offset: int = 0,
+    ) -> list[TaskInstance]:
+        docs = self._doc_store.query(
+            TASK_INSTANCES_COLLECTION, _task_filter(task_id, task_version),
+            sort=_NEWEST_FIRST, limit=limit, offset=offset,
+        )
+        return [TaskInstance.from_dict(doc) for doc in docs]
+
+    def count(self, task_id: str, *, task_version: int | None = None) -> int:
+        return self._doc_store.count(TASK_INSTANCES_COLLECTION, _task_filter(task_id, task_version))
 
     def seed_context(self, instance_id: str, ops: "ContextUpdateOps") -> None:
         """Apply the run's initial context, then journal it as the replay base (even when empty)."""
@@ -761,6 +783,26 @@ def set_task_instance_store(store: TaskInstanceStore) -> None:
 def reset_task_instance_store() -> None:
     global _task_instance_store
     _task_instance_store = None
+
+
+def task_instances(
+    task_id: str, *, task_version: int | None = None, limit: int | None = None, offset: int = 0,
+) -> list[TaskInstance]:
+    """A task's recorded runs, newest first, from the configured document store. A run keeps only the minute it
+    started, so runs of one minute come in descending instance-id order, which keeps pages from overlapping."""
+    return get_task_instance_store().find(task_id, task_version=task_version, limit=limit, offset=offset)
+
+
+def count_task_instances(task_id: str, *, task_version: int | None = None) -> int:
+    return get_task_instance_store().count(task_id, task_version=task_version)
+
+
+def find_task_instance(instance_id: str) -> TaskInstance | None:
+    """One recorded run by its instance id, or None when there is no such run."""
+    try:
+        return get_task_instance_store().get(instance_id)
+    except NotFoundError:
+        return None
 
 
 def register_task_instance(
