@@ -1,5 +1,7 @@
 """Store infrastructure for AgentEnv persistence layer"""
 
+from typing import TYPE_CHECKING
+
 from agent_env.store.base import (
     ConcurrentModificationError,
     ConfigError,
@@ -22,7 +24,6 @@ from agent_env.store.document_store import (
     AbsentOrNull,
     DocumentStore,
     DuplicateKeyError,
-    DynamoDbDocumentStore,
     Eq,
     Exists,
     Filter,
@@ -51,15 +52,14 @@ from agent_env.store.image_store import (
     RegistryAuth,
     SecretStoreCredentials,
 )
+from agent_env.store._lazy import lazy_backends
 from agent_env.store.object_store import (
     LocalFilesystemObjectStore,
     ObjectMetadata,
     ObjectStore,
-    S3ObjectStore,
 )
 from agent_env.store.query import QueryBuilder
 from agent_env.store.secret_store import (
-    AwsSecretsManagerSecretStore,
     LocalSecretStore,
     SecretStore,
 )
@@ -88,7 +88,6 @@ __all__ = [
     "DocumentStore",
     "MongoDocumentStore",
     "LocalSqliteDocumentStore",
-    "DynamoDbDocumentStore",
     "VersionedEntityStore",
     "compare_and_swap",
     "rev_precondition",
@@ -117,10 +116,22 @@ __all__ = [
     # Object store abstraction
     "ObjectStore",
     "ObjectMetadata",
-    "S3ObjectStore",
     "LocalFilesystemObjectStore",
     # Secret store abstraction
     "SecretStore",
-    "AwsSecretsManagerSecretStore",
     "LocalSecretStore",
 ]
+
+if TYPE_CHECKING:  # type checkers see the classes; at runtime __getattr__ imports them on first use
+    from agent_env.store.document_store.dynamodb_document_store import DynamoDbDocumentStore as DynamoDbDocumentStore
+    from agent_env.store.object_store.s3_object_store import S3ObjectStore as S3ObjectStore
+    from agent_env.store.secret_store.aws_secrets_manager_secret_store import (
+        AwsSecretsManagerSecretStore as AwsSecretsManagerSecretStore,
+    )
+
+# The backends that need the aws extra: imported on first use, and left out of __all__.
+__getattr__ = lazy_backends(__name__, {
+    "DynamoDbDocumentStore": "agent_env.store.document_store.dynamodb_document_store",
+    "S3ObjectStore": "agent_env.store.object_store.s3_object_store",
+    "AwsSecretsManagerSecretStore": "agent_env.store.secret_store.aws_secrets_manager_secret_store",
+})

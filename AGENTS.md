@@ -30,7 +30,10 @@ pip install -e ./packages/agentenv-protocol -e '.[dev]'
 Both install the in-repo protocol package together with the dev extra: agent-env depends on it and
 the workspace copy is the one to develop against (`uv sync` does this through the uv workspace in
 `pyproject.toml`). `make install` is the pip route in one step. No cloud credentials are needed; the
-default stores are local.
+default stores are local. The cloud store backends need their extra, both in `dev`: `aws` (boto3) for
+S3, Secrets Manager, DynamoDB and ECR, `gcp` for the Google Cloud ones. Core must import without boto3: a
+store package re-exports an `aws` backend on first use, and code outside the backends imports boto3
+or one of them only where it is used.
 
 ## Commands
 
