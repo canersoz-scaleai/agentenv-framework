@@ -425,6 +425,18 @@ def test_an_appended_event_never_changes() -> None:
         log.set_format(" ")
 
 
+def test_the_format_cannot_change_once_an_event_is_appended() -> None:
+    log = TrajectoryLog()
+    log.set_format("first/1")
+    log.set_format("second/1")
+    log.append({"step": 1})
+
+    log.set_format("second/1")
+    with pytest.raises(RuntimeError, match="cannot change"):
+        log.set_format("third/1")
+    assert log.format == "second/1"
+
+
 def test_a_sealed_log_refuses_more_events() -> None:
     trajectories = TaskTrajectories()
     log = _open(trajectories, "task-1", "context-1")

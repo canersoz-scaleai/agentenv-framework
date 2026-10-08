@@ -152,10 +152,13 @@ class TrajectoryLog:
         return self._format
 
     def set_format(self, format: str) -> None:
-        """Name the events' versioned format, such as ``my-cli-events/1``."""
+        """Name the events' versioned format, such as ``my-cli-events/1``; once an event is
+        appended, it stays."""
         if not isinstance(format, str) or not format.strip():
             raise ValueError("trajectory format must be a non-empty string")
         self._ensure_open()
+        if self._events and format != self._format:
+            raise RuntimeError("the trajectory's format cannot change once events are appended")
         self._format = format
 
     def append(self, event: Mapping[str, Any]) -> None:

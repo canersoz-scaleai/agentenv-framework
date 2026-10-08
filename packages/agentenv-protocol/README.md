@@ -327,6 +327,7 @@ never changes after it is appended and a read never returns part of one. It does
 no I/O; call it from one thread at a time. After the task ends the log refuses
 further events. `set_format` names the events' versioned format, which readers
 use to parse them; call it before the first `append`, which otherwise raises.
+Once an event is appended the format cannot change.
 
 The framework keeps each task's log and serves it while the task runs. When the
 result carries no `native_trajectory`, the log is the task's final trajectory:
