@@ -20,6 +20,7 @@ from agentenv_protocol.a2a_agent import (
 from agent_env.config import configure
 from agent_env.store.object_store import LocalFilesystemObjectStore
 from agent_env.task_step.context import DeployedAgent, TaskStepContext
+from agent_env.task_step.snapshot_utils import live_trajectory
 from agent_env.task_step.task_steps import prompt_agent as pa
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
 
@@ -115,6 +116,26 @@ async def test_a_live_turn_is_stored_in_chunks_while_it_runs(monkeypatch, tmp_pa
     assert json.loads(run.store.get(run.store.object_url(f"{live}end.json"))) == {
         "state": "completed",
         "next": len(_EVENTS + _MORE),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_follower_stopped_early_is_marked_ended_in_the_turns_state(monkeypatch, tmp_path):
+    async def stops_at_once(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(live_trajectory, "follow_trajectory", stops_at_once)
+    run = _Run(monkeypatch, tmp_path, live=True, wait_for_chunk=False)
+
+    result = await run.execute(run.step(live_trajectory=True))
+
+    final_key = run.store.get_object_key(result.prompt_responses[-1].agent_trajectory_s3_uri)
+    turn_id = final_key.removeprefix(f"{_PREFIX}trajectory-").removesuffix(".json")
+    end_key = f"{_PREFIX}{turn_id}/live/end.json"
+    assert sorted(run.store.list(_PREFIX)) == sorted([final_key, end_key])
+    assert json.loads(run.store.get(run.store.object_url(end_key))) == {
+        "state": "completed",
+        "next": 0,
     }
 
 

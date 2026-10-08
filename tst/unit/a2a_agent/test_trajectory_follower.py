@@ -180,13 +180,14 @@ async def test_a_failing_write_is_retried_then_raised(monkeypatch, tmp_path):
     assert len(attempts) == live_trajectory._WRITE_ATTEMPTS
 
 
-def _agent_answering(monkeypatch, *pages: dict) -> None:
-    """Every httpx client reaches an agent that answers each cursor read with the next page, then
-    keeps answering with the last one."""
-    answers = list(pages)
+def _agent_answering(monkeypatch, *answers: dict | httpx.Response) -> None:
+    """Every httpx client reaches an agent that answers each cursor read with the next answer, a
+    page or a response, then keeps answering with the last one."""
+    remaining = list(answers)
 
     def answer(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=answers.pop(0) if len(answers) > 1 else answers[0])
+        given = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return given if isinstance(given, httpx.Response) else httpx.Response(200, json=given)
 
     monkeypatch.setattr(
         httpx,
@@ -215,8 +216,8 @@ async def test_a_failed_turn_stops_its_follower_without_draining_and_marks_it_en
     with pytest.raises(type(error)):
         async with following_live_trajectory(
             _ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0
-        ) as on_sent:
-            on_sent("task-1")
+        ) as turn:
+            turn.follow("task-1")
             await asyncio.sleep(0.05)
             raise error
 
@@ -233,8 +234,8 @@ async def test_a_cancelled_turn_is_marked_ended_after_the_events_it_stored(monke
     with pytest.raises(asyncio.CancelledError):
         async with following_live_trajectory(
             _ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0
-        ) as on_sent:
-            on_sent("task-1")
+        ) as turn:
+            turn.follow("task-1")
             async with asyncio.timeout(5):
                 while "prefix/turn/live/00000000-00000002.jsonl" not in store.list("prefix/"):
                     await asyncio.sleep(0.01)
@@ -251,11 +252,54 @@ async def test_a_turn_the_follower_saw_end_keeps_its_state(monkeypatch, tmp_path
     with pytest.raises(RuntimeError):
         async with following_live_trajectory(
             _ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0
-        ) as on_sent:
-            on_sent("task-1")
+        ) as turn:
+            turn.follow("task-1")
             async with asyncio.timeout(5):
                 while "prefix/turn/live/end.json" not in store.list("prefix/"):
                     await asyncio.sleep(0.01)
             raise RuntimeError("the step failed after the turn ended")
 
     assert _end(store) == {"state": "completed", "next": 1}
+
+
+async def _until_stored(store: LocalFilesystemObjectStore, key: str) -> None:
+    async with asyncio.timeout(5):
+        while key not in store.list("prefix/"):
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stops_with",
+    [
+        pytest.param(httpx.Response(400, json={"detail": "bad"}), id="client-error"),
+        pytest.param(httpx.Response(404, json={"detail": "Unknown task"}), id="task-evicted"),
+        pytest.param(_page(2, [], "running"), id="drain-timeout"),
+    ],
+)
+async def test_a_turn_the_follower_stopped_before_its_end_is_marked_ended_in_the_reported_state(
+    monkeypatch, tmp_path, stops_with
+):
+    monkeypatch.setattr(live_trajectory, "_DRAIN_SECONDS", 0.1)
+    _agent_answering(monkeypatch, _page(0, [{"i": 0}, {"i": 1}], "running"), stops_with)
+    store = LocalFilesystemObjectStore(str(tmp_path))
+
+    async with following_live_trajectory(_ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0) as turn:
+        turn.follow("task-1")
+        await _until_stored(store, "prefix/turn/live/00000000-00000002.jsonl")
+        turn.ended("completed")
+
+    assert _end(store) == {"state": "completed", "next": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("task_state", "state"), [("canceled", "canceled"), ("failed", "failed"), ("rejected", "failed")])
+async def test_a_reported_task_state_ends_the_turn_as_its_trajectory_state(monkeypatch, tmp_path, task_state, state):
+    _agent_answering(monkeypatch, httpx.Response(404, json={"detail": "Unknown task"}))
+    store = LocalFilesystemObjectStore(str(tmp_path))
+
+    async with following_live_trajectory(_ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0) as turn:
+        turn.follow("task-1")
+        turn.ended(task_state)
+
+    assert _end(store) == {"state": state, "next": 0}

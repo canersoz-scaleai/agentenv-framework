@@ -527,14 +527,16 @@ class PromptAgentTaskStep(TaskStep):
                 if live is not None
                 else nullcontext(None)
             )
-            async with following as on_sent:
+            async with following as live_turn:
                 sent_task_id, result = await send_and_wait(
                     target_url, current_user_parts, agent=agent, message_id=target_a2a_task_id,
                     context_id=solver_context_id, timeout_seconds=self.timeout_seconds,
                     poll_interval_seconds=self.poll_interval_seconds, before_send=record_turn,
-                    on_sent=on_sent,
+                    on_sent=live_turn.follow if live_turn else None,
                 )
-            target_state = result["status"]["state"]
+                target_state = result["status"]["state"]
+                if live_turn:
+                    live_turn.ended(target_state)
             status_msg = (result.get("status") or {}).get("message") or {}
             final_terminal = protocol.TerminalResponse.from_message(status_msg)
             agent_response_parts = status_msg.get("parts") or [{"kind": "text", "text": final_terminal.response_text}]

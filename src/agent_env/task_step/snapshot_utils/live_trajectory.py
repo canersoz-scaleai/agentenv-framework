@@ -1,7 +1,8 @@
 """A turn's live trajectory, stored as it is read: ``<prefix><turn>/live/<after>-<next>.jsonl`` per
-page, ``meta.json`` naming the events' format, and ``end.json`` once the turn has ended: with the
-agent's final state when the follower read it, else ``canceled`` or ``failed`` when the step stopped
-following first.
+page, ``meta.json`` naming the events' format, and ``end.json`` once following stops: with the
+agent's final state when the follower read it, else the state the step saw the turn end in, or
+``canceled`` or ``failed`` when the step stopped first. A follower that stopped early leaves
+``end.json``'s ``next`` short of the turn's events; the final trajectory holds them all.
 
 Written from the worker with its own credentials, like the final trajectory. Every object is
 written once: one already there holds the same bytes, so a repeated write is a no-op."""
@@ -10,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from agentenv_protocol.a2a_agent import TrajectoryState
@@ -26,6 +27,8 @@ _WRITE_ATTEMPTS = 3
 _DRAIN_SECONDS = 60
 # A stopped step marks its turn ended in passing: the write must not hold up the cancel.
 _END_WRITE_SECONDS = 5
+# The A2A task states a turn's trajectory ends in as themselves; any other (failed, rejected) ends it failed.
+_ENDED_AS = {"completed": TrajectoryState.COMPLETED, "canceled": TrajectoryState.CANCELED}
 
 
 class LiveTrajectoryChunks:
@@ -74,6 +77,39 @@ class LiveTrajectoryChunks:
                 await asyncio.sleep(attempt)
 
 
+class LiveTurn:
+    """What a turn's body tells its follower: the task to ``follow`` once the message is sent, and
+    the state it ``ended`` in once the wait for it returns."""
+
+    def __init__(
+        self, endpoint: str, store: ObjectStore, prefix_key: str, turn_id: str, poll_interval_seconds: float
+    ) -> None:
+        self._endpoint = endpoint
+        self._store = store
+        self._prefix_key = prefix_key
+        self._turn_id = turn_id
+        self._poll_interval_seconds = poll_interval_seconds
+        self.stop = asyncio.Event()
+        self.followers: list[asyncio.Task] = []
+        self.sinks: list[LiveTrajectoryChunks] = []
+        self.ended_as: TrajectoryState | None = None
+
+    def follow(self, task_id: str) -> None:
+        sink = LiveTrajectoryChunks(self._store, self._prefix_key, self._turn_id)
+        self.sinks.append(sink)
+        self.followers.append(
+            asyncio.create_task(
+                follow_trajectory(
+                    self._endpoint, task_id, sink, poll_interval_seconds=self._poll_interval_seconds, stop=self.stop
+                )
+            )
+        )
+
+    def ended(self, task_state: str) -> None:
+        """Report the A2A state the turn's task ended in."""
+        self.ended_as = _ENDED_AS.get(task_state, TrajectoryState.FAILED)
+
+
 @asynccontextmanager
 async def following_live_trajectory(
     endpoint: str,
@@ -82,34 +118,22 @@ async def following_live_trajectory(
     turn_id: str,
     *,
     poll_interval_seconds: float,
-) -> AsyncIterator[Callable[[str], None]]:
-    """Yield the callback that starts following the agent's task once the turn's message is sent.
+) -> AsyncIterator[LiveTurn]:
+    """Yield the turn whose task is followed once its message is sent.
 
     When the body returns, the follower drains what remains, for at most ``_DRAIN_SECONDS``; when it
-    raises, the follower is stopped at once, since the agent may be gone, and the turn is marked
-    ended (``canceled`` for a cancelled step, else ``failed``) so readers do not wait on it. A
-    follower's own failure is logged and never fails the turn."""
-    stop = asyncio.Event()
-    followers: list[asyncio.Task] = []
-    sinks: list[LiveTrajectoryChunks] = []
-    stopped_as: TrajectoryState | None = None
-
-    def follow(task_id: str) -> None:
-        sink = LiveTrajectoryChunks(store, prefix_key, turn_id)
-        sinks.append(sink)
-        followers.append(
-            asyncio.create_task(
-                follow_trajectory(
-                    endpoint, task_id, sink, poll_interval_seconds=poll_interval_seconds, stop=stop
-                )
-            )
-        )
+    raises, the follower is stopped at once, since the agent may be gone. Either way, a turn whose
+    end the follower did not read is marked ended in the state the body reported, else ``canceled``
+    for a cancelled step or ``failed``, so readers do not wait on it. A follower's own failure is
+    logged and never fails the turn."""
+    turn = LiveTurn(endpoint, store, prefix_key, turn_id, poll_interval_seconds)
+    stopped_as = TrajectoryState.FAILED
 
     try:
-        yield follow
-        stop.set()
-        if followers:
-            _, draining = await asyncio.wait(followers, timeout=_DRAIN_SECONDS)
+        yield turn
+        turn.stop.set()
+        if turn.followers:
+            _, draining = await asyncio.wait(turn.followers, timeout=_DRAIN_SECONDS)
             if draining:
                 logger.warning(
                     "Live trajectory of turn %s did not finish draining in %ds (continuing)",
@@ -119,22 +143,19 @@ async def following_live_trajectory(
     except asyncio.CancelledError:
         stopped_as = TrajectoryState.CANCELED
         raise
-    except BaseException:
-        stopped_as = TrajectoryState.FAILED
-        raise
     finally:
-        stop.set()
-        for follower in followers:
+        turn.stop.set()
+        for follower in turn.followers:
             follower.cancel()
-        if followers:
-            await asyncio.wait(followers)
-        for follower in followers:
+        if turn.followers:
+            await asyncio.wait(turn.followers)
+        for follower in turn.followers:
             if not follower.cancelled() and follower.exception() is not None:
                 logger.warning(
                     "Live trajectory of turn %s stopped (continuing): %r", turn_id, follower.exception()
                 )
-        if stopped_as is not None and sinks:
-            await _mark_ended(sinks[-1], stopped_as, turn_id)
+        if turn.sinks:
+            await _mark_ended(turn.sinks[-1], turn.ended_as or stopped_as, turn_id)
 
 
 async def _mark_ended(sink: LiveTrajectoryChunks, state: TrajectoryState, turn_id: str) -> None:
