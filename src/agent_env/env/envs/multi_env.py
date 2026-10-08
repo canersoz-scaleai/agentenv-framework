@@ -609,6 +609,7 @@ class MultiEnv(Env):
             gateway_mode=self._gateway_mode,
             state_provider=gw._state_provider,  # local-only, set above
             state_instance=gw._state_instance,
+            host_port=self._sandbox.host_port,
             host_ips=self._sandbox.host_ips,
             extra_hosts=self._sandbox.extra_hosts,
             mcp_server_name=self._mcp_server_name or self.name,
@@ -654,7 +655,7 @@ COMPOSE_EOF'''
         await self._sandbox.exec_script(
             f"cd {GATEWAY_APP_DIR} && docker compose up -d --force-recreate {svc_list}"
         )
-        await gw._wait_for_gateway(self._sandbox, AGENT_ENV_GATEWAY_MCP_PORT)
+        await gw._wait_for_gateway(self._sandbox, self._sandbox.host_port(AGENT_ENV_GATEWAY_MCP_PORT))
 
         # Install changelog triggers for each service
         for name in environment_names:
