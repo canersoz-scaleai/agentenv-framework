@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 
 import pytest
@@ -24,12 +25,14 @@ from agentenv_protocol.a2a_agent import (
     TaskTrajectoryRequest,
     TrajectoryLog,
     TrajectoryState,
+    Uploaded,
     a2a_agent,
     build_registry,
     card_request_accepts,
     enable,
     extension,
 )
+from agentenv_protocol.a2a_agent import framework
 from agentenv_protocol.a2a_agent._trajectory_log import TaskTrajectories
 from agentenv_protocol.a2a_agent.framework import _SdkServices
 from agentenv_protocol.a2a_agent.tasks import v1 as tasks_v1
@@ -552,3 +555,68 @@ def test_a_context_read_keeps_the_format_while_a_new_turn_is_pending() -> None:
         TrajectoryState.PENDING,
         "test-events/1",
     )
+
+
+# Events shaped like a CLI's: nested objects, non-ASCII and line-separator text, floats, nulls.
+_NATIVE_EVENTS = [
+    {"type": "system", "subtype": "init", "tools": ["Read", "mcp__db__query"], "cwd": "/app"},
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": "Prüfe die Daten — ✓ a\u2028b"}]}},
+    {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok", "is_error": False}]}},
+    {"type": "result", "subtype": "success", "result": "done", "total_cost_usd": 0.0123, "usage": None},
+]
+
+
+def test_the_log_is_byte_identical_to_the_native_trajectory_it_replaces(monkeypatch):
+    """An agent that appends its events and one that returns them as a native trajectory answer the
+    task read with the same trajectory and upload the same bytes, so porting an agent to the log does
+    not change its final trajectory."""
+
+    @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1),))
+    class Native(AgentEnvAgent):
+        async def run(self, request: TaskRequest) -> TaskResult:
+            return (
+                TaskResult.builder()
+                .succeeded()
+                .add_text("done")
+                .native_trajectory(format="test-events/1", payload=_NATIVE_EVENTS)
+                .build()
+            )
+
+    @a2a_agent(identity=_IDENTITY, extensions=(enable(TRAJECTORY_V1, live=True),))
+    class Live(AgentEnvAgent):
+        async def run(self, request: TaskRequest) -> TaskResult:
+            request.trajectory.set_format("test-events/1")
+            for event in _NATIVE_EVENTS:
+                request.trajectory.append(event)
+            return TaskResult.text("done")
+
+    uploaded: list[bytes] = []
+
+    async def capture_upload(_target, body: bytes):
+        uploaded.append(body)
+        return Uploaded(size_bytes=len(body))
+
+    monkeypatch.setattr(framework, "upload", capture_upload)
+    grant = {
+        "media_type": "application/json",
+        "max_bytes": 1_000_000,
+        "write": {
+            "kind": "http-put",
+            "url": "https://objects.example.test/write",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        },
+    }
+    inline: list[Any] = []
+    for agent in (Native(), Live()):
+        with TestClient(agent.create_app()) as client:
+            task_id = _send(client, "go", "message-1")
+            assert _within(5, lambda: _task_state(client, task_id) == "completed")
+            inline.append(_trajectory(client, {"task_id": task_id}).json())
+            response = _trajectory(client, {"task_id": task_id, "objects": {"trajectory": grant}})
+            assert response.status_code == 200, response.text
+
+    assert inline[0] == inline[1] == {"trajectory": _NATIVE_EVENTS}
+    assert uploaded[0] == uploaded[1]
+    assert json.loads(uploaded[1]) == _NATIVE_EVENTS
