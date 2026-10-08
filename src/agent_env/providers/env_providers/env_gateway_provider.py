@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TRAJECTORY_READ_ATTEMPTS = 3
+
 # MCP server health-check budget. Some servers wait on an upstream before they bind; a server
 # that is up passes its first probe, so the long start period only delays failing a broken one.
 MCP_HC_RETRIES = 30
@@ -760,12 +762,7 @@ COMPOSE_EOF'''
 
         # Print gateway logs for debugging
         logger.info("Gateway logs:")
-        gateway_container_id = await self._get_container_id(sandbox, GATEWAY_SERVICE_NAME)
-        if gateway_container_id:
-            exit_code, logs, stderr = await sandbox.exec_with_output( "sudo", "docker", "logs", gateway_container_id)
-            logger.info(f"  stdout:\n{logs}")
-            if stderr:
-                logger.info(f"  stderr:\n{stderr}")
+        await self._log_service(sandbox, GATEWAY_SERVICE_NAME)
         if not gateway_ready:
             raise RuntimeError("Gateway did not become ready in time")
 
@@ -775,13 +772,8 @@ COMPOSE_EOF'''
             if self._needs_local_postgres else []
         )
         for name in sidecar_names:
-            container_id = await self._get_container_id(sandbox, name)
-            if container_id:
-                exit_code, logs, stderr = await sandbox.exec_with_output("sudo", "docker", "logs", container_id)
-                logger.info(f"{name} logs:\n  stdout:\n{logs}")
-                if stderr:
-                    logger.info(f"  stderr:\n{stderr}")
-            else:
+            logger.info(f"{name} logs:")
+            if not await self._log_service(sandbox, name):
                 logger.warning(f"{name} container not found")
 
         gateway_url = sandbox.tunnel_urls.get(gateway_port)
@@ -992,25 +984,58 @@ COMPOSE_EOF'''
         return False
 
     async def read_trajectory(self, sandbox: VmSandbox) -> list[dict]:
-        """Read trajectory JSONL from gateway container."""
+        """Read trajectory JSONL from gateway container. A read whose exec transport failed (exit -1) may
+        hold only part of the history, so it is retried and then raised, never parsed."""
         container_id = await self._get_container_id(sandbox, GATEWAY_SERVICE_NAME)
         if not container_id:
             return []
 
-        exit_code, stdout, stderr = await sandbox.exec_with_output(
-            "sudo", "docker", "exec", container_id, "cat", "/var/log/agentenv/trajectory.jsonl"
-        )
+        for attempt in range(_TRAJECTORY_READ_ATTEMPTS):
+            exit_code, stdout, stderr = await sandbox.exec_with_output(
+                "sudo", "docker", "exec", container_id, "cat", "/var/log/agentenv/trajectory.jsonl"
+            )
+            if exit_code != -1:
+                break
+            logger.warning(f"Trajectory read lost its exec transport (attempt {attempt + 1}): {stderr[-200:]}")
+        else:
+            raise RuntimeError(f"Could not read the gateway trajectory: exec transport failed {_TRAJECTORY_READ_ATTEMPTS} times")
         events = []
         for line in stdout.strip().split("\n"):
             if line:
                 events.append(json.loads(line))
         return events
 
+    async def _log_service(self, sandbox: VmSandbox, compose_service: str) -> bool:
+        """Log a compose service's container output; False when it has no container. Diagnostics only, so
+        a lookup or ``docker logs`` that fails is reported as a warning, never raised into the deploy."""
+        try:
+            container_id = await self._get_container_id(sandbox, compose_service)
+            if not container_id:
+                return False
+            exit_code, logs, stderr = await sandbox.exec_with_output("sudo", "docker", "logs", container_id)
+        except Exception as e:
+            logger.warning(f"Skipping {compose_service} logs: {e}")
+            return True
+        if exit_code != 0:
+            logger.warning(f"Skipping {compose_service} logs: docker logs exited {exit_code}: {stderr.strip()[-500:]}")
+            return True
+        logger.info(f"  stdout:\n{logs}")
+        if stderr:
+            logger.info(f"  stderr:\n{stderr}")
+        return True
+
     async def _get_container_id(self, sandbox: VmSandbox, compose_service: str) -> str | None:
-        """Get container ID for a docker-compose service (including exited containers)."""
-        exit_code, stdout, stderr = await sandbox.exec_with_output(
-            "sudo", "docker", "compose", "-f", DOCKER_COMPOSE_PATH, "ps", "-a", "-q", compose_service
-        )
+        """Get container ID for a docker-compose service (including exited containers). A lookup whose
+        exec transport failed (exit -1) is retried, then raised: it can't tell "no container" apart."""
+        for attempt in range(_TRAJECTORY_READ_ATTEMPTS):
+            exit_code, stdout, stderr = await sandbox.exec_with_output(
+                "sudo", "docker", "compose", "-f", DOCKER_COMPOSE_PATH, "ps", "-a", "-q", compose_service
+            )
+            if exit_code != -1:
+                break
+            logger.warning(f"Container lookup for {compose_service} lost its exec transport (attempt {attempt + 1}): {stderr[-200:]}")
+        else:
+            raise RuntimeError(f"Could not look up the {compose_service} container: exec transport failed {_TRAJECTORY_READ_ATTEMPTS} times")
         container_id = stdout.strip()
         return container_id if container_id else None
 
