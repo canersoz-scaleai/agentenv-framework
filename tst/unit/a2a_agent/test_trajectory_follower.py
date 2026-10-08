@@ -180,17 +180,35 @@ async def test_a_failing_write_is_retried_then_raised(monkeypatch, tmp_path):
     assert len(attempts) == live_trajectory._WRITE_ATTEMPTS
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error", [RuntimeError("turn failed"), asyncio.CancelledError()])
-async def test_a_failed_turn_stops_its_follower_without_draining(monkeypatch, tmp_path, error):
-    """An agent that never ends: only a drain would keep the follower reading."""
+def _agent_answering(monkeypatch, *pages: dict) -> None:
+    """Every httpx client reaches an agent that answers each cursor read with the next page, then
+    keeps answering with the last one."""
+    answers = list(pages)
+
+    def answer(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=answers.pop(0) if len(answers) > 1 else answers[0])
+
     monkeypatch.setattr(
         httpx,
         "AsyncClient",
-        lambda *a, real=httpx.AsyncClient, **kw: real(
-            *a, transport=httpx.MockTransport(lambda r: httpx.Response(200, json=_page(0, [], "running"))), **kw
-        ),
+        lambda *a, real=httpx.AsyncClient, **kw: real(*a, transport=httpx.MockTransport(answer), **kw),
     )
+
+
+def _end(store: LocalFilesystemObjectStore) -> dict:
+    return json.loads(store.get(store.object_url("prefix/turn/live/end.json")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "state"),
+    [(RuntimeError("turn failed"), "failed"), (asyncio.CancelledError(), "canceled")],
+)
+async def test_a_failed_turn_stops_its_follower_without_draining_and_marks_it_ended(
+    monkeypatch, tmp_path, error, state
+):
+    """An agent that never ends: only a drain would keep the follower reading."""
+    _agent_answering(monkeypatch, _page(0, [], "running"))
     store = LocalFilesystemObjectStore(str(tmp_path))
     started = time.monotonic()
 
@@ -203,4 +221,41 @@ async def test_a_failed_turn_stops_its_follower_without_draining(monkeypatch, tm
             raise error
 
     assert time.monotonic() - started < 2
-    assert store.list("prefix/") == []
+    assert store.list("prefix/") == ["prefix/turn/live/end.json"]
+    assert _end(store) == {"state": state, "next": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_is_marked_ended_after_the_events_it_stored(monkeypatch, tmp_path):
+    _agent_answering(monkeypatch, _page(0, [{"i": 0}, {"i": 1}], "running"), _page(2, [], "running"))
+    store = LocalFilesystemObjectStore(str(tmp_path))
+
+    with pytest.raises(asyncio.CancelledError):
+        async with following_live_trajectory(
+            _ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0
+        ) as on_sent:
+            on_sent("task-1")
+            async with asyncio.timeout(5):
+                while "prefix/turn/live/00000000-00000002.jsonl" not in store.list("prefix/"):
+                    await asyncio.sleep(0.01)
+            raise asyncio.CancelledError()
+
+    assert _end(store) == {"state": "canceled", "next": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_the_follower_saw_end_keeps_its_state(monkeypatch, tmp_path):
+    _agent_answering(monkeypatch, _page(0, [{"i": 0}], "completed"))
+    store = LocalFilesystemObjectStore(str(tmp_path))
+
+    with pytest.raises(RuntimeError):
+        async with following_live_trajectory(
+            _ENDPOINT, store, "prefix/", "turn", poll_interval_seconds=0
+        ) as on_sent:
+            on_sent("task-1")
+            async with asyncio.timeout(5):
+                while "prefix/turn/live/end.json" not in store.list("prefix/"):
+                    await asyncio.sleep(0.01)
+            raise RuntimeError("the step failed after the turn ended")
+
+    assert _end(store) == {"state": "completed", "next": 1}
