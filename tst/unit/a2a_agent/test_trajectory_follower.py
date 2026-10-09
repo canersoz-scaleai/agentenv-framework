@@ -15,6 +15,7 @@ from agent_env.store.object_store import LocalFilesystemObjectStore
 from agent_env.task_step.snapshot_utils import live_trajectory
 from agent_env.task_step.snapshot_utils.live_trajectory import (
     LiveTrajectoryChunks,
+    LiveTurns,
     following_live_trajectory,
 )
 
@@ -303,3 +304,52 @@ async def test_a_reported_task_state_ends_the_turn_as_its_trajectory_state(monke
         turn.ended(task_state)
 
     assert _end(store) == {"state": state, "next": 0}
+
+
+def _next(store: LocalFilesystemObjectStore, turn: str) -> dict:
+    return json.loads(store.get(store.object_url(f"prefix/{turn}/live/next.json")))
+
+
+@pytest.mark.asyncio
+async def test_each_turn_names_the_next_and_the_last_is_marked_last(monkeypatch, tmp_path):
+    _agent_answering(monkeypatch, _page(0, [{"i": 0}], "completed"))
+    store = LocalFilesystemObjectStore(str(tmp_path))
+    turns = LiveTurns(_ENDPOINT, store, "prefix/", poll_interval_seconds=0)
+
+    for turn_id in ("turn-1", "turn-2"):
+        async with turns.following(turn_id) as turn:
+            turn.follow(f"task-{turn_id}")
+            await _until_stored(store, f"prefix/{turn_id}/live/end.json")
+            turn.ended("completed")
+    assert "prefix/turn-2/live/next.json" not in store.list("prefix/")
+    await turns.end()
+
+    assert _next(store, "turn-1") == {"turn": "turn-2"}
+    assert _next(store, "turn-2") == {"turn": None}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_never_sent_is_not_linked_and_the_last_sent_is_marked_last(monkeypatch, tmp_path):
+    _agent_answering(monkeypatch, _page(0, [{"i": 0}], "completed"))
+    store = LocalFilesystemObjectStore(str(tmp_path))
+    turns = LiveTurns(_ENDPOINT, store, "prefix/", poll_interval_seconds=0)
+    async with turns.following("turn-1") as turn:
+        turn.follow("task-1")
+        turn.ended("completed")
+
+    with pytest.raises(RuntimeError):
+        async with turns.following("turn-2"):
+            raise RuntimeError("the message could not be sent")
+    await turns.end()
+
+    assert _next(store, "turn-1") == {"turn": None}
+    assert not any(key.startswith("prefix/turn-2/") for key in store.list("prefix/"))
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_sent_no_turn_marks_none(tmp_path):
+    store = LocalFilesystemObjectStore(str(tmp_path))
+
+    await LiveTurns(_ENDPOINT, store, "prefix/", poll_interval_seconds=0).end()
+
+    assert store.list("prefix/") == []

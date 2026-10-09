@@ -1,8 +1,8 @@
 """prompt_agent follows a deployed agent's trajectory while each turn runs and stores it in chunks, on the local
 defaults. The agents are the echo agent (tst/data/a2a_agent), which appends a step a second before its echo, so a
 turn runs for a few seconds; over a two-turn conversation with a user-sim, each turn is stored under its own prefix,
-in more than one chunk, and its chunks join to that turn's final trajectory. Needs Docker and a throwaway local
-registry."""
+in more than one chunk, and its chunks join to that turn's final trajectory; each turn names the one after it, and
+the last none. Needs Docker and a throwaway local registry."""
 
 import json
 import re
@@ -126,3 +126,5 @@ async def test_each_turn_is_stored_live_under_its_own_prefix_and_joins_to_its_fi
         assert [event for key in chunks for event in _json_lines(store, key)] == final
         assert json.loads(store.get(store.object_url(f"{live}meta.json"))) == {"format": "agentenv-echo-agent/v1"}
         assert json.loads(store.get(store.object_url(f"{live}end.json"))) == {"state": "completed", "next": len(final)}
+    links = [json.loads(store.get(store.object_url(f"{prefix_key}{turn}/live/next.json"))) for turn in turns]
+    assert links == [{"turn": turns[1]}, {"turn": None}]

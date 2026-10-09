@@ -117,6 +117,7 @@ async def test_a_live_turn_is_stored_in_chunks_while_it_runs(monkeypatch, tmp_pa
         "state": "completed",
         "next": len(_EVENTS + _MORE),
     }
+    assert json.loads(run.store.get(run.store.object_url(f"{live}next.json"))) == {"turn": None}
 
 
 @pytest.mark.asyncio
@@ -132,11 +133,28 @@ async def test_a_turn_whose_follower_stopped_early_is_marked_ended_in_the_turns_
     final_key = run.store.get_object_key(result.prompt_responses[-1].agent_trajectory_s3_uri)
     turn_id = final_key.removeprefix(f"{_PREFIX}trajectory-").removesuffix(".json")
     end_key = f"{_PREFIX}{turn_id}/live/end.json"
-    assert sorted(run.store.list(_PREFIX)) == sorted([final_key, end_key])
+    next_key = f"{_PREFIX}{turn_id}/live/next.json"
+    assert sorted(run.store.list(_PREFIX)) == sorted([final_key, end_key, next_key])
     assert json.loads(run.store.get(run.store.object_url(end_key))) == {
         "state": "completed",
         "next": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_fails_after_a_turn_marks_that_turn_last(monkeypatch, tmp_path):
+    run = _Run(monkeypatch, tmp_path, live=True, wait_for_chunk=False)
+
+    def unavailable(*_args, **_kwargs) -> None:
+        raise RuntimeError("conversation store unavailable")
+
+    monkeypatch.setattr(pa.conversation_store, "complete_a2a_task", unavailable)
+
+    with pytest.raises(RuntimeError, match="conversation store unavailable"):
+        await run.execute(run.step(live_trajectory=True))
+
+    (next_key,) = [key for key in run.store.list(_PREFIX) if key.endswith("/live/next.json")]
+    assert json.loads(run.store.get(run.store.object_url(next_key))) == {"turn": None}
 
 
 @pytest.mark.asyncio
