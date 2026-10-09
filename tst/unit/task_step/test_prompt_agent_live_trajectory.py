@@ -100,7 +100,7 @@ async def test_a_live_turn_is_stored_in_chunks_while_it_runs(monkeypatch, tmp_pa
 
     result = await run.execute(run.step(live_trajectory=True))
 
-    final_url = result.prompt_responses[-1].agent_trajectory_s3_uri
+    final_url = result.prompt_responses[-1].agent_trajectory_object_url
     turn_id = run.store.get_object_key(final_url).removeprefix(f"{_PREFIX}trajectory-").removesuffix(".json")
     live = f"{_PREFIX}{turn_id}/live/"
     chunks = _chunk_keys(run.store)
@@ -129,7 +129,7 @@ async def test_a_turn_whose_follower_stopped_early_is_marked_ended_in_the_turns_
 
     result = await run.execute(run.step(live_trajectory=True))
 
-    final_key = run.store.get_object_key(result.prompt_responses[-1].agent_trajectory_s3_uri)
+    final_key = run.store.get_object_key(result.prompt_responses[-1].agent_trajectory_object_url)
     turn_id = final_key.removeprefix(f"{_PREFIX}trajectory-").removesuffix(".json")
     end_key = f"{_PREFIX}{turn_id}/live/end.json"
     assert sorted(run.store.list(_PREFIX)) == sorted([final_key, end_key])
@@ -147,7 +147,7 @@ async def test_without_live_trajectory_nothing_is_followed(monkeypatch, tmp_path
 
     assert run.cursor_reads == []
     assert _chunk_keys(run.store) == []
-    assert json.loads(run.store.get(result.prompt_responses[-1].agent_trajectory_s3_uri)) == _EVENTS + _MORE
+    assert json.loads(run.store.get(result.prompt_responses[-1].agent_trajectory_object_url)) == _EVENTS + _MORE
 
 
 @pytest.mark.asyncio
@@ -169,7 +169,7 @@ async def test_an_agent_without_the_live_read_is_not_followed(monkeypatch, tmp_p
 
     assert run.cursor_reads == []
     assert _chunk_keys(run.store) == []
-    assert json.loads(run.store.get(result.prompt_responses[-1].agent_trajectory_s3_uri)) == _EVENTS + _MORE
+    assert json.loads(run.store.get(result.prompt_responses[-1].agent_trajectory_object_url)) == _EVENTS + _MORE
 
 
 def test_a_prefix_outside_the_store_is_not_followed(monkeypatch, tmp_path, caplog):
