@@ -22,7 +22,7 @@ from enum import Enum
 from typing import IO, TYPE_CHECKING, Any, AsyncIterator, Callable, Iterable, Optional
 
 from agent_env.config import get_config
-from agent_env.utils.deprecation import warn_deprecated
+from agent_env.store.image_store.oci_registry_credentials import registry_host_from_ref
 from agent_env.utils.paths import validate_relative_filename
 
 if TYPE_CHECKING:
@@ -146,6 +146,8 @@ class Sandbox(ABC):
     network_policy: NetworkPolicy | None = None
     # Host IPs published ports bind to; empty binds every interface.
     host_ips: tuple[str, ...] = ()
+    # ``name:address`` entries the containers started on this sandbox add to their hosts file.
+    extra_hosts: tuple[str, ...] = ()
 
     _VM_READY_TIMEOUT = 1200      # wait_for_vm wall-clock budget (s)
     _VM_READY_POLL_INTERVAL = 30  # sparse polling (s)
@@ -158,6 +160,11 @@ class Sandbox(ABC):
         deployments; container ports are unaffected either way.
         """
         return port
+
+    def scoped_name(self, name: str) -> str:
+        """The name a container, network, image or temp path a step calls ``name`` takes on this sandbox's
+        host: ``name`` itself on a host of its own. A backend whose sandboxes share a host overrides this."""
+        return name
 
     @abstractmethod
     async def terminate(self) -> None:
@@ -178,11 +185,6 @@ class Sandbox(ABC):
         """Write the object store's object at ``object_url`` into the agent process's filesystem at
         ``destination_path``."""
         raise NotImplementedError(f"{self.__class__.__name__} does not support write_file_from_object")
-
-    async def write_file_from_s3(self, s3_url: str, destination_path: str) -> None:
-        """Deprecated: ``write_file_from_object``."""
-        warn_deprecated("Sandbox.write_file_from_s3", "write_file_from_object", kind="method")
-        await self.write_file_from_object(s3_url, destination_path)
 
     async def write_file_from_url(self, url: str, destination_path: str) -> None:
         """Download an HTTP(S) URL into the agent process's filesystem at destination_path."""
@@ -277,10 +279,45 @@ class VmSandbox(Sandbox):
         )
 
     async def load_docker_images(self, artifacts: list) -> None:
-        """Load Docker images from DockerImageArtifacts into the sandbox in parallel."""
+        """Put each DockerImageArtifact's image on the VM: those with a tar.gz are loaded from it, in parallel, and the
+        rest are pulled by image name. An image no sandbox can get is refused before anything is loaded."""
         if not artifacts:
             return
+        if problems := [problem for artifact in artifacts if (problem := artifact.load_problem())]:
+            raise RuntimeError(f"Can't load images: {'; '.join(problems)}")
+        if tarballs := [artifact for artifact in artifacts if artifact.tar_gz_object_url]:
+            await self._load_tarballs(tarballs)
+        if pulled := [artifact.image_name for artifact in artifacts if not artifact.tar_gz_object_url]:
+            await self.pull_images(pulled)
+
+    async def _load_tarballs(self, artifacts: list) -> None:
+        """Load the images of ``artifacts``, each with a tar.gz, in parallel."""
         await self._load_docker_images(artifacts, await self._signed_image_urls(artifacts))
+
+    async def pull_images(self, image_names: list[str]) -> None:
+        """``docker pull`` each of ``image_names``, concurrently, after logging in to each registry the image store
+        holds credentials for: once per registry, since minting a login can be a network round trip. The first pull
+        to fail cancels the rest, since one that stalls would otherwise hold the failure back; the command a cancelled
+        exec started keeps running on the VM until it ends or the VM does. A network policy restricting egress isn't
+        widened for them: it must allow the registries itself."""
+        image_names = list(dict.fromkeys(image_names))
+        store = get_config().get_image_store()
+        one_per_registry = {registry_host_from_ref(image_name): image_name for image_name in reversed(image_names)}
+        for image_name in one_per_registry.values():
+            auth = await asyncio.to_thread(store.auth, image_name)
+            if auth is not None:
+                await self.exec_script(
+                    f"echo {shlex.quote(auth.password)} | docker login "
+                    f"--username {shlex.quote(auth.username)} --password-stdin {shlex.quote(auth.registry)}"
+                )
+        pulls = [asyncio.ensure_future(_pull(self, image_name)) for image_name in image_names]
+        try:
+            await asyncio.gather(*pulls)
+        except BaseException:
+            for pull in pulls:
+                pull.cancel()
+            await asyncio.gather(*pulls, return_exceptions=True)
+            raise
 
     @staticmethod
     async def _signed_image_urls(artifacts: list) -> list[str | None]:
@@ -337,11 +374,6 @@ class VmSandbox(Sandbox):
     async def load_object_file(self, object_url: str, destination_path: str) -> None:
         """Download the object store's object at ``object_url`` onto the VM host at ``destination_path``."""
         await self._download_object_to_vm(object_url, destination_path)
-
-    async def load_s3_file(self, s3_url: str, destination_path: str) -> None:
-        """Deprecated: ``load_object_file``."""
-        warn_deprecated("VmSandbox.load_s3_file", "load_object_file", kind="method")
-        await self.load_object_file(s3_url, destination_path)
 
     async def _download_object_to_vm(self, object_url: str, vm_path: str) -> None:
         """Place object_url onto the VM host at vm_path, backend-agnostically."""
@@ -446,6 +478,19 @@ class VmSandbox(Sandbox):
 def port_bindings(host_ips: Iterable[str], host_port: int, container_port: int) -> list[str]:
     """Docker publish specs for one port: one per host IP, or a bare one (every interface) when there are none."""
     return [f"{ip}:{host_port}:{container_port}" for ip in host_ips] or [f"{host_port}:{container_port}"]
+
+
+async def _pull(sandbox: VmSandbox, image_name: str) -> None:
+    """``docker pull image_name``. An image built for linux/amd64 only has nothing for an arm64 host (an
+    Apple Silicon Mac running the local provider), so that pull falls back to the amd64 image, which the
+    host's Docker runs emulated."""
+    try:
+        await sandbox.exec_script(f"docker pull {shlex.quote(image_name)}")
+    except RuntimeError as e:
+        if "no matching manifest" not in str(e):
+            raise
+        logger.warning("%s has no image for this host's platform; pulling linux/amd64, which runs emulated", image_name)
+        await sandbox.exec_script(f"docker pull --platform linux/amd64 {shlex.quote(image_name)}")
 
 
 async def stage_files_into_container(sandbox: Sandbox, file_artifacts: dict[str, Any], destination: str) -> dict[str, str]:

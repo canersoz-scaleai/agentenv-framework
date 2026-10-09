@@ -17,6 +17,7 @@ from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.artifact.store import get_artifact_store
 from agent_env.bundle import BundleError, dry_run_bundle, run_bundle
 from agent_env.cli import cli
+from agent_env.config import get_config
 from agent_env.config.runtime import Config
 from agent_env.env import Env, GatewayEnv, MCPServerEnv, MultiEnv
 from agent_env.env import bootstrap
@@ -152,6 +153,50 @@ def test_a_sandbox_image_in_this_machines_registry_is_refused_on_another_provide
     ]
 
 
+# Images with no tarball, which a sandbox pulls by name
+
+PULLED = ("ghcr.io/team/img@sha256:" + "0" * 64, None)
+
+
+@pytest.mark.parametrize("sandbox", ["local", "modal", "modal_vm"])
+def test_an_image_with_no_tarball_is_pulled_so_it_runs_on_any_provider(bundle_dir, sandbox):
+    _agent("solver", PULLED)
+    _task(bundle_dir, [AGENT])
+
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
+
+
+NO_REGISTRY = ("img:v1", None)
+CANT_LOAD = ("on the {sandbox!r} sandbox provider, which can't load it: '{id}' v1 has no tar.gz, and its image name "
+             "'img:v1' doesn't name a registry to pull it from")
+
+
+@pytest.mark.parametrize("sandbox, refused", [("modal_vm", True), ("local", False), ("modal", False)])
+def test_an_agent_image_with_no_tarball_and_no_registry_is_refused_where_a_vm_loads_it(bundle_dir, sandbox, refused):
+    """The local and Modal providers run an agent in a container, by image name, whether or not it has a tar.gz."""
+    _agent("solver", NO_REGISTRY)
+    _task(bundle_dir, [AGENT])
+
+    if refused:
+        assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox=sandbox)) == [
+            "tasks/t.json: step 'agent': deploys agent 'solver''s image " + CANT_LOAD.format(sandbox=sandbox,
+                                                                                             id="solver-image")]
+    else:
+        assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox=sandbox).runs] == ["t"]
+
+
+def test_an_env_image_with_no_tarball_and_no_registry_is_refused_where_a_gateway_vm_loads_it(bundle_dir):
+    """The local provider's gateway is a VM, which loads the env's images; Modal's runs each server by image name."""
+    _env("crm", NO_REGISTRY)
+    _task(bundle_dir, [{"id": "env", "type": "deploy_env", "env_id": "crm"}])
+
+    assert _problems(lambda: dry_run_bundle(bundle_dir, sandbox="local")) == [
+        "tasks/t.json: step 'env': deploys env 'crm''s image 'crm-image' " + CANT_LOAD.format(sandbox="local",
+                                                                                              id="crm-image")]
+    _infra(REMOTE)
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal").runs] == ["t"]
+
+
 # What a provider can create
 
 
@@ -281,6 +326,17 @@ def test_a_step_that_names_no_agent_needs_the_default_in_the_store(bundle_dir, m
     dry_run_bundle(bundle_dir)
 
 
+def test_a_default_agent_the_store_cant_read_is_reported_not_raised(bundle_dir, monkeypatch):
+    monkeypatch.setattr("agent_env.config.runtime.Config.get_default_a2a_agent_id", lambda self: "house-agent")
+    get_config().get_document_store().insert("a2a_agents", {"id": "house-agent", "version": 1, "type": "a2a_agent"})
+    _task(bundle_dir, [{"id": "agent", "type": "deploy_agent", "env_ids": []}])
+
+    (problem,) = _problems(lambda: dry_run_bundle(bundle_dir))
+
+    assert problem.startswith("tasks/t.json: step 'agent': names no agent, so it deploys the default, 'house-agent', "
+                              "and agent 'house-agent' can't be read (KeyError:")
+
+
 def test_a_judge_the_task_deploys_itself_or_the_direct_llm_judge_needs_no_default_agent(bundle_dir, monkeypatch):
     monkeypatch.setattr("agent_env.config.runtime.Config.get_default_a2a_agent_id", lambda self: "house-agent")
     judge = {"type": "rubrics_verifier", "prompt_id": "p", "verifier_id": "v", "criteria": [{"id": "c", "description": "done"}]}
@@ -360,6 +416,20 @@ def test_a_gateway_deploy_on_another_provider_needs_infra_it_can_reach(bundle_di
                            "'modal_vm' sandbox provider, which can't reach it: localhost:5000/local/img:v1 is in a "
                            "registry on this machine; run it with --sandbox local")
     assert len(problems) == 4  # the gateway's image, and the service-db's three
+
+
+def test_infra_on_another_provider_with_no_tarball_and_no_registry_to_pull_it_from_is_refused(bundle_dir):
+    _env("crm", REMOTE)
+    _infra(("img:v1", None))
+    _task(bundle_dir, [{"id": "env", "type": "deploy_env", "env_id": "crm"}])
+
+    problems = _problems(lambda: dry_run_bundle(bundle_dir, sandbox="modal_vm"))
+
+    assert problems[0] == ("tasks/t.json: step 'env': deploys the gateway env 'default''s image 'gateway-default' "
+                           + CANT_LOAD.format(sandbox="modal_vm", id="gateway-default"))
+    assert len(problems) == 4  # the gateway's image, and the service-db's three
+    # Modal's container gateway runs the gateway by image name and swaps out service-db images the store doesn't hold
+    assert [entry.name for entry in dry_run_bundle(bundle_dir, sandbox="modal").runs] == ["t"]
 
 
 def test_a_problem_several_deploys_share_is_reported_once_naming_the_first(bundle_dir):

@@ -14,23 +14,23 @@ import time
 import pytest
 
 from agent_env.config import set_object_store
-from agent_env.store.object_store import S3ObjectStore
 from agent_env.task_step.context import PromptResponse, TaskStepContext
 from agent_env.task_step.snapshot_utils import agent_state_capture as mod
 from agent_env.task_step.snapshot_utils import snapshot_series as ps
 from agent_env.task_step.task_steps import prompt_agent as pa_mod
 from agent_env.task_step.task_steps.prompt_agent import PromptAgentTaskStep
+from tst.unit.store.fakes import FakeObjectStore
 
 from .capture_stubs import BUCKET, context
 
-TRAJ_PREFIX = f"s3://{BUCKET}/traj/"
+TRAJ_PREFIX = f"fake://{BUCKET}/traj/"
 
 
 @pytest.fixture(autouse=True)
-def _s3_store_backs_prefix_minting():
-    # Trajectory prefixes are minted by the configured object store; pin an S3 one so
-    # they stay s3://BUCKET/... instead of resolving a filesystem path under cwd.
-    set_object_store(S3ObjectStore(client=object(), bucket=BUCKET))
+def _store_backs_prefix_minting():
+    # Trajectory prefixes are minted by the configured object store; pin a fake one so
+    # they stay fake://BUCKET/... instead of resolving a filesystem path under cwd.
+    set_object_store(FakeObjectStore(root=BUCKET))
 INSTANCE_ID = "solve-run-0123456789abcdef"
 # The env universe a `_series()` capture versions into.
 SNAPSHOT_ID = f"{INSTANCE_ID}__snapshot-solve"
@@ -99,7 +99,7 @@ class _FakeWorkspace:
             await self.gate.wait()
         if self.fail_after is not None and self.calls > self.fail_after:
             raise RuntimeError("sidecar exploded")
-        prefix = f"s3://{BUCKET}/agent_snapshots/{artifact_id}/{self.calls}-abc/"
+        prefix = f"fake://{BUCKET}/agent_snapshots/{artifact_id}/{self.calls}-abc/"
         return mod.WorkspaceCapture(
             universe_id=artifact_id,
             universe_version=self.calls,
@@ -139,10 +139,10 @@ def _pending(series: ps.SnapshotSeries) -> list[dict]:
 @pytest.mark.asyncio
 async def test_object_mode_trajectory_is_not_uploaded_twice(monkeypatch):
     _install(monkeypatch)
-    direct_url = f"s3://{BUCKET}/prompt_agent_trajectories/direct.json"
+    direct_url = f"fake://{BUCKET}/prompt_agent_trajectories/direct.json"
 
     async def direct_trajectory(**kwargs):
-        assert kwargs["trajectory_output_prefix"].startswith(f"s3://{BUCKET}/")
+        assert kwargs["trajectory_output_prefix"].startswith(f"fake://{BUCKET}/")
         return mod.TrajectoryCapture(object_url=direct_url)
 
     def unexpected_upload(*args, **kwargs):
@@ -154,7 +154,7 @@ async def test_object_mode_trajectory_is_not_uploaded_twice(monkeypatch):
     row = await _series()._capture_never_raising(context(), is_final=False)
 
     assert row["capture_status"] == "ok"
-    assert row["trajectory_s3_uri"] == direct_url
+    assert row["trajectory_s3_uri"] == row["trajectory_object_url"] == direct_url
 
 
 async def _until(pred, timeout=2.0, what="condition"):
@@ -439,7 +439,7 @@ async def test_max_snapshots_bounds_interior_captures_but_reserves_the_final_one
     series = _series(interval_seconds=0.01, max_snapshots=2)
     ctx = context()
     ctx.prompt_responses.append(
-        PromptResponse(prompt_id="p1", response="ok", agent_trajectory_s3_uri="s3://b/t.json")
+        PromptResponse(prompt_id="p1", response="ok", agent_trajectory_object_url="s3://b/t.json")
     )
     series.start(ctx)
     await _until(
@@ -534,23 +534,23 @@ async def test_an_unsupported_trajectory_read_still_yields_a_gradable_row(monkey
     assert row["capture_status"] == "partial"
     assert row["capture_reason"] == "trajectory_context_unsupported"
     # Nulls are stripped on append, not here — this is the raw row.
-    assert row["bundle_object_url"] and row["trajectory_s3_uri"] is None
+    assert row["bundle_object_url"] and row["trajectory_s3_uri"] is row["trajectory_object_url"] is None
 
 
 @pytest.mark.asyncio
 async def test_the_final_row_reads_the_trajectory_cumulatively_like_the_others(monkeypatch):
-    """`PromptResponse.agent_trajectory_s3_uri` is only the LAST turn's, so using
+    """`PromptResponse.agent_trajectory_object_url` is only the LAST turn's, so using
     it here would make the final point narrower than its predecessors."""
     _install(monkeypatch)
     ctx = context()
     ctx.prompt_responses.append(
         PromptResponse(prompt_id="p1", response="done", a2a_context_id="cid-1",
-                       agent_trajectory_s3_uri="s3://b/last-turn-only.json")
+                       agent_trajectory_object_url="s3://b/last-turn-only.json")
     )
     await _series().finish(ctx)
 
     (row,) = _rows(ctx)
-    assert row["trajectory_s3_uri"] == f"{TRAJ_PREFIX}trajectory-x.json"
+    assert row["trajectory_s3_uri"] == row["trajectory_object_url"] == f"{TRAJ_PREFIX}trajectory-x.json"
     assert row["capture_status"] == "ok"
 
 
@@ -561,12 +561,12 @@ async def test_the_final_row_falls_back_to_the_recorded_uri(monkeypatch):
     ctx = context()
     ctx.prompt_responses.append(
         PromptResponse(prompt_id="p1", response="done", a2a_context_id="cid-1",
-                       agent_trajectory_s3_uri="s3://b/t.json")
+                       agent_trajectory_object_url="s3://b/t.json")
     )
     await _series().finish(ctx)
 
     (row,) = _rows(ctx)
-    assert row["trajectory_s3_uri"] == "s3://b/t.json"
+    assert row["trajectory_s3_uri"] == row["trajectory_object_url"] == "s3://b/t.json"
     assert row["capture_status"] == "partial"
     assert row["capture_reason"] == "trajectory_session_missing"
 
@@ -579,12 +579,12 @@ async def test_a_sibling_attempts_trajectory_is_never_borrowed(monkeypatch):
     ctx = context()
     ctx.prompt_responses.append(
         PromptResponse(prompt_id="p1", response="old", a2a_context_id="cid-PREVIOUS",
-                       agent_trajectory_s3_uri="s3://b/previous-attempt.json")
+                       agent_trajectory_object_url="s3://b/previous-attempt.json")
     )
     await _series().finish(ctx)
 
     (row,) = _rows(ctx)
-    assert "trajectory_s3_uri" not in row, "matched on prompt_id alone, not the conversation"
+    assert {"trajectory_s3_uri", "trajectory_object_url"}.isdisjoint(row), "matched on prompt_id alone, not the conversation"
     assert row["capture_reason"] == "trajectory_session_missing; trajectory_missing"
 
 
@@ -614,7 +614,7 @@ async def test_the_reads_share_one_capture_budget(monkeypatch):
         await asyncio.sleep(0.1)
         return mod.WorkspaceCapture(
             universe_id="wsp", universe_version=1,
-            bundle_object_url=f"s3://{BUCKET}/b/", capture_prefix=f"s3://{BUCKET}/b/",
+            bundle_object_url=f"fake://{BUCKET}/b/", capture_prefix=f"fake://{BUCKET}/b/",
         )
 
     async def traj(**kwargs):
@@ -734,7 +734,7 @@ async def test_an_undeployed_env_id_is_a_reason_not_a_raise(monkeypatch):
     _install(monkeypatch)
     ctx = context()  # no deployed envs
     ctx.prompt_responses.append(
-        PromptResponse(prompt_id="p1", response="ok", agent_trajectory_s3_uri="s3://b/t.json")
+        PromptResponse(prompt_id="p1", response="ok", agent_trajectory_object_url="s3://b/t.json")
     )
     await _series(env_id="env-missing").finish(ctx)
 
@@ -836,7 +836,7 @@ async def test_teardown_outlasts_an_interior_capture_that_times_out(monkeypatch)
     ctx = context()
     ctx.prompt_responses.append(
         PromptResponse(prompt_id="p1", response="ok", a2a_context_id="cid-1",
-                       agent_trajectory_s3_uri="s3://b/t.json")
+                       agent_trajectory_object_url="s3://b/t.json")
     )
     series.start(ctx)
     await _until(lambda: series._lock.locked(), what="the interior capture")
@@ -1040,7 +1040,7 @@ async def test_execute_finishes_the_series_even_when_the_conversation_raises(mon
     monkeypatch.setattr(PromptAgentTaskStep, "_execute_conversation", exploding_conversation)
     ctx = context()
     ctx.prompt_responses.append(
-        PromptResponse(prompt_id=step.prompt_id, response="", agent_trajectory_s3_uri="s3://b/t")
+        PromptResponse(prompt_id=step.prompt_id, response="", agent_trajectory_object_url="s3://b/t")
     )
 
     # A long run that died is the most interesting point for a curve, so the

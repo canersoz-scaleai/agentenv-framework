@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from agent_env.artifact.artifact import Artifact
@@ -37,6 +39,9 @@ def vm(monkeypatch):
     calls: list[tuple] = []
 
     class _Vm:
+        def scoped_name(self, name):
+            return name
+
         async def exec_script(self, script, **kw):
             calls.append(("exec", script))
             return ""
@@ -50,6 +55,9 @@ def vm(monkeypatch):
 
         async def write_file_from_url(self, url, destination_path):  # pragma: no cover
             calls.append(("container_url", url, destination_path))
+
+        async def docker_cp(self, source, destination, *, remove_source=False):
+            calls.append(("cp", source, destination, remove_source))
 
     from agent_env.providers.sandbox_providers import sandbox_provider as sp_mod
 
@@ -164,6 +172,20 @@ class TestUrlsOntoVm:
         assert not [c for c in calls if c[0] == "container_url"]
         assert ctx.metadata["loaded_urls"][0]["sandbox_name"] == "mk"
 
+    @pytest.mark.asyncio
+    async def test_a_named_url_is_curled_to_its_filename(self, vm):
+        ctx, calls = vm
+        step = LoadArtifactTaskStep(
+            id="stage", version=None, sandbox_name="mk", destination_path="/app/seeds",
+            urls=[{"url": "https://files.example/objects/obj-4f9c2a", "filename": "repo.tar.gz"}],
+        )
+        ctx = await step.execute(ctx)
+
+        curls = [c[1] for c in calls if c[0] == "exec" and c[1].startswith("curl -fsSL")]
+        assert len(curls) == 1, curls
+        assert "https://files.example/objects/obj-4f9c2a" in curls[0] and curls[0].endswith("-o /app/seeds/repo.tar.gz")
+        assert ctx.metadata["loaded_urls"][0]["files"] == ["repo.tar.gz"]
+
 
 class TestContainerPathUnchanged:
     @pytest.mark.asyncio
@@ -191,6 +213,44 @@ class TestContainerPathUnchanged:
 
         assert seen == [{"container": "task-container", "destination": "/loaded"}]
         assert ctx.metadata["loaded_file_artifact_universes"][0]["container_name"] == "task-container"
+
+    @pytest.mark.asyncio
+    async def test_urls_go_into_the_named_container_not_the_agents(self, vm):
+        ctx, calls = vm
+        ctx.metadata["deployed_docker_containers"] = [{"container_name": "task-container", "sandbox_name": "mk"}]
+        step = LoadArtifactTaskStep(
+            id="stage", version=None, sandbox_name="mk", container_name="task-container",
+            urls=["https://example.com/data.csv"], destination_path="/work",
+        )
+
+        await step.execute(ctx)
+
+        [curl] = [c[1] for c in calls if c[0] == "exec" and c[1].startswith("curl ")]
+        assert ("cp", curl.rsplit(" -o ", 1)[1], "task-container:/work/data.csv", True) in calls
+        assert ("exec", "docker exec -u 0 task-container mkdir -p /work") in calls
+        assert not [c for c in calls if c[0] == "container_url"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    @pytest.mark.parametrize("failure", [RuntimeError("curl: (22) 404"), asyncio.CancelledError()], ids=["error", "cancel"])
+    async def test_a_failed_url_load_reports_its_own_error_and_cleans_up(self, cleanup_fails, failure):
+        scripts = []
+
+        class _Vm:
+            async def exec_script(self, script, **kw):
+                scripts.append(script)
+                if script.startswith("curl "):
+                    raise failure
+                if script.startswith("rm -f ") and cleanup_fails:
+                    raise RuntimeError("exec transport closed")
+                return ""
+
+        step = LoadArtifactTaskStep(id="s", version=None, sandbox_name="mk", container_name="c", urls=["https://x/y"])
+
+        with pytest.raises(type(failure)):
+            await step._load_url_into_container(_Vm(), "c", "https://x/y", "/work/y")
+
+        assert scripts[-1].startswith("rm -f /tmp/_load_url_")
 
 
 class TestUrlHelper:

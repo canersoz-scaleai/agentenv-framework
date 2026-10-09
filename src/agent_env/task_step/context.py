@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_env.env.env import DeployedEnv
+from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, host_url_for
+from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url
 
 _REDACTED_KEYS = {
     "litellm_api_key", "judge_litellm_api_key", "usersim_api_key", "remote_tokens", "cf_access_client_secret",
@@ -80,6 +82,17 @@ class DeployedAgent:
             on_host=bool(data.get("on_host", False)),
         )
 
+    def url_for(self, sandbox_type: str | None, *, on_host: bool = False) -> str:
+        """This agent's A2A URL as an agent on ``sandbox_type`` reaches it, in a container there or, ``on_host``, on
+        the sandbox's host. A local sandbox's host is this machine, which reaches the URL as it is. An agent outside
+        our sandboxes, a human say, is at a URL this machine reaches."""
+        url = self.a2a_url or self.api_url
+        if on_host and sandbox_type == LocalSandbox.type:
+            return url
+        if not self.sandbox_id:
+            return host_url_for(url, sandbox_type)
+        return reachable_url(url, from_sandbox_type=self.sandbox_type, to_sandbox_type=sandbox_type)
+
 
 @dataclass
 class DeployedSandbox:
@@ -110,19 +123,36 @@ class DeployedSandbox:
         )
 
 
+def dual_keyed(legacy: str, neutral: str, value: Any) -> dict[str, Any]:
+    """A renamed run-context key under both its names: readers on older versions read the legacy one."""
+    return {legacy: value, neutral: value}
+
+
+def read_dual_keyed(data: dict[str, Any], legacy: str, neutral: str) -> Any:
+    """A renamed run-context key, legacy name first while both are written: a raw-doc writer that knows only the
+    legacy name leaves the neutral one stale. A legacy key holding None falls through to the neutral one."""
+    value = data.get(legacy)
+    return value if value is not None else data.get(neutral)
+
+
+# (legacy, neutral) keys of the PromptResponse fields that were renamed. Stored documents and raw-doc readers use the
+# legacy keys, so to_dict writes each beside its neutral one and from_dict reads either.
+_PROMPT_RESPONSE_LEGACY_KEYS = (
+    ("agent_trajectory_s3_uri", "agent_trajectory_object_url"),
+    ("agent_trajectory_s3_prefix", "agent_trajectory_object_prefix"),
+    ("target_agent_per_turn_trajectory_s3_uris", "target_agent_per_turn_trajectory_object_urls"),
+)
+
+
 @dataclass
 class PromptResponse:
     prompt_id: str
     response: str
     prompt_text: str | None = None
-    agent_trajectory_s3_uri: str | None = None
-    agent_trajectory_s3_prefix: str | None = None
     agent_trajectory_file_path: str | None = None
-    target_agent_per_turn_trajectory_s3_uris: list[str | None] | None = None
     # A None entry means "identical to prompt_text" — the first turn of a
     # prompt-mode step is not stored twice.
     source_agent_per_turn_prompt_parts: list[list[dict] | None] | None = None
-    compact_trajectory_s3_uri: str | None = None
     tool_call_count: int | None = None
     model: str | None = None
     error_type: str | None = None
@@ -133,6 +163,17 @@ class PromptResponse:
     agent_name: str | None = None
     step_id: str | None = None
     structured_output: Any = None
+    agent_trajectory_object_url: str | None = None
+    agent_trajectory_object_prefix: str | None = None
+    target_agent_per_turn_trajectory_object_urls: list[str | None] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """The stored form: every field, plus the legacy key of each renamed one."""
+        data = dataclasses.asdict(self)
+        for legacy, neutral in _PROMPT_RESPONSE_LEGACY_KEYS:
+            value = data[neutral]
+            data[legacy] = list(value) if isinstance(value, list) else value
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> PromptResponse:
@@ -140,12 +181,15 @@ class PromptResponse:
             prompt_id=data["prompt_id"],
             response=data["response"],
             prompt_text=data.get("prompt_text"),
-            agent_trajectory_s3_uri=data.get("agent_trajectory_s3_uri"),
-            agent_trajectory_s3_prefix=data.get("agent_trajectory_s3_prefix"),
+            agent_trajectory_object_url=read_dual_keyed(data, "agent_trajectory_s3_uri", "agent_trajectory_object_url"),
+            agent_trajectory_object_prefix=read_dual_keyed(
+                data, "agent_trajectory_s3_prefix", "agent_trajectory_object_prefix"
+            ),
             agent_trajectory_file_path=data.get("agent_trajectory_file_path"),
-            target_agent_per_turn_trajectory_s3_uris=data.get("target_agent_per_turn_trajectory_s3_uris"),
+            target_agent_per_turn_trajectory_object_urls=read_dual_keyed(
+                data, "target_agent_per_turn_trajectory_s3_uris", "target_agent_per_turn_trajectory_object_urls"
+            ),
             source_agent_per_turn_prompt_parts=data.get("source_agent_per_turn_prompt_parts"),
-            compact_trajectory_s3_uri=data.get("compact_trajectory_s3_uri"),
             tool_call_count=data.get("tool_call_count"),
             model=data.get("model"),
             error_type=data.get("error_type"),
@@ -172,9 +216,15 @@ class TaskStepContext:
     agent_harness: str | None = None
     instance_id: str | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        """The stored form: ``asdict``, with each prompt response's legacy keys (``PromptResponse.to_dict``)."""
+        d = dataclasses.asdict(dataclasses.replace(self, prompt_responses=[]))
+        d["prompt_responses"] = [response.to_dict() for response in self.prompt_responses]
+        return d
+
     def to_safe_dict(self) -> dict[str, Any]:
         """Return a dict representation with sensitive keys recursively removed."""
-        d = dataclasses.asdict(self)
+        d = self.to_dict()
         if "metadata" in d:
             d["metadata"] = _strip_redacted_keys(d["metadata"])
         return d

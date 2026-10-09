@@ -30,7 +30,10 @@ pip install -e ./packages/agentenv-protocol -e '.[dev]'
 Both install the in-repo protocol package together with the dev extra: agent-env depends on it and
 the workspace copy is the one to develop against (`uv sync` does this through the uv workspace in
 `pyproject.toml`). `make install` is the pip route in one step. No cloud credentials are needed; the
-default stores are local.
+default stores are local. The cloud store backends need their extra, both in `dev`: `aws` (boto3) for
+S3, Secrets Manager, DynamoDB and ECR, `gcp` for the Google Cloud ones. Core must import without boto3: a
+store package re-exports an `aws` backend on first use, and code outside the backends imports boto3
+or one of them only where it is used.
 
 ## Commands
 
@@ -59,7 +62,17 @@ default stores are local.
   sandboxes for envs and agents. MongoDB, S3, Cloud Storage, ECR, AWS Secrets Manager, Google Cloud
   Secret Manager, Modal and E2B exist as implementations and are selected by config.
 - The model endpoint is unset until `[model] base_url` / `api_key` (or `LITELLM_BASE_URL` /
-  `LITELLM_API_KEY`) is configured.
+  `LITELLM_API_KEY`) is configured. A loopback URL handed into a `local` container (the model
+  endpoint, an agent, peer or gateway on this machine) becomes `host.docker.internal`. On Linux that
+  name is the Docker bridge address (`docker0`, usually `172.17.0.1`), not loopback, so a service on
+  this machine that local containers call, a model proxy say, has to listen there: bind it to the
+  bridge address and use that address in its URL. Binding `0.0.0.0` also works, but exposes the
+  service to the network.
+- A host-mode `install_agent` (no `container_name`) on a `local` sandbox runs the agent's
+  `install_commands_host` on this machine, with your privileges. Every command a local sandbox runs
+  carries `AGENTENV_SANDBOX=<sandbox id>`, and teardown stops the processes that carry it, then removes
+  what steps staged in `/tmp` under that id. Those processes are found through `/proc`, so on macOS
+  they keep running; files the install wrote elsewhere (`/opt`, packages) stay.
 - `[agents] default_a2a_agent_id`: the agent a `deploy_agent` step without an id deploys; built-in
   `a2a-default`, overridable by `configure(default_a2a_agent_id=...)`.
 - Secrets never live in the file: use `secret:KEY` or `env:NAME` references, resolved through
@@ -78,11 +91,11 @@ and deserialized through a registry.
 | Package | Contents |
 |---|---|
 | `env/` | `Env` base class: a subclass declares `type`, implements `from_dict` and `async deploy(...) -> DeployedEnv`, and may override `reset` and `load_file_artifact_universe`. Built-ins in `env/envs/`: `MCPServerEnv` (`mcp_server`), `MultiEnv` (`multi`, MCP servers plus websites), `ServiceDBEnv` (`service_db`, PostgreSQL), `WebsiteEnv` (`website`), `GatewayEnv` (`gateway_server`). `env/gateway/gateway.py` is the env-side gateway server, container-only code. |
-| `artifact/` | Immutable versioned artifacts; every `put()` creates a new version. The document goes to the document store, binary payloads to the object store. Built-ins: `CliArtifact` (`cli`), `FileArtifact` (`file`), `FileArtifactUniverse` (`file_artifact_universe`), `DockerImageArtifact` (`docker_image`), `EnvironmentArtifact` (`environment`; legacy `service`), `EnvironmentUniverseArtifact` (`environment_universe`; legacy `service_universe`), `SkillArtifact` (`skill`), `VMImageArtifact` (`vm_image`). |
+| `artifact/` | Immutable versioned artifacts; every `put()` creates a new version. The document goes to the document store, binary payloads to the object store. Built-ins: `CliArtifact` (`cli`), `FileArtifact` (`file`), `FileArtifactUniverse` (`file_artifact_universe`), `DockerImageArtifact` (`docker_image`), `EnvironmentArtifact` (`environment`; legacy `service`), `EnvironmentUniverseArtifact` (`environment_universe`; legacy `service_universe`), `SkillArtifact` (`skill`). A `DockerImageArtifact` holds a tar.gz of its image, or, written by `put_ref` (`--image-ref` on `env mcp-server put` and `a2a-agent put`), only a registry reference with its tag pinned to a digest, which sandboxes pull. |
 | `task/`, `task_step/` | A `Task` holds its `TaskStep`s inline; `Task.run()` executes them as a DAG. `depends_on` (None means all prior steps) gates a step, independent steps run concurrently, `fail_task_on_error` makes a failure fatal or tolerated, `retry_config` rolls a failed span back through the step journal and re-dispatches it. Built-in steps live in `task_step/task_steps/` (`deploy_env`, `deploy_agent`, `prompt_agent`, the verifiers under `verifiers/`, and more). |
 | `store/` | Four store ABCs with local and cloud implementations: `DocumentStore` (SQLite, MongoDB), `ObjectStore` (filesystem, S3, Cloud Storage), `ImageStore` (local OCI registry, ECR), `SecretStore` (env vars or file, AWS Secrets Manager, Google Cloud Secret Manager). `VersionedEntityStore` implements the shared versioned get/put logic, `QueryBuilder` is the immutable chained query API, `store/base.py` holds the error types. A new backend must pass the conformance kits in `tst/store/`. |
 | `config/` | The `Config` singleton (`get_config`, `configure`, `reset_config`) in `config/runtime.py`, file discovery in `config/loader.py`, and `load_impl`, which resolves `module:Class` pointers. `agent_env.store` re-exports the config names for compatibility. |
-| `providers/` | `providers/sandbox_providers/` holds the sandbox providers `local`, `modal`, `modal_vm`, `e2b`; `[sandbox] default` and `agent_default` accept a comma-separated fallback chain. `providers/env_providers/` holds the environment providers: `EnvironmentProvider` (an env's containers and state store) and `EnvironmentGatewayProvider`, which renders a docker-compose for the gateway and its MCP servers inside the sandbox; `providers/env_state/` holds env-state providers (`local_postgres` built in). |
+| `providers/` | `providers/sandbox_providers/` holds the sandbox providers `local`, `modal`, `modal_vm`, `e2b`, `sail_vm` (the `sail` extra); `[sandbox] default` and `agent_default` accept a comma-separated fallback chain. `providers/env_providers/` holds the environment providers: `EnvironmentProvider` (an env's containers and state store) and `EnvironmentGatewayProvider`, which renders a docker-compose for the gateway and its MCP servers inside the sandbox; `providers/env_state/` holds env-state providers (`local_postgres` built in). |
 | `a2a_agent/` | The `A2AAgent` entity (`a2a_agent`), its stores and the validator steps. The protocol package provides the agent-side framework. |
 | `runner/` | The `[runner]` seam: `Runner.submit()` returns `(run_id, instance_id)`; `LocalRunner` is built in. |
 | `explorer/` | Optional local web UI: `agent-env up`, needs the `explorer` extra, binds loopback `:8234`. |
@@ -137,14 +150,18 @@ orchestrators call it the same way. What callers rely on:
 - Every persisted or transmitted context snapshot passes through `TaskStepContext.to_safe_dict()`
   or the context-ops diff, which strip `_REDACTED_KEYS` (`task_step/context.py`);
   `regraft_redacted_keys` restores live values when a context is rebuilt from a stored document.
+  Both write each prompt response through `PromptResponse.to_dict()`, which adds the S3-named key
+  of every renamed trajectory field, since stored documents and raw-doc readers use them; serialize
+  a context with `TaskStepContext.to_dict()`, not `dataclasses.asdict`.
 - A run is resumable: pass a previously persisted `context`, a `start_step` and the existing
   `instance_id`; completed steps are seeded as SUCCESS.
 
 ## Tests
 
 - Tiers are by path. `tst/unit/` runs offline: `tst/unit/conftest.py` blocks IP sockets with
-  pytest-socket and AWS goes to moto, so anything that needs the network is either missing a mock or
-  belongs in `tst/integration/`. Opt out per test with `@pytest.mark.enable_socket`, or override the
+  pytest-socket, so anything that needs the network is either missing a mock or belongs in
+  `tst/integration/`. The AWS backends' tests live in `tst/unit/store/aws/` and run against moto or
+  stubbed clients, and the directory is skipped without the `aws` extra. Opt out per test with `@pytest.mark.enable_socket`, or override the
   `_disable_network` fixture in a closer conftest when a loopback server is the point.
 - `tst/integration/` needs Docker and the local registry on `:5000` and runs on the local default
   backends. Minutes-long tests (real image builds, sandbox VMs, gateways, agents) carry
@@ -175,8 +192,7 @@ skips for the allowed capabilities pass, and the fast job allows no skips under
 touches the plugin CLI, `agent_env/plugins`, the tier itself or the lockfile, and allows no skips; a
 `changes` job decides. `.github/workflows/plugin-api.yml` runs the `plugin-api` job on every pull
 request, title edits included, and on `main`: `.github/scripts/check_plugin_api.py` compares the
-plugin surface (its `BASES` and `USED`, which a unit test holds to the README "Plugin compatibility"
-list) between `HEAD^1` and `HEAD` with griffe, pinned in the `dev` extra, and fails on a break the
+plugin surface (its `BASES` and `USED`) between `HEAD^1` and `HEAD` with griffe, pinned in the `dev` extra, and fails on a break the
 title does not mark with `!`. `.github/workflows/clean-install.yml` runs the `clean-install` job on
 every pull request and on `main`: `.github/scripts/clean_install.py` builds both distributions as the
 release does, fails if the wheel leaves out a file tracked under `src/agent_env/examples` or a

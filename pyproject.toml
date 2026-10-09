@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentenv-framework"
-version = "0.9.1288"
+version = "0.9.1301"
 description = "SDK and CLI for building, deploying and running agent environments and the tasks that grade agents in them."
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,7 +30,6 @@ classifiers = [
 ]
 dependencies = [
     "agentenv-framework-protocol>=0.1.0",
-    "boto3>=1.35.0",
     "certifi>=2024.2.2",  # the public roots the local transfer CA's trust bundle carries
     "click>=8.0.0",
     "cryptography>=42",  # the local transfer CA
@@ -50,6 +49,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The AWS store backends (S3, Secrets Manager, DynamoDB, ECR), selected by impl pointer in config.toml.
+aws = [
+    "boto3>=1.35.0",
+    "botocore>=1.35.0",
+]
 # The local explorer / `agent-env up` (Part 5). Optional so a library or worker install
 # stays lean; `agent-env up` fails fast with an install hint when it is absent.
 explorer = [
@@ -64,8 +68,12 @@ gcp = [
     "google-cloud-storage>=3.0",
     "requests>=2.31",
 ]
+# The sail_vm sandbox provider (Sail Research Sailboxes), selected with --sandbox sail_vm.
+sail = [
+    "sail~=0.12.8",  # Sailbox exec/fs/listener/egress APIs validated against the 0.12 line
+]
 dev = [
-    "agentenv-framework[explorer,gcp]",      # so the explorer and GCP backend tests run in CI
+    "agentenv-framework[aws,explorer,gcp,sail]",  # so the AWS, explorer, GCP backend and Sail provider tests run in CI
     "griffelib==2.3.0",  # the plugin API check; exact, since what it reports as a break changes between releases
     "moto>=5.0.0",
     "psycopg2-binary>=2.9.0",  # the gateway server module's driver; outside its container only the tests import it

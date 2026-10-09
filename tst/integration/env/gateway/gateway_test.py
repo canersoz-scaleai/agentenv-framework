@@ -446,11 +446,17 @@ def agentenv_website_env() -> WebsiteEnv:
         id="modal_vm",
         marks=skip_without_remote_sandbox("modal_vm"),
     ),
+    pytest.param(
+        "sail_vm",
+        id="sail_vm",
+        marks=skip_without_remote_sandbox("sail_vm"),
+    ),
 ])
 def sandbox_provider(request):
     from agent_env.providers import (
         ModalSandboxProvider,
         ModalVmSandboxProvider,
+        build_sandbox_provider,
         reset_env_sandbox_provider,
         reset_sandbox_provider,
         set_env_sandbox_provider,
@@ -463,6 +469,9 @@ def sandbox_provider(request):
     elif request.param == "modal_vm":
         set_sandbox_provider(ModalVmSandboxProvider())
         set_env_sandbox_provider(ModalVmSandboxProvider())
+    elif request.param == "sail_vm":
+        set_sandbox_provider(build_sandbox_provider("sail_vm"))
+        set_env_sandbox_provider(build_sandbox_provider("sail_vm"))
     try:
         yield request.param
     finally:
@@ -966,7 +975,7 @@ async def test_gateway_with_single_mcp_server(mcp_server_envs, email_service_art
         assert cli_artifact.entrypoint == "bin/email"
         assert cli_artifact.env_id == email_env.id
         assert cli_artifact.env_version == email_env.version
-        assert cli_artifact.cli_object_url.startswith("s3://")
+        assert get_config().get_object_store_at(cli_artifact.cli_object_url).owns(cli_artifact.cli_object_url)
 
         universe = cli_artifact.get_cli_files()
         assert isinstance(universe, FileArtifactUniverse)

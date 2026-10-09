@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import functools
 import glob
+import json
 import logging
 import os
 import platform
@@ -20,8 +21,10 @@ import signal
 import socket
 import subprocess
 import tempfile
+from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from agent_env import config
@@ -42,6 +45,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The name a container on this machine reaches it by. Only Linux lacks it natively; on Rancher Desktop an explicit
+# mapping would point it at the VM.
+_HOST_ALIAS = "host.docker.internal"
+_EXTRA_HOSTS = (f"{_HOST_ALIAS}:host-gateway",) if platform.system() == "Linux" else ()
+
 _APP_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_./~})$-])/app(?=(?:/|:|[\s'\";)&|]|$))")
 _IN_CONTAINER_SCRIPT = re.compile(r"\s*(?:sudo\s+)?docker\s+exec\b")
 
@@ -55,6 +63,10 @@ def _runs_in_container(cmd: list[str]) -> bool:
 
 _REAP_SECONDS = 5
 
+# Every command a local sandbox runs carries this, set to the sandbox's id, and so does whatever the command starts, so
+# teardown can find a process left running on this machine, such as the agent a host-mode install started.
+_SANDBOX_ENV = "AGENTENV_SANDBOX"
+
 # Where a container finds the local transfer CA's trust files, and the variables that point TLS clients at them:
 # SSL_CERT_FILE replaces a client's roots, so it gets the public roots plus the CA; NODE_EXTRA_CA_CERTS adds.
 _TRUST_DIR = "/etc/agentenv"
@@ -67,6 +79,8 @@ LOCAL_TRUST_ENV = {
 # Marker dropped in the work dir when this sandbox runs a container, so a later get_sandbox()
 # (post-run teardown reconstructs the sandbox from disk) knows it owns that container.
 _CONTAINER_MODE_MARKER = ".agent-container-mode"
+# The sandbox's container port -> host port map, so a sandbox rebuilt from its id publishes and finds the same ports.
+_PORT_MAP_FILE = ".port-map.json"
 
 
 def _local_sandbox_root_path() -> Path:
@@ -116,6 +130,7 @@ class LocalSandbox(VmSandbox):
     """
 
     type = "local"
+    extra_hosts = _EXTRA_HOSTS
 
     def __init__(self, exposed_ports: list[int] | None = None, work_dir: Path | None = None, sandbox_id: str | None = None,
                  port_map: dict[int, int] | None = None):
@@ -169,7 +184,11 @@ class LocalSandbox(VmSandbox):
         host, so a fixed name (the VmSandbox default) would collide across concurrent deploys and
         make teardown ownership-blind. Deriving it from the sandbox id gives each deploy its own
         container and lets teardown remove only the one this sandbox created."""
-        return f"agent-{self.sandbox_id}"
+        return self.scoped_name("agent")
+
+    def scoped_name(self, name: str) -> str:
+        """``name`` made this sandbox's own: every local sandbox shares this machine's Docker and /tmp."""
+        return f"{name}-{self.sandbox_id}"
 
     @property
     def owns_container(self) -> bool:
@@ -200,8 +219,12 @@ class LocalSandbox(VmSandbox):
         newer one; and the compose-down is scoped to this sandbox's project via its work dir. Without
         this, local runs leak their containers/compose stacks, which squat host ports and block the
         next deploy. Prod backends override terminate() to tear the whole VM down.
+        Processes its commands left running on this machine are stopped first (on Linux; see ``_marked_pids``),
+        then, once none is left to run from it, what its steps staged in /tmp is removed.
         """
         try:
+            if await _stop_marked(self.sandbox_id):
+                await asyncio.to_thread(_remove_staged, self.sandbox_id)
             if self.mode == SANDBOX_MODE_VM and not self.owns_container:
                 await self._remove_labeled()
         finally:  # a container that wouldn't go must not keep the compose stack up
@@ -244,7 +267,8 @@ class LocalSandbox(VmSandbox):
         """Execute a command locally via subprocess.
 
         Strips 'sudo' and points /app at the local work directory, both as a path argument and
-        inside the script of a top-level ``bash -c``, unless the command runs in a container.
+        inside the script of a top-level ``bash -c``, unless the command runs in a container. The
+        command carries ``_SANDBOX_ENV``, so teardown can stop whatever it leaves running.
         Returns an object with .stdout, .stderr streams and .wait() method, matching the
         interface expected by exec_with_output().
         """
@@ -260,6 +284,7 @@ class LocalSandbox(VmSandbox):
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, _SANDBOX_ENV: self.sandbox_id},
         )
         return process
 
@@ -323,6 +348,44 @@ def _kill_tree(root: int) -> None:
             os.kill(pid, signal.SIGKILL)
 
 
+def _marked_pids(sandbox_id: str) -> list[int]:
+    """The processes carrying ``sandbox_id``'s ``_SANDBOX_ENV``. Read from /proc, so Linux only: macOS doesn't let
+    one process read another's environment, and finds none."""
+    marker = f"{_SANDBOX_ENV}={sandbox_id}".encode()
+    pids = []
+    for environ in glob.glob("/proc/[0-9]*/environ"):
+        with contextlib.suppress(OSError):  # gone, or another user's
+            if marker in Path(environ).read_bytes().split(b"\0"):
+                pids.append(int(environ.split("/")[2]))
+    return pids
+
+
+async def _stop_marked(sandbox_id: str) -> bool:
+    """Stop the processes ``sandbox_id``'s commands left running, which a real VM would take down with it: SIGTERM,
+    then SIGKILL for any still there a few seconds later. False if some are still running."""
+    if not (pids := await asyncio.to_thread(_marked_pids, sandbox_id)):
+        return True
+    logger.info("Stopping %d process(es) sandbox %s left running on this machine", len(pids), sandbox_id)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+        for _ in range(_REAP_SECONDS * 10):
+            await asyncio.sleep(0.1)
+            if not (pids := await asyncio.to_thread(_marked_pids, sandbox_id)):
+                return True
+    logger.warning("Processes %s that sandbox %s started are still running; keeping what it staged in /tmp",
+                   pids, sandbox_id)
+    return False
+
+
+def _remove_staged(sandbox_id: str) -> None:
+    """Remove what steps staged in /tmp for ``sandbox_id``, such as a host install's work dir, which a host agent may
+    run from until it is stopped. Steps name these with ``scoped_name``, so they end in the sandbox's id."""
+    for path in glob.glob(f"/tmp/*-{glob.escape(sandbox_id)}"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def local_grant_trust() -> Path | None:
     """The trust files a container on this host needs to use the configured object store's grants: the local
     transfer CA's, when the store is a local one that hands out grants; None otherwise."""
@@ -368,8 +431,7 @@ def remove_local_work_dir(sandbox_id: str) -> Path | None:
 class LocalSandboxProvider(SandboxProvider):
     """SandboxProvider that runs VM-style gateway deployments on local Docker."""
 
-    # Only Linux lacks a native host.docker.internal; on Rancher Desktop this mapping would point it at the VM.
-    EXTRA_CONTAINER_RUN_ARGS = "--add-host host.docker.internal:host-gateway" if platform.system() == "Linux" else ""
+    EXTRA_CONTAINER_RUN_ARGS = " ".join(f"--add-host {entry}" for entry in _EXTRA_HOSTS)
 
     async def create_vm(
         self,
@@ -391,6 +453,7 @@ class LocalSandboxProvider(SandboxProvider):
         sandbox = LocalSandbox(
             port_map={port: _free_host_port() for port in (exposed_ports or [])},
         )
+        (sandbox.work_dir / _PORT_MAP_FILE).write_text(json.dumps(sandbox._port_map))
         sandbox.network_policy = self.effective_network_policy(network_policy)
         return sandbox
 
@@ -479,8 +542,10 @@ class LocalSandboxProvider(SandboxProvider):
         work_dir = LocalSandbox.find_work_dir(sandbox_id)
         if work_dir is None:
             raise RuntimeError(f"Local sandbox work directory not found for sandbox_id={sandbox_id!r}")
+        port_map = work_dir / _PORT_MAP_FILE
+        ports = {int(c): h for c, h in json.loads(port_map.read_text()).items()} if port_map.exists() else None
         # VM mode even for a container it owns: exec runs on this host, so steps must `docker exec` into it.
-        return LocalSandbox(sandbox_id=sandbox_id, work_dir=work_dir)
+        return LocalSandbox(sandbox_id=sandbox_id, work_dir=work_dir, port_map=ports)
 
     @classmethod
     def shares_network_with(cls, sandbox_type: Optional[str]) -> bool:
@@ -492,10 +557,34 @@ class LocalSandboxProvider(SandboxProvider):
 
     @classmethod
     def get_external_url(cls, url: str) -> str:
-        """Rewrite a ``localhost`` URL (a published host port) to the form a workload reaches from
-        inside a container: ``host.docker.internal``. Docker Desktop and Rancher Desktop (macOS/Windows)
-        resolve this themselves; on Linux ``EXTRA_CONTAINER_RUN_ARGS`` maps it via ``--add-host …:host-gateway``."""
-        return url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
+        """``url`` as a container on this machine reaches it: a loopback host (a published host port, or a
+        service on this machine) becomes ``host.docker.internal``, and anything else is left alone. Docker
+        Desktop and Rancher Desktop resolve that name themselves; on Linux ``extra_hosts`` maps it to the
+        bridge gateway, so a service there must listen on more than loopback."""
+        parts = urlsplit(url)
+        if not _is_loopback(parts.hostname):
+            return url
+        userinfo, at, _ = parts.netloc.rpartition("@")
+        port = f":{parts.port}" if parts.port is not None else ""
+        return urlunsplit(parts._replace(netloc=f"{userinfo}{at}{_HOST_ALIAS}{port}"))
+
+
+def host_url_for(url: str, sandbox_type: Optional[str]) -> str:
+    """``url``, which this machine reaches, as a container on ``sandbox_type`` reaches it: only a local
+    sandbox's containers run on this machine, and they reach its loopback by another name."""
+    return LocalSandboxProvider.get_external_url(url) if sandbox_type == LocalSandbox.type else url
+
+
+def _is_loopback(host: Optional[str]) -> bool:
+    """Whether ``host`` names this machine from itself: ``localhost``, a loopback address, or the unspecified
+    address a server listening everywhere prints."""
+    if host == "localhost":
+        return True
+    try:
+        address = ip_address(host or "")
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 @functools.cache

@@ -1,6 +1,8 @@
 import asyncio
 import os
 import platform
+import shutil
+import signal
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ import pytest
 
 import agent_env.providers.sandbox_providers.local_sandbox as ls
 from agent_env.a2a_agent.a2a_agent import A2AAgent
+from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.config import reset_config, set_object_store
 from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, LocalSandboxProvider
 from agent_env.providers.sandbox_providers.sandbox_provider import SANDBOX_MODE_CONTAINER, SANDBOX_MODE_VM
@@ -18,6 +21,10 @@ from agent_env.store.routing import LocalRunObjectStore
 from agent_env.a2a_agent import a2a_agent as a2a_agent_module
 from agent_env.a2a_agent.a2a_agent import A2AAgent
 from tst.unit.store.fakes import FakeObjectStore
+
+
+def _image(tar_gz_object_url: str | None, image_name: str = "img:1") -> DockerImageArtifact:
+    return DockerImageArtifact(id="img", description="", image_name=image_name, tar_gz_object_url=tar_gz_object_url)
 
 _real_copy_into_container = ls._copy_into_container  # before the fixtures below replace them
 _real_local_grant_trust = ls.local_grant_trust
@@ -214,7 +221,7 @@ async def test_load_docker_images_stages_tarballs_per_sandbox(tmp_path):
         def download_to_file(self, url, dest_path):
             self.staged.append(dest_path)
 
-    artifact = SimpleNamespace(tar_gz_object_url="file:///store/svc.tar.gz", image_name="svc:latest")
+    artifact = _image("file:///store/svc.tar.gz", "svc:latest")
     store = _Local()
     set_object_store(store)
     try:
@@ -473,8 +480,9 @@ def test_local_never_shares_network_and_externalizes_localhost():
 
 def test_host_gateway_flag_only_where_nothing_provides_the_alias():
     """Only Linux lacks a native host.docker.internal; on Rancher an explicit mapping would break it."""
-    expected = "--add-host host.docker.internal:host-gateway" if platform.system() == "Linux" else ""
-    assert LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS == expected
+    linux = platform.system() == "Linux"
+    assert LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS == ("--add-host host.docker.internal:host-gateway" if linux else "")
+    assert LocalSandbox.extra_hosts == (("host.docker.internal:host-gateway",) if linux else ())
 
 
 @pytest.mark.asyncio
@@ -817,6 +825,115 @@ async def test_a_command_cancelled_while_it_spawns_is_still_stopped(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_a_command_carries_its_sandboxs_id(tmp_path: Path):
+    sandbox = LocalSandbox(work_dir=tmp_path)
+
+    _, stdout, _ = await sandbox.exec_with_output("bash", "-c", "echo $AGENTENV_SANDBOX")
+
+    assert stdout.strip() == sandbox.sandbox_id
+
+
+@pytest.mark.asyncio
+async def test_teardown_sends_sigterm_then_sigkill_to_what_outlives_it(monkeypatch):
+    sent, running = [], {11: signal.SIGTERM, 12: signal.SIGKILL}  # pid -> the signal that stops it
+    monkeypatch.setattr(ls, "_REAP_SECONDS", 1)
+    monkeypatch.setattr(ls, "_marked_pids", lambda sandbox_id: sorted(running) if sandbox_id == "local-a" else [])
+
+    def kill(pid, sig):
+        sent.append((pid, sig))
+        if running.get(pid) == sig:
+            del running[pid]
+
+    monkeypatch.setattr(ls.os, "kill", kill)
+    assert await ls._stop_marked("local-a")
+
+    assert sent == [(11, signal.SIGTERM), (12, signal.SIGTERM), (12, signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_teardown_keeps_the_staging_a_surviving_process_runs_from(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(ls, "_REAP_SECONDS", 1)
+    monkeypatch.setattr(ls, "_marked_pids", lambda sandbox_id: [13])  # never stops
+    monkeypatch.setattr(ls.os, "kill", lambda pid, sig: None)
+    sandbox = _RecordingLocalSandbox(work_dir=tmp_path)
+    staged = Path(tempfile.mkdtemp(prefix="install-agent-solver-", suffix=f"-{sandbox.sandbox_id}", dir="/tmp"))
+    try:
+        await sandbox.terminate()
+
+        assert staged.exists()
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _running(pid: int) -> bool:
+    """Whether ``pid`` is still running: a killed process another parent hasn't reaped yet is a zombie."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] not in "ZX"
+    except FileNotFoundError:
+        return False
+
+
+async def _detached(sandbox: LocalSandbox, command: str = "sleep 300") -> int:
+    """Start ``command`` the way a host install starts its agent, outliving the exec that started it, and wait until
+    it reads as marked: while a process execs, /proc shows it no environment, which on a loaded machine can last."""
+    _, stdout, _ = await sandbox.exec_with_output("bash", "-c", f"nohup {command} >/dev/null 2>&1 </dev/null & echo $!")
+    pid = int(stdout)
+    for _ in range(100):
+        if pid in ls._marked_pids(sandbox.sandbox_id):
+            break
+        await asyncio.sleep(0.1)
+    return pid
+
+
+@pytest.mark.asyncio
+async def test_teardown_removes_what_steps_staged_in_tmp_for_this_sandbox_only(tmp_path: Path):
+    sandbox = _RecordingLocalSandbox(work_dir=tmp_path)
+    ours = Path(tempfile.mkdtemp(prefix="install-agent-solver-", suffix=f"-{sandbox.sandbox_id}", dir="/tmp"))
+    (ours / "agent-ctx.tar.gz").write_bytes(b"ctx")
+    theirs = Path(tempfile.mkdtemp(prefix="install-agent-solver-", suffix="-local-0ther000", dir="/tmp"))
+    try:
+        await sandbox.terminate()
+
+        assert not ours.exists()
+        assert theirs.exists()
+    finally:
+        shutil.rmtree(ours, ignore_errors=True)
+        shutil.rmtree(theirs, ignore_errors=True)
+
+
+linux_only = pytest.mark.skipif(platform.system() != "Linux", reason="a process's environment is read from /proc")
+
+
+@linux_only
+@pytest.mark.asyncio
+async def test_teardown_stops_what_a_command_left_running_and_only_that(tmp_path: Path):
+    ours, theirs = LocalSandbox(work_dir=tmp_path / "a"), LocalSandbox(work_dir=tmp_path / "b")
+    left, other = await _detached(ours), await _detached(theirs)
+    try:
+        assert ls._marked_pids(ours.sandbox_id) == [left], f"running={_running(left)}"
+
+        await _RecordingLocalSandbox(work_dir=ours.work_dir, sandbox_id=ours.sandbox_id).terminate()
+
+        assert not _running(left)
+        assert _running(other)
+    finally:
+        await ls._stop_marked(theirs.sandbox_id)
+
+
+@linux_only
+@pytest.mark.asyncio
+async def test_teardown_kills_a_process_that_ignores_sigterm(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ls, "_REAP_SECONDS", 1)
+    sandbox = LocalSandbox(work_dir=tmp_path)
+    stubborn = await _detached(sandbox, "bash -c 'trap \"\" TERM; sleep 300'")
+
+    await ls._stop_marked(sandbox.sandbox_id)
+
+    assert not _running(stubborn)
+    assert not ls._marked_pids(sandbox.sandbox_id)
+
+
+@pytest.mark.asyncio
 async def test_a_container_is_created_given_the_local_ca_then_started(tmp_path, monkeypatch, copies):
     """The CA's trust files are in place before the container's first process runs, and its TLS clients
     are pointed at them, so it can use the local object store's grants."""
@@ -934,6 +1051,22 @@ async def test_an_agent_placed_on_a_local_vm_sandbox_gets_the_local_ca(tmp_path,
         assert (LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS in script) if LocalSandboxProvider.EXTRA_CONTAINER_RUN_ARGS else True
     else:
         assert copies == [] and "sleep 2" in script
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_an_agent_placed_on_a_local_vm_sandbox_maps_the_host_alias(tmp_path, monkeypatch, trusted):
+    """Whether or not the store hands out local grants, the agent reaches this machine by name on Linux."""
+    monkeypatch.setattr(a2a_agent_module, "local_grant_trust", (lambda: local_ca().trust_dir) if trusted else (lambda: None))
+    monkeypatch.setattr(a2a_agent_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_RecordingLocalSandbox, "extra_hosts", ("host.docker.internal:host-gateway",))
+    sandbox = _RecordingLocalSandbox(work_dir=tmp_path)
+    agent = A2AAgent.__new__(A2AAgent)
+    agent._sandbox = sandbox
+
+    await agent._run_container("img:v1", 8000, {"K": "v"})
+
+    assert "--add-host host.docker.internal:host-gateway" in sandbox.scripts[0]
 
 
 async def _no_sleep(_seconds):
