@@ -42,7 +42,7 @@ class TestResolveInputs:
     def test_no_override_uses_stored_values(self):
         res = _load_step()._resolve_inputs(_ctx())
         assert res.artifacts == [{"id": "stored-artifact", "version": None}]
-        assert res.urls == []
+        assert res.downloads == []
         assert res.destination_path == "/dest"
 
     def test_override_artifacts_list(self):
@@ -69,14 +69,27 @@ class TestResolveInputs:
         )
         ctx = _ctx({"load": {"urls": ["https://new/x", "https://new/y"]}})
         res = step._resolve_inputs(ctx)
-        assert res.urls == ["https://new/x", "https://new/y"]
+        assert res.downloads == [("https://new/x", "x"), ("https://new/y", "y")]
         assert res.artifacts == []
 
     def test_override_urls_none_clears_list(self):
         # {"urls": null} in the JSON override must clear the list, not crash on list(None)
         step = LoadArtifactTaskStep(id="load", version=None, agent_name="agent", urls=["https://old/a"])
         res = step._resolve_inputs(_ctx({"load": {"urls": None}}))
-        assert res.urls == []
+        assert res.downloads == []
+
+    def test_override_urls_take_named_entries(self):
+        step = LoadArtifactTaskStep(id="load", version=None, agent_name="agent", urls=["https://old/a"])
+        ctx = _ctx({"load": {"urls": [
+            {"url": "https://files.example/objects/obj-4f9c2a", "filename": "sheet.xlsx"},
+            "https://new/notes.txt",
+        ]}})
+        res = step._resolve_inputs(ctx)
+        assert res.downloads == [
+            ("https://files.example/objects/obj-4f9c2a", "sheet.xlsx"),
+            ("https://new/notes.txt", "notes.txt"),
+        ]
+        assert step.urls == ["https://old/a"]
 
     def test_override_artifact_id_null_raises(self):
         # {"artifact_id": null} is malformed — fail clear, not with an opaque Artifact.get(None) error

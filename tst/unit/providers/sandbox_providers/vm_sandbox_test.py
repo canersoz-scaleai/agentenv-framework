@@ -1,20 +1,23 @@
 import asyncio
 import hashlib
 import io
-import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 
 import pytest
 
+from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.providers.sandbox_providers import sandbox as sandbox_module
 from agent_env.providers.sandbox_providers.sandbox import VmSandbox
-from agent_env.store import set_object_store
+from agent_env.store import ImageStore, RegistryAuth, set_object_store
 from agent_env.config import get_config, reset_config
 from tst.unit.store.fakes import ConfiguredObjectStore
 from tst.util.exec_scripts import script_run
+
+
+def _image(tar_gz_object_url: str | None, image_name: str = "img:1") -> DockerImageArtifact:
+    return DockerImageArtifact(id="img", description="", image_name=image_name, tar_gz_object_url=tar_gz_object_url)
 
 
 class _SigningStore:
@@ -84,7 +87,7 @@ async def test_load_docker_images_downloads_to_file_before_load(signing_store):
     must only apply to a `-o file` download.
     """
     sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
-    artifact = SimpleNamespace(tar_gz_object_url="s3://bucket/img.tar.gz", image_name="myimage:latest")
+    artifact = _image("s3://bucket/img.tar.gz", "myimage:latest")
 
     await sandbox.load_docker_images([artifact])
 
@@ -103,8 +106,8 @@ async def test_load_docker_images_downloads_to_file_before_load(signing_store):
 async def test_load_docker_images_uses_unique_tmp_per_artifact(signing_store):
     sandbox = _RecordingVmSandbox(images_stdout="a\nb\n")
     artifacts = [
-        SimpleNamespace(tar_gz_object_url="s3://bucket/a.tar.gz", image_name="a:1"),
-        SimpleNamespace(tar_gz_object_url="s3://bucket/b.tar.gz", image_name="b:1"),
+        _image("s3://bucket/a.tar.gz", "a:1"),
+        _image("s3://bucket/b.tar.gz", "b:1"),
     ]
 
     await sandbox.load_docker_images(artifacts)
@@ -112,6 +115,127 @@ async def test_load_docker_images_uses_unique_tmp_per_artifact(signing_store):
     load_script = next(s for s in sandbox.scripts if "docker load" in s)
     assert "/tmp/_docker_image_vm-test_0.tar.gz" in load_script
     assert "/tmp/_docker_image_vm-test_1.tar.gz" in load_script
+
+
+@pytest.mark.asyncio
+async def test_a_load_of_tarballs_runs_the_script_it_always_has(signing_store):
+    sandbox = _RecordingVmSandbox(images_stdout="a\nb\n")
+
+    await sandbox.load_docker_images([_image("s3://bucket/a.tar.gz", "a:1"), _image("s3://bucket/b.tar.gz", "b:1")])
+
+    flags = "--retry 5 --retry-all-errors --retry-delay 1"
+    assert sandbox.scripts == [
+        f'(curl -fsSL {flags} "https://signed/a.tar.gz" -o /tmp/_docker_image_vm-test_0.tar.gz '
+        "&& gunzip -c /tmp/_docker_image_vm-test_0.tar.gz | docker load && rm -f /tmp/_docker_image_vm-test_0.tar.gz) & "
+        f'(curl -fsSL {flags} "https://signed/b.tar.gz" -o /tmp/_docker_image_vm-test_1.tar.gz '
+        "&& gunzip -c /tmp/_docker_image_vm-test_1.tar.gz | docker load && rm -f /tmp/_docker_image_vm-test_1.tar.gz) & wait"
+    ]
+
+
+class _Registry(ImageStore):
+    """Holds credentials for registry.example only."""
+
+    def image_ref(self, repository, tag):
+        return f"registry.example/{repository}:{tag}"
+
+    def auth(self, ref):
+        return RegistryAuth("registry.example", "user", "token") if ref.startswith("registry.example/") else None
+
+
+@pytest.fixture
+def registry():
+    get_config().set_image_store(_Registry())
+    yield
+    reset_config()
+
+
+PRIVATE = "registry.example/team/app@sha256:" + "0" * 64
+PUBLIC = "ghcr.io/team/tool:v1"
+
+
+@pytest.mark.asyncio
+async def test_an_image_with_no_tarball_is_pulled_after_logging_in_to_the_registry_the_store_holds(registry):
+    sandbox = _RecordingVmSandbox()
+
+    await sandbox.load_docker_images([_image(None, PRIVATE), _image(None, PUBLIC), _image(None, PRIVATE)])
+
+    login, *pulls = sandbox.scripts
+    assert login == "echo token | docker login --username user --password-stdin registry.example"
+    assert sorted(pulls) == sorted([f"docker pull {PRIVATE}", f"docker pull {PUBLIC}"])
+
+
+@pytest.mark.asyncio
+async def test_tarballs_are_loaded_and_the_rest_pulled(signing_store, registry):
+    sandbox = _RecordingVmSandbox(images_stdout="a\n")
+
+    await sandbox.load_docker_images([_image(None, PUBLIC), _image("s3://bucket/a.tar.gz", "a:1")])
+
+    load, pull = sandbox.scripts
+    assert '"https://signed/a.tar.gz"' in load and PUBLIC not in load
+    assert pull == f"docker pull {PUBLIC}"
+
+
+@pytest.mark.asyncio
+async def test_an_image_no_sandbox_can_get_is_refused_before_anything_is_loaded(signing_store):
+    sandbox = _RecordingVmSandbox(images_stdout="a\n")
+
+    with pytest.raises(RuntimeError, match="Can't load images: 'img' v0 has no tar.gz, and its image name 'img:v1' doesn't name"):
+        await sandbox.load_docker_images([_image("s3://bucket/a.tar.gz", "a:1"), _image(None, "img:v1")])
+
+    assert sandbox.scripts == []
+
+
+@pytest.mark.asyncio
+async def test_a_login_is_minted_once_per_registry():
+    minted = []
+
+    class _Counting(_Registry):
+        def auth(self, ref):
+            minted.append(ref)
+            return super().auth(ref)
+
+    get_config().set_image_store(_Counting())
+    try:
+        sandbox = _RecordingVmSandbox()
+        await sandbox.pull_images([PRIVATE, "registry.example/team/other:v1", PUBLIC, "ghcr.io/team/more:v2"])
+    finally:
+        reset_config()
+
+    assert len(minted) == 2  # registry.example's and ghcr.io's
+    assert sum("docker login" in script for script in sandbox.scripts) == 1
+    assert sum(script.startswith("docker pull") for script in sandbox.scripts) == 4
+
+
+class _OnePullFailsVm(_RecordingVmSandbox):
+    """``docker pull`` of BAD fails; every other pull stalls until it's cancelled."""
+
+    BAD = "ghcr.io/team/bad:v1"
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled: list[str] = []
+
+    async def exec_script(self, script, *, max_retries=0):
+        if script == f"docker pull {self.BAD}":
+            await asyncio.sleep(0)
+            raise RuntimeError("Script failed (exit 1):\nstderr: manifest unknown")
+        if script.startswith("docker pull"):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(script)
+                raise
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_the_first_pull_to_fail_cancels_the_rest_so_a_stalled_one_cant_hold_it_back(registry):
+    sandbox = _OnePullFailsVm()
+
+    with pytest.raises(RuntimeError, match="manifest unknown"):
+        await sandbox.pull_images([PUBLIC, _OnePullFailsVm.BAD, PRIVATE])
+
+    assert sorted(sandbox.cancelled) == sorted([f"docker pull {PUBLIC}", f"docker pull {PRIVATE}"])
 
 
 class _ScriptRecorder(VmSandbox):
@@ -257,7 +381,7 @@ async def test_load_docker_images_streams_through_when_unsigned():
     set_object_store(_LocalStore())
     try:
         sandbox = _PushTargetVmSandbox(b"IMGBYTES", images_stdout="myimage\n")
-        artifact = SimpleNamespace(tar_gz_object_url="file:///store/img.tar.gz", image_name="myimage:latest")
+        artifact = _image("file:///store/img.tar.gz", "myimage:latest")
         await sandbox.load_docker_images([artifact])
     finally:
         reset_config()
@@ -298,7 +422,7 @@ async def test_the_store_is_called_off_the_event_loop(signs):
     set_object_store(store)
     try:
         sandbox = _PushTargetVmSandbox(b"IMG", images_stdout="a\nb\n")
-        artifacts = [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in "ab"]
+        artifacts = [_image(f"s3://bucket/{n}.tar.gz", f"{n}:1") for n in "ab"]
         await sandbox.load_docker_images(artifacts)
         await sandbox.load_object_file("s3://bucket/data.json", "/tmp/data.json")
     finally:
@@ -349,7 +473,7 @@ async def test_a_failed_sign_stops_the_signs_still_waiting():
     store = _FailingSigner()
     set_object_store(store)
     try:
-        artifacts = [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in range(20)]
+        artifacts = [_image(f"s3://bucket/{n}.tar.gz", f"{n}:1") for n in range(20)]
         with pytest.raises(ConnectionError):
             await _RecordingVmSandbox().load_docker_images(artifacts)
         await asyncio.sleep(0.2)
@@ -385,7 +509,7 @@ async def test_a_load_bounds_how_many_signs_run_at_once():
         names = [f"i{n}" for n in range(20)]
         sandbox = _RecordingVmSandbox(images_stdout="\n".join(names))
         await sandbox.load_docker_images(
-            [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in names]
+            [_image(f"s3://bucket/{n}.tar.gz", f"{n}:1") for n in names]
         )
     finally:
         reset_config()
@@ -443,21 +567,6 @@ async def test_a_failed_docker_cp_raises_with_its_stderr():
 
 
 @pytest.mark.asyncio
-async def test_the_s3_named_methods_are_deprecated_aliases(signing_store, caplog):
-    """They delegate, and each use is counted: the log line, not the warning, is what reaches production logs."""
-    sandbox = _RecordingVmSandbox()
-    with caplog.at_level(logging.WARNING, logger="agent_env.utils.deprecation"):
-        with pytest.warns(DeprecationWarning, match="use load_object_file"):
-            await sandbox.load_s3_file("s3://bucket/a.json", "/tmp/a.json")
-        with pytest.warns(DeprecationWarning, match="use write_file_from_object"):
-            await sandbox.write_file_from_s3("s3://bucket/b.json", "/work/b.json")
-    assert any("https://signed/a.json" in s for s in sandbox.scripts)
-    assert any("https://signed/b.json" in s for s in sandbox.scripts)
-    counted = [r.deprecated_symbol for r in caplog.records if getattr(r, "event", None) == "agent_env_deprecated_symbol"]
-    assert counted == ["VmSandbox.load_s3_file", "Sandbox.write_file_from_s3"]
-
-
-@pytest.mark.asyncio
 async def test_a_url_the_local_store_holds_is_read_from_it_not_the_configured_store(cli_routing, monkeypatch):
     """Under namespace routing, outside an @local run, the configured store owns only its own urls."""
     set_object_store(ConfiguredObjectStore())
@@ -473,6 +582,6 @@ async def test_a_url_the_local_store_holds_is_read_from_it_not_the_configured_st
     sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
 
     await sandbox.load_object_file(data, "/tmp/data.json")
-    await sandbox.load_docker_images([SimpleNamespace(tar_gz_object_url=image, image_name="myimage:latest")])
+    await sandbox.load_docker_images([_image(image, "myimage:latest")])
 
     assert pushed == [(local, data), (local, image)]

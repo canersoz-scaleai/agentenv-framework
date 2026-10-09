@@ -107,3 +107,70 @@ async def test_urls_go_into_a_container_sandbox(monkeypatch):
 
     sandbox.write_file_from_url.assert_awaited_once_with("https://example.com/data.zip", "/work/inputs/data.zip")
     sandbox.exec_script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bare_urls_are_named_after_their_path_and_repeats_are_suffixed(monkeypatch):
+    sandbox = _container_sandbox(vm_backed=False)
+    step = LoadArtifactTaskStep(
+        id="load", version=None, sandbox_name="bundler", destination_path="/work/inputs",
+        urls=[
+            "https://a.example/x/data.csv", "https://b.example/data.csv?sig=1", "https://c.example/",
+            "https://d.example/my%20notes.txt",
+        ],
+    )
+
+    ctx = await step.execute(_context(sandbox, monkeypatch))
+
+    assert sorted(c.args for c in sandbox.write_file_from_url.await_args_list) == [
+        ("https://a.example/x/data.csv", "/work/inputs/data.csv"),
+        ("https://b.example/data.csv?sig=1", "/work/inputs/data-1.csv"),
+        ("https://c.example/", "/work/inputs/downloaded"),
+        ("https://d.example/my%20notes.txt", "/work/inputs/my notes.txt"),
+    ]
+    (loaded,) = ctx.metadata["loaded_urls"]
+    assert loaded["files"] == ["data.csv", "data-1.csv", "downloaded", "my notes.txt"]
+    assert loaded["destination_path"] == "/work/inputs"
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_list_names_each_entry_its_own_way(monkeypatch):
+    sandbox = _container_sandbox(vm_backed=False)
+    step = LoadArtifactTaskStep(
+        id="load", version=None, sandbox_name="bundler", destination_path="/tmp/data",
+        urls=[
+            "https://a.example/data.csv",
+            {"url": "https://files.example/objects/obj-4f9c2a", "filename": "report.txt"},
+            "https://b.example/data.csv",
+        ],
+    )
+
+    ctx = await step.execute(_context(sandbox, monkeypatch))
+
+    assert sorted(c.args for c in sandbox.write_file_from_url.await_args_list) == [
+        ("https://a.example/data.csv", "/tmp/data/data.csv"),
+        ("https://b.example/data.csv", "/tmp/data/data-1.csv"),
+        ("https://files.example/objects/obj-4f9c2a", "/tmp/data/report.txt"),
+    ]
+    (loaded,) = ctx.metadata["loaded_urls"]
+    assert loaded["files"] == ["data.csv", "report.txt", "data-1.csv"]
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_urls_override_fails_before_anything_is_loaded(universe, monkeypatch):
+    sandbox = _container_sandbox(vm_backed=False)
+    step = LoadArtifactTaskStep(
+        id="load", version=None, sandbox_name="bundler", artifact_id=UNIVERSE_ID,
+        urls=["https://a.example/data.csv"], destination_path="/work/inputs",
+    )
+    ctx = _context(sandbox, monkeypatch)
+    ctx.metadata["user_overrides"] = {"step_params": {"load": {"urls": [
+        "https://a.example/data.csv", {"url": "https://files.example/objects/obj-7d01", "filename": "data.csv"},
+    ]}}}
+
+    with pytest.raises(ValueError, match="would be saved as 'data.csv'"):
+        await step.execute(ctx)
+
+    sandbox.write_file_from_object.assert_not_awaited()
+    sandbox.write_file_from_url.assert_not_awaited()
+    assert "loaded_urls" not in ctx.metadata

@@ -9,7 +9,6 @@ from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniv
 from agent_env.artifact.artifacts.environment import EnvironmentArtifact
 from agent_env.artifact.artifacts.environment_universe import EnvironmentUniverseArtifact
 from agent_env.artifact.artifacts.skill import AGENT_SKILLS_SPEC_VERSION, SkillArtifact
-from agent_env.artifact.artifacts.vm_image import VMImageArtifact
 from agent_env.artifact.registry import (
     ARTIFACT_REGISTRY,
     canonical_type,
@@ -29,13 +28,9 @@ __all__ = [
     "FileArtifactUniverse",
     "EnvironmentArtifact",
     "EnvironmentUniverseArtifact",
-    # Deprecated aliases. Kept in __all__ so `from agent_env.artifact import *`
-    # still binds them; served by __getattr__ below rather than imported eagerly, so
-    # importing this package does not itself trip the deprecation counter.
     "SkillArtifact",
     "AGENT_SKILLS_SPEC_VERSION",
     "Universe",
-    "VMImageArtifact",
     "ARTIFACT_REGISTRY",
     "canonical_type",
     "equivalent_types",

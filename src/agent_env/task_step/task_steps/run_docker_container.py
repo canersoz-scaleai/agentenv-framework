@@ -167,9 +167,10 @@ class RunDockerContainerTaskStep(TaskStep):
         )
         sandbox = await provider.get_sandbox(ds.sandbox_id)
 
-        image_tag = self.image_tag or f"{self.container_name}:latest"
+        container = sandbox.scoped_name(self.container_name)
+        image_tag = sandbox.scoped_name(self.image_tag) if self.image_tag else f"{container}:latest"
 
-        work_dir = f"/tmp/docker-context-{self.container_name}"
+        work_dir = f"/tmp/docker-context-{container}"
         await sandbox.exec_script(
             f"rm -rf {shlex.quote(work_dir)} && mkdir -p {shlex.quote(work_dir)}"
         )
@@ -193,7 +194,7 @@ class RunDockerContainerTaskStep(TaskStep):
         label = shlex.quote(f"{SANDBOX_LABEL}={ds.sandbox_id}")
         build_cmd = (
             f"cd {shlex.quote(work_dir)} && "
-            f"docker build --platform linux/amd64 --label {label} "
+            f"docker build --label {label} "
             f"-f {shlex.quote(self.dockerfile_path)} "
             f"-t {shlex.quote(image_tag)} "
             f"{build_arg_flags} ."
@@ -202,13 +203,16 @@ class RunDockerContainerTaskStep(TaskStep):
             f"Building docker image '{image_tag}' on sandbox {ds.sandbox_id} "
             f"(dockerfile={self.dockerfile_path})"
         )
-        await sandbox.exec_script(build_cmd)
+        await _build(sandbox, build_cmd)
+        await sandbox.exec_script(f"rm -rf {shlex.quote(work_dir)}")
 
         network_flag = ""
         if self.network:
             network_flag = f"--network {await self._ensure_network(sandbox, self.network)} "
 
-        port_flags = " ".join(f"-p {spec}" for p in (self.ports or []) for spec in port_bindings(sandbox.host_ips, p, p))
+        port_flags = " ".join(
+            f"-p {spec}" for p in (self.ports or []) for spec in port_bindings(sandbox.host_ips, sandbox.host_port(p), p)
+        )
         env_flag_parts = []
         if self.env_vars:
             for k, v in self.env_vars.items():
@@ -218,10 +222,11 @@ class RunDockerContainerTaskStep(TaskStep):
         device_flags = " ".join(f"--device {shlex.quote(d)}" for d in self.devices)
         cap_flags = " ".join(f"--cap-add {shlex.quote(c)}" for c in self.cap_add)
         volume_flags = " ".join(f"-v {shlex.quote(v)}" for v in self.volumes)
+        host_flags = " ".join(f"--add-host {shlex.quote(entry)}" for entry in sandbox.extra_hosts)
         extra_flags = " ".join(f for f in (
             "--privileged" if self.privileged else "",
             f"--shm-size {shlex.quote(self.shm_size)}" if self.shm_size else "",
-            device_flags, cap_flags, volume_flags,
+            device_flags, cap_flags, volume_flags, host_flags,
         ) if f)
         entrypoint_flag = ""
         if self.command_override:
@@ -242,7 +247,7 @@ class RunDockerContainerTaskStep(TaskStep):
         else:
             command_tail = ""
         run_cmd = (
-            f"docker run -d --name {shlex.quote(self.container_name)} --label {label} "
+            f"docker run -d --name {shlex.quote(container)} --label {label} "
             f"{network_flag}{entrypoint_flag}{extra_flags} {port_flags} {env_flags} "
             f"{shlex.quote(image_tag)}{command_tail}"
         )
@@ -258,7 +263,7 @@ class RunDockerContainerTaskStep(TaskStep):
             if extra == self.network:
                 continue
             enet = await self._ensure_network(sandbox, extra)
-            await sandbox.exec_script(f"docker network connect {enet} {shlex.quote(self.container_name)}")
+            await sandbox.exec_script(f"docker network connect {enet} {shlex.quote(container)}")
             logger.info(f"Connected container '{self.container_name}' to extra network '{extra}'")
 
         if self.ready_command:
@@ -266,7 +271,7 @@ class RunDockerContainerTaskStep(TaskStep):
             logger.info(f"Waiting for container '{self.container_name}' readiness: {self.ready_command}")
             await sandbox.exec_script(
                 f"for i in $(seq 1 60); do "
-                f"if docker exec {shlex.quote(self.container_name)} sh -c {ready} >/dev/null 2>&1; then exit 0; fi; "
+                f"if docker exec {shlex.quote(container)} sh -c {ready} >/dev/null 2>&1; then exit 0; fi; "
                 f"sleep 2; done; "
                 f"echo 'container {self.container_name} failed readiness check within 120s' >&2; exit 1"
             )
@@ -282,10 +287,12 @@ class RunDockerContainerTaskStep(TaskStep):
         return context
 
     async def _ensure_network(self, sandbox, name: str) -> str:
-        net = shlex.quote(name)
         # host / none / bridge / container:<name> are Docker built-in modes, not user bridges -- nothing to create.
-        if name in ("host", "none", "bridge") or name.startswith("container:"):
-            return net
+        if name in ("host", "none", "bridge"):
+            return shlex.quote(name)
+        if name.startswith("container:"):
+            return shlex.quote(f"container:{sandbox.scoped_name(name.removeprefix('container:'))}")
+        net = shlex.quote(sandbox.scoped_name(name))
         await sandbox.exec_script(
             f"docker network inspect {net} >/dev/null 2>&1 "    # already exists -> reuse it
             f"|| docker network create --label {shlex.quote(f'{SANDBOX_LABEL}={sandbox.sandbox_id}')} {net} >/dev/null 2>&1 "  # else create the user bridge
@@ -380,3 +387,16 @@ class RunDockerContainerTaskStep(TaskStep):
             f"rm -f {shlex.quote(archive_path)}"
         )
         logger.info(f"Extracted {url} into {work_dir}")
+
+
+async def _build(sandbox, build_cmd: str) -> None:
+    """Run ``build_cmd``, a ``docker build``, for the host's own platform. A base image built for linux/amd64 only has
+    nothing for an arm64 host (an Apple Silicon Mac running the local provider), so that build falls back to
+    linux/amd64, which the host's Docker runs emulated."""
+    try:
+        await sandbox.exec_script(build_cmd)
+    except RuntimeError as e:
+        if "no match for platform" not in str(e) and "no matching manifest" not in str(e):
+            raise
+        logger.warning("The base image has no build for this host's platform; building linux/amd64, which runs emulated")
+        await sandbox.exec_script(build_cmd.replace("docker build ", "docker build --platform linux/amd64 ", 1))

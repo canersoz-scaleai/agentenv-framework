@@ -127,7 +127,7 @@ def test_response_history_diff_uses_linear_comparisons(monkeypatch, append_new):
     ops = build_context_update_ops(pre, post)
 
     if append_new:
-        assert ops.add_to_sets["context.prompt_responses"] == [dataclasses.asdict(_response("new"))]
+        assert ops.add_to_sets["context.prompt_responses"] == [_response("new").to_dict()]
     else:
         assert ops.is_empty()
     assert comparisons <= 2 * len(pre.prompt_responses)
@@ -381,8 +381,8 @@ def test_in_place_mutation_of_appended_list_item_duplicates_in_doc():
     """Regression: mutating an item already present in a top-level $addToSet list
     re-adds it as a NEW element instead of updating in place.
 
-    Reproduces the production bug where ``rubrics_verifier`` set
-    ``compact_trajectory_s3_uri`` on a ``prompt_response`` that ``prompt_agent``
+    Reproduces the production bug where ``rubrics_verifier`` set the compacted
+    trajectory's URL on a ``prompt_response`` that ``prompt_agent``
     had already appended to ``context.prompt_responses``. The mutated item is
     BSON-unequal to the stored one, so the diff emits it via ``$addToSet`` and
     the instance ends up with two near-identical prompt_responses — the hub then
@@ -395,7 +395,7 @@ def test_in_place_mutation_of_appended_list_item_duplicates_in_doc():
 
     # Model the (now-fixed) in-place mutation: same logical item, one field changed.
     mutated = _response("p1")
-    mutated.compact_trajectory_s3_uri = "s3://bucket/compact.json"
+    mutated.tool_call_count = (mutated.tool_call_count or 0) + 1
     post = TaskStepContext(prompt_responses=[mutated])
 
     ops = build_context_update_ops(pre, post)

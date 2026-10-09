@@ -12,8 +12,8 @@ from agent_env.providers.sandbox_providers.chained_sandbox_provider import Chain
 from agent_env.providers.sandbox_providers.local_sandbox import LocalSandbox, LocalSandboxProvider
 from agent_env.providers.sandbox_providers.modal_sandbox import ModalSandbox, ModalSandboxProvider
 from agent_env.providers.sandbox_providers.modal_vm_sandbox import ModalVmSandbox, ModalVmSandboxProvider
-from agent_env.providers.sandbox_providers.sandbox import Sandbox, VmSandbox
-from agent_env.providers.sandbox_providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS, SandboxProvider, _pull, build_sandbox_provider
+from agent_env.providers.sandbox_providers.sandbox import Sandbox, VmSandbox, _pull
+from agent_env.providers.sandbox_providers.sandbox_provider import _BUILTIN_SANDBOX_PROVIDERS, SandboxProvider, build_sandbox_provider
 from agent_env.store import ImageStore, RegistryAuth
 from tst.util.exec_scripts import script_run
 
@@ -117,6 +117,45 @@ async def test_default_create_container_mutates_mode_to_container():
     )
     assert result is fake_vm
     assert result.mode == "container"
+
+
+@pytest.mark.asyncio
+async def test_a_create_container_cancelled_during_the_pull_terminates_the_vm():
+    pulling = asyncio.Event()
+
+    class _HangingVm(VmSandbox):
+        type = "fake-vm"
+
+        def __init__(self):
+            self.sandbox_id = "vm-fake"
+            self.tunnel_urls = {}
+            self.vnc_url = None
+            self.mode = "vm"
+            self.terminated = False
+
+        async def terminate(self) -> None:
+            self.terminated = True
+
+        async def exec_script(self, script: str) -> str:
+            pulling.set()
+            await asyncio.Event().wait()
+            return ""
+
+    vm = _HangingVm()
+
+    class _VmStyleProvider(SandboxProvider):
+        async def create_vm(self, **kwargs):
+            return vm
+
+        async def create_sandbox(self, **kwargs):
+            raise NotImplementedError
+
+    task = asyncio.ensure_future(_VmStyleProvider().create_container(image_name="nginx:latest", port=8080, env={}))
+    await pulling.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert vm.terminated
 
 
 @pytest.mark.asyncio

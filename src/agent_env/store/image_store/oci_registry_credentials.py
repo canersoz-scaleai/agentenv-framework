@@ -60,21 +60,29 @@ def normalize_registry_host(host: str) -> str:
     return "docker.io" if normalized in _DOCKER_HUB_HOSTS else normalized
 
 
-def registry_host_from_ref(ref: str) -> str | None:
-    """Return the normalized registry authority from a Docker/OCI image reference.
+def names_registry(ref: str) -> bool:
+    """Whether the image reference ``ref`` spells out its registry, as ``ghcr.io/x/y`` and ``localhost:5000/x`` do.
 
     Docker treats a first path component as a registry only when it is ``localhost``
-    or contains a dot or port. Unqualified references therefore resolve to Docker Hub.
+    or contains a dot or port, and resolves any other reference on Docker Hub.
     Schemed values are not valid image references and deliberately do not match.
     """
     if not ref or "://" in ref:
-        return None
+        return False
     first, separator, _ = ref.partition("/")
+    return bool(separator) and (first.lower() == "localhost" or "." in first or ":" in first)
+
+
+def registry_host_from_ref(ref: str) -> str | None:
+    """Return the normalized registry authority from a Docker/OCI image reference: the one it names
+    (``names_registry``), else Docker Hub's. None for a value that isn't a reference.
+    """
+    if not ref or "://" in ref:
+        return None
+    first = ref.partition("/")[0]
     if not first:
         return None
-    if not separator or not (
-        first.lower() == "localhost" or "." in first or ":" in first
-    ):
+    if not names_registry(ref):
         return "docker.io"
     try:
         return normalize_registry_host(first)
@@ -83,11 +91,12 @@ def registry_host_from_ref(ref: str) -> str | None:
 
 
 def is_loopback_host(host: str | None) -> bool:
-    """Whether a registry ``host``, with or without its port, names this machine."""
+    """Whether a registry ``host``, with or without its port, names this machine: a loopback address, the
+    unspecified ``0.0.0.0``, or ``host.docker.internal``, which only this machine's containers resolve."""
     if not host:
         return False
-    name = host[1:host.find("]")] if host.startswith("[") else host.rsplit(":", 1)[0]
-    return name == "localhost" or name.startswith("127.") or name == "::1"
+    name = (host[1:host.find("]")] if host.startswith("[") else host.rsplit(":", 1)[0]).lower()
+    return name in ("localhost", "::1", "0.0.0.0", "host.docker.internal") or name.startswith("127.")
 
 
 class SecretStoreCredentials(OciRegistryCredentials):

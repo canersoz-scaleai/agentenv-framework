@@ -33,12 +33,13 @@ import time
 import uuid
 from typing import Any, ClassVar, Optional
 
+from agent_env.providers.sandbox_providers.local_sandbox import host_url_for
 from agent_env.providers.sandbox_providers.sandbox_provider import (
     all_sandbox_container_env,
     registered_sandbox_provider_classes,
 )
 from agent_env.store.ids import derive_id, is_local_id, key_segment, validate_local_id
-from agent_env.task_step.context import TaskStepContext
+from agent_env.task_step.context import TaskStepContext, dual_keyed
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ _RESERVED_ENV_KEYS = frozenset({
     "LITELLM_BASE_URL", "ANTHROPIC_BASE_URL",
     "PATH", "HOME",
 })
+_MODEL_URL_KEYS = frozenset({"LITELLM_BASE_URL", "ANTHROPIC_BASE_URL"})
 
 
 class RunContainerUnitTestsVerifierTaskStep(TaskStep):
@@ -253,6 +255,8 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         command, extra_env = self._resolve_command(context)
         merged_env.update(self.env_vars)
         merged_env.update(extra_env)
+        for key in _MODEL_URL_KEYS & merged_env.keys():
+            merged_env[key] = host_url_for(merged_env[key], sandbox.type)
         env_flags = " ".join(f"-e {k}={shlex.quote(v)}" for k, v in merged_env.items())
 
         # 3. Run setup_commands (fail loud)
@@ -263,7 +267,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
             )
             await sandbox.exec_script(
                 f"docker exec -u {shlex.quote(self.user)} {env_flags} "
-                f"{shlex.quote(self.container_name)} bash -c {shlex.quote(setup_cmd)}"
+                f"{shlex.quote(sandbox.scoped_name(self.container_name))} bash -c {shlex.quote(setup_cmd)}"
             )
 
         # 4. Run main command, bounded by in-container timeout(1)
@@ -273,7 +277,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
         )
         wrapped = (
             f"docker exec -u {shlex.quote(self.user)} {env_flags} "
-            f"{shlex.quote(self.container_name)} "
+            f"{shlex.quote(sandbox.scoped_name(self.container_name))} "
             f"timeout --kill-after=10 {self.timeout_sec} bash -c {shlex.quote(command)}"
         )
         exit_code, stdout, stderr = await sandbox.exec_with_output("sudo", "bash", "-c", wrapped)
@@ -362,12 +366,12 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
             "stdout_artifact": {
                 "id": stdout_artifact.id,
                 "version": stdout_artifact.version,
-                "s3_url": stdout_artifact.object_url,
+                **dual_keyed("s3_url", "object_url", stdout_artifact.object_url),
             },
             "stderr_artifact": {
                 "id": stderr_artifact.id,
                 "version": stderr_artifact.version,
-                "s3_url": stderr_artifact.object_url,
+                **dual_keyed("s3_url", "object_url", stderr_artifact.object_url),
             },
             "stdout_head": stdout[:_OUTPUT_PREVIEW_CHARS],
             "stderr_head": stderr[:_OUTPUT_PREVIEW_CHARS],
@@ -428,7 +432,7 @@ class RunContainerUnitTestsVerifierTaskStep(TaskStep):
     async def _extract_file(self, sandbox, path_in_container: str) -> str:
         """`docker cp` a file out of the container, read it from the VM, return text."""
         vm_temp = f"/tmp/_verifier_out_{uuid.uuid4().hex[:8]}"
-        await sandbox.docker_cp(f"{self.container_name}:{path_in_container}", vm_temp)
+        await sandbox.docker_cp(f"{sandbox.scoped_name(self.container_name)}:{path_in_container}", vm_temp)
         try:
             exit_code, stdout, stderr = await sandbox.exec_with_output("sudo", "cat", vm_temp)
             if exit_code != 0:

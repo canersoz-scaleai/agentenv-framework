@@ -25,7 +25,7 @@ from agent_env.env.gateway.constants import EXT_TRAJECTORY_URI
 from agent_env.store import get_config
 from agent_env.store.base import GrantUnavailableError
 from agent_env.store.ids import derive_id, is_local_id, validate_local_id
-from agent_env.store.object_store import MIN_GRANT_LIFETIME_SECONDS, ObjectStore, S3ObjectStore
+from agent_env.store.object_store import MIN_GRANT_LIFETIME_SECONDS, ObjectStore
 from agent_env.store.object_store.object_store import issues_grants_to
 from agent_env.store.routing import in_local_run
 from agent_env.task_step.context import TaskStepContext
@@ -95,6 +95,10 @@ async def _push_s3_credentials(base_url: str, card: dict, timeout_seconds: float
     from agentenv_protocol import client as protocol_v1
 
     if protocol_v1.find_extension(card, _S3_CREDENTIALS_EXTENSION_URI) is None or in_local_run():
+        return
+    try:
+        from agent_env.store.object_store import S3ObjectStore
+    except ModuleNotFoundError:  # the aws extra: without it no object store is an S3ObjectStore
         return
     try:
         store = get_config().get_object_store()

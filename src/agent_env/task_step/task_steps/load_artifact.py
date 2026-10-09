@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import posixpath
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Optional
 from urllib.parse import unquote, urlparse
 
+from agent_env.providers.sandbox_providers.sandbox_provider import reachable_url
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity_refs import EntityRef
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
@@ -28,13 +30,100 @@ _STEP_ARTIFACT_SOURCES: tuple[tuple[str, Callable[[dict], Optional[dict]]], ...]
     ("env_snapshotted_universes", lambda entry: entry),
 )
 
+# A `urls` entry: a bare URL, saved under the name its path ends in, or
+# {"url": ..., "filename": ...}, saved under that filename verbatim.
+UrlEntry = str | dict[str, str]
+_URL_ENTRY_KEYS = frozenset({"url", "filename"})
+
+
+def _named_download(step_id: str, entry: dict) -> tuple[str, str]:
+    """The ``(url, filename)`` of an object entry, rejecting anything but a plain file name for ``filename``."""
+    unknown = sorted(set(entry) - _URL_ENTRY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"load_artifact '{step_id}': urls entry {entry!r} has unknown key(s) {unknown}; "
+            f"an object entry takes only 'url' and 'filename'"
+        )
+    url, filename = entry.get("url"), entry.get("filename")
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"load_artifact '{step_id}': urls entry {entry!r} needs a non-empty string 'url'")
+    if not isinstance(filename, str) or not filename:
+        raise ValueError(
+            f"load_artifact '{step_id}': urls entry {entry!r} needs a non-empty string 'filename' "
+            f"(a bare URL string is saved under the name its path ends in)"
+        )
+    if problem := _plain_name_problem(filename):
+        raise ValueError(f"load_artifact '{step_id}': urls entry {entry!r}: {problem}")
+    return url, filename
+
+
+def _plain_name_problem(filename: str) -> Optional[str]:
+    """Why ``filename`` can't be saved directly in the destination, or None when it can."""
+    try:
+        validate_relative_filename(filename)
+    except ValueError as e:
+        return str(e)
+    if "/" in filename or "\\" in filename or filename == ".":
+        return "filename must be a plain file name, not a path"
+    return None
+
+
+def _url_downloads(step_id: str, urls: list[UrlEntry]) -> list[tuple[str, str]]:
+    """Each ``urls`` entry as ``(url, filename)``, the name it is saved under in the destination.
+
+    A bare URL takes the last segment of its decoded path, a repeat the first of ``-1``, ``-2``, ...
+    no other bare URL has; an explicit filename is never renamed, so one given twice, or matching a
+    bare URL's name, raises.
+    """
+    explicit: dict[str, str] = {}
+    for entry in urls:
+        if isinstance(entry, dict):
+            url, filename = _named_download(step_id, entry)
+            if filename in explicit:
+                raise ValueError(
+                    f"load_artifact '{step_id}': filename {filename!r} is given to more than one urls entry "
+                    f"({explicit[filename]!r} and {url!r})"
+                )
+            explicit[filename] = url
+        elif not isinstance(entry, str):
+            raise ValueError(
+                f"load_artifact '{step_id}': urls entry {entry!r} must be a URL string or an object "
+                f"with 'url' and 'filename'"
+            )
+
+    downloads: list[tuple[str, str]] = []
+    taken: set[str] = set()
+    for entry in urls:
+        if isinstance(entry, dict):
+            downloads.append((entry["url"], entry["filename"]))
+            continue
+        # Decoded first, so an escaped slash separates too and the name can't climb out of the destination.
+        base = posixpath.basename(unquote(urlparse(entry).path)) or "downloaded"
+        if problem := _plain_name_problem(base):
+            raise ValueError(
+                f"load_artifact '{step_id}': {entry!r} would be saved as {base!r}: {problem}; give it a 'filename'"
+            )
+        stem, ext = os.path.splitext(base)
+        filename, count = base, 0
+        while filename in taken:
+            count += 1
+            filename = f"{stem}-{count}{ext}"
+        taken.add(filename)
+        if filename in explicit:
+            raise ValueError(
+                f"load_artifact '{step_id}': {entry!r} would be saved as {filename!r}, the filename given to "
+                f"{explicit[filename]!r}; give it a 'filename' of its own"
+            )
+        downloads.append((entry, filename))
+    return downloads
+
 
 @dataclass
 class _LoadInputs:
     """What a load_artifact step loads and where, after per-run overrides."""
 
     artifacts: list[dict]
-    urls: list[str]
+    downloads: list[tuple[str, str]]
     destination_path: Optional[str]
 
 
@@ -55,7 +144,7 @@ class LoadArtifactTaskStep(TaskStep):
         artifacts: Optional[list[dict]] = None,
         artifact_id: Optional[str] = None,
         artifact_version: Optional[int] = None,
-        urls: Optional[list[str]] = None,
+        urls: Optional[list[UrlEntry]] = None,
         collected_artifacts_step_id: Optional[str] = None,
         artifact_from_step_id: Optional[str] = None,
         destination_path: Optional[str] = None,
@@ -107,6 +196,8 @@ class LoadArtifactTaskStep(TaskStep):
         self.env_step_id = env_step_id
         self.artifacts = artifacts or []
         self.urls = list(urls or [])
+        # Stored urls fail here, at construction; a per-run `urls` override is checked in `_resolve_inputs`.
+        _url_downloads(self.id, self.urls)
         # Superseded by the producer-agnostic `artifact_from_step_id`, but kept
         # readable/writable: it is persisted on existing task-step documents.
         self.collected_artifacts_step_id = collected_artifacts_step_id
@@ -223,10 +314,11 @@ class LoadArtifactTaskStep(TaskStep):
         return matches[0] if matches else None
 
     def _resolve_inputs(self, context: TaskStepContext) -> _LoadInputs:
-        """Resolve ``(artifacts, urls, destination_path)``, honoring per-run
+        """Resolve ``(artifacts, downloads, destination_path)``, honoring per-run
         ``step_overrides``. An override wins over the stored value; an explicit
         artifact override also wins over ``artifact_from_step_id`` /
-        ``collected_artifacts_step_id`` wiring.
+        ``collected_artifacts_step_id`` wiring. A ``urls`` override is named and
+        validated here, before anything is loaded.
         Topology (env_id/agent_name/container_name) is not overridable here.
         """
         overrides = self.step_param_overrides(context)
@@ -257,11 +349,12 @@ class LoadArtifactTaskStep(TaskStep):
 
         # `or []` so a `{"urls": null}` override cleanly clears rather than crashing on list(None).
         urls = list(overrides["urls"] or []) if "urls" in overrides else list(self.urls)
+        downloads = _url_downloads(self.id, urls)
         destination_path = overrides.get("destination_path", self.destination_path)
 
         if overrides:
             logger.info("load '%s': applying step_overrides for %s", self.id, sorted(overrides))
-        return _LoadInputs(artifacts=resolved_artifacts, urls=urls, destination_path=destination_path)
+        return _LoadInputs(artifacts=resolved_artifacts, downloads=downloads, destination_path=destination_path)
 
     async def _load_url_onto_vm(self, sandbox, url: str, destination_path: str) -> None:
         """Host counterpart of ``sandbox.load_object_file``; ``write_file_from_url`` targets a container instead."""
@@ -273,6 +366,21 @@ class LoadArtifactTaskStep(TaskStep):
         await sandbox.exec_script(
             f"curl -fsSL {CURL_RETRY_FLAGS} {shlex.quote(url)} -o {shlex.quote(destination_path)}"
         )
+
+    async def _load_url_into_container(self, sandbox, container: str, url: str, destination_path: str) -> None:
+        """Download ``url`` onto the VM host, then copy it into ``container`` at ``destination_path``:
+        ``write_file_from_url`` reaches only the sandbox's own agent container."""
+        vm_temp = f"/tmp/_load_url_{uuid.uuid4().hex[:8]}"
+        try:
+            await self._load_url_onto_vm(sandbox, url, vm_temp)
+            await sandbox.exec_script(
+                f"docker exec -u 0 {shlex.quote(container)} mkdir -p {shlex.quote(posixpath.dirname(destination_path))}"
+            )
+            await sandbox.docker_cp(vm_temp, f"{container}:{destination_path}", remove_source=True)
+        except BaseException:  # a cancelled load leaves nothing on the host either
+            with contextlib.suppress(Exception):  # best effort: the load's own error is the one to report
+                await sandbox.exec_script(f"rm -f {shlex.quote(vm_temp)}")
+            raise
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         from agent_env.a2a_agent import A2AAgent
@@ -302,7 +410,7 @@ class LoadArtifactTaskStep(TaskStep):
 
         inputs = self._resolve_inputs(context)
         resolved_artifacts = inputs.artifacts
-        urls = inputs.urls
+        downloads = inputs.downloads
         destination_path = inputs.destination_path
 
         # With container_name it hosts that container; alone it is the target itself.
@@ -355,7 +463,7 @@ class LoadArtifactTaskStep(TaskStep):
                     destination = (destination_path or "/loaded").rstrip("/") or "/"
                     if self.container_name is not None:
                         files = await _load_universe_into_container(
-                            target_sandbox, self.container_name, artifact, destination,
+                            target_sandbox, target_sandbox.scoped_name(self.container_name), artifact, destination,
                         )
                     elif onto_vm_host:
                         files = await _load_universe_onto_vm(target_sandbox, artifact, destination)
@@ -426,7 +534,7 @@ class LoadArtifactTaskStep(TaskStep):
                     if self.sandbox_name is not None:
                         sandbox = target_sandbox
                         # None targets the VM host itself, or a container sandbox directly.
-                        container = self.container_name
+                        container = sandbox.scoped_name(self.container_name) if self.container_name else None
                         if container is None and not onto_vm_host and isinstance(sandbox, VmSandbox):
                             container = sandbox.container_name
                     else:
@@ -490,7 +598,8 @@ class LoadArtifactTaskStep(TaskStep):
                 if agent is None or not agent.instance_id:
                     raise RuntimeError(f"Agent '{self.agent_name}' not found in context.deployed_agents (or missing instance_id)")
                 deployed_agent = get_a2a_agent_instance_store().get(agent.instance_id)
-                gateway_url = require_gateway_url(deployed, "Installing a CliArtifact")
+                gateway_url = reachable_url(require_gateway_url(deployed, "Installing a CliArtifact"),
+                                            from_sandbox_type=deployed.sandbox_type, to_sandbox_type=agent.sandbox_type)
                 install_path = await A2AAgent.install_cli(deployed_agent, artifact, gateway_url)
                 agent_clis = context.metadata.setdefault("installed_clis", {}).setdefault(self.agent_name, {})
                 agent_clis[artifact.id] = {
@@ -500,7 +609,7 @@ class LoadArtifactTaskStep(TaskStep):
             else:
                 raise ValueError(f"Unsupported artifact type for loading: '{artifact.type}'")
 
-        if urls:
+        if downloads:
             if self.sandbox_name is not None:
                 sandbox = target_sandbox
             else:
@@ -514,38 +623,33 @@ class LoadArtifactTaskStep(TaskStep):
                 )
                 sandbox = await provider.get_sandbox(agent.sandbox_id)
             destination = (destination_path or "/tmp/file_artifacts").rstrip("/") or "/"
-
-            files: list[str] = []
-            seen: dict[str, int] = {}
-            for url in urls:
-                base = unquote(os.path.basename(urlparse(url).path)) or "downloaded"
-                count = seen.get(base, 0)
-                seen[base] = count + 1
-                if count == 0:
-                    files.append(base)
-                else:
-                    stem, ext = os.path.splitext(base)
-                    files.append(f"{stem}-{count}{ext}")
-
             semaphore = asyncio.Semaphore(8)
+
+            if onto_vm_host:
+                target_desc = f"VM sandbox '{self.sandbox_name}'"
+            elif self.container_name is not None:
+                target_desc = f"container '{self.container_name}'"
+            else:
+                target_desc = "agent"
 
             async def _load_one(url: str, filename: str) -> None:
                 async with semaphore:
                     dest = f"{destination}/{filename}"
                     if onto_vm_host:
                         await self._load_url_onto_vm(sandbox, url, dest)
+                    elif self.container_name is not None:
+                        await self._load_url_into_container(sandbox, sandbox.scoped_name(self.container_name), url, dest)
                     else:
                         await sandbox.write_file_from_url(url, dest)
-                    target_desc = f"VM sandbox '{self.sandbox_name}'" if onto_vm_host else "agent"
                     logger.info(f"Loaded URL into {target_desc}: {url} -> {dest}")
 
-            await asyncio.gather(*(_load_one(u, f) for u, f in zip(urls, files)))
+            await asyncio.gather(*(_load_one(u, f) for u, f in downloads))
             context.metadata.setdefault("loaded_urls", []).append({
                 "step_id": self.id,
                 "agent_name": None if self.sandbox_name is not None else self.agent_name,
                 "sandbox_name": self.sandbox_name,
                 "destination_path": destination,
-                "files": files,
+                "files": [filename for _, filename in downloads],
             })
 
         return context
