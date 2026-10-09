@@ -2,9 +2,9 @@
 
 Deterministic: it echoes the prompt and records the echo in the framework's trajectory log, which a
 reader can follow while the turn runs; a ``live-steps <n>`` in its prompt has it first append ``n`` step
-events, a second apart. Agent-config, mcp-config, trajectory and triggers come from the agentenv-protocol
-framework. ``model_params`` is a write-only config field so the agent-config negotiation and its
-redaction on read-back can be observed.
+events (at most ``MAX_LIVE_STEPS``), a second apart. Agent-config, mcp-config, trajectory and triggers
+come from the agentenv-protocol framework. ``model_params`` is a write-only config field so the
+agent-config negotiation and its redaction on read-back can be observed.
 
 It also moves files both ways. After the echo it adds a ``read <name> over <scheme>: <text>`` line for
 each file part it is sent, fetching only inline bytes and HTTP(S) URLs (``could not read ...`` otherwise),
@@ -38,6 +38,8 @@ from agentenv_protocol.a2a_agent import (
 SEND_FILE = "send-file "
 LIVE_STEPS = re.compile(r"live-steps (\d+)")
 LIVE_STEP_SECONDS = 1
+# Bounds how long a prompt can hold up a turn.
+MAX_LIVE_STEPS = 10
 TRAJECTORY_FORMAT = "agentenv-echo-agent/v1"
 READ_TIMEOUT_SECONDS = 120
 
@@ -79,7 +81,7 @@ class EchoAgent(AgentEnvAgent):
         request.trajectory.set_format(TRAJECTORY_FORMAT)
         prompt = "\n".join(part.text for part in request.parts if isinstance(part, TextPart))
         if steps := LIVE_STEPS.search(prompt):
-            for step in range(int(steps.group(1))):
+            for step in range(min(int(steps.group(1)), MAX_LIVE_STEPS)):
                 request.trajectory.append({"type": "step", "step": step})
                 await asyncio.sleep(LIVE_STEP_SECONDS)
         reply = f"Echo: {prompt}"
