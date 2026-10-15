@@ -172,6 +172,7 @@ class DeployAgentTaskStep(TaskStep):
         litellm_base_url: Optional[str] = None,
         sandbox_type: Optional[str] = None,
         ttl_seconds: Optional[int] = None,
+        idle_timeout_seconds: Optional[int] = None,
         cpu: Optional[float] = None,
         memory_mb: Optional[int] = None,
         agent_snapshot_files_artifact_id: Optional[str] = None,
@@ -202,6 +203,7 @@ class DeployAgentTaskStep(TaskStep):
         self.litellm_base_url = litellm_base_url
         self.sandbox_type = sandbox_type
         self.ttl_seconds = ttl_seconds
+        self.idle_timeout_seconds = idle_timeout_seconds
         self.cpu = cpu
         self.memory_mb = memory_mb
         self.agent_snapshot_files_artifact_id = agent_snapshot_files_artifact_id
@@ -239,6 +241,7 @@ class DeployAgentTaskStep(TaskStep):
         base["litellm_base_url"] = self.litellm_base_url
         base["sandbox_type"] = self.sandbox_type
         base["ttl_seconds"] = self.ttl_seconds
+        base["idle_timeout_seconds"] = self.idle_timeout_seconds
         base["cpu"] = self.cpu
         base["memory_mb"] = self.memory_mb
         base["agent_snapshot_files_artifact_id"] = self.agent_snapshot_files_artifact_id
@@ -271,6 +274,7 @@ class DeployAgentTaskStep(TaskStep):
             litellm_base_url=data.get("litellm_base_url"),
             sandbox_type=data.get("sandbox_type"),
             ttl_seconds=data.get("ttl_seconds"),
+            idle_timeout_seconds=data.get("idle_timeout_seconds"),
             cpu=data.get("cpu"),
             memory_mb=data.get("memory_mb"),
             agent_snapshot_files_artifact_id=data.get("agent_snapshot_files_artifact_id"),
@@ -341,6 +345,8 @@ class DeployAgentTaskStep(TaskStep):
                 build_sandbox_provider(ds.sandbox_type) if ds.sandbox_type else get_sandbox_provider()
             )
             linked_sandbox = await provider.get_sandbox(ds.sandbox_id)
+            # A reconnect can't tell its idle timeout; the record of its deploy can.
+            linked_sandbox.idle_timeout = ds.idle_timeout_seconds
             logger.info(
                 f"Linking agent '{self.agent_name}' to pre-existing sandbox "
                 f"'{self.sandbox_name}' (sandbox_id={ds.sandbox_id}, type={ds.sandbox_type})"
@@ -371,6 +377,10 @@ class DeployAgentTaskStep(TaskStep):
             deploy_kwargs["sandbox_type"] = resolved_sandbox_type
         resolved_ttl = self._resolved_ttl_seconds(context)
         deploy_kwargs["ttl_seconds"] = resolved_ttl
+        _idle_override = user_overrides.get("idle_timeout_seconds")
+        resolved_idle = _idle_override if _idle_override is not None else self.idle_timeout_seconds
+        if resolved_idle is not None:
+            deploy_kwargs["idle_timeout_seconds"] = resolved_idle
         if self.cpu is not None:
             deploy_kwargs["cpu"] = self.cpu
         if self.memory_mb is not None:
@@ -385,6 +395,8 @@ class DeployAgentTaskStep(TaskStep):
         if linked_sandbox is not None:
             deploy_kwargs["sandbox"] = linked_sandbox
         deployed = await agent.deploy(**deploy_kwargs)
+        if resolved_idle is not None:
+            logger.info(f"Agent '{self.agent_name}' idle_timeout requested={resolved_idle} applied={deployed.idle_timeout_seconds}")
         deployed_agents.append(agent)
         a2a_url = deployed.a2a_url
         card = deployed.agent_card
@@ -493,6 +505,7 @@ class DeployAgentTaskStep(TaskStep):
             instance_id=deployed.instance_id,
             role=self.role,
             network_policy=deployed.network_policy,
+            idle_timeout_seconds=deployed.idle_timeout_seconds,
         ))
         return context
 

@@ -233,11 +233,15 @@ def as_builtin(provider: Optional[EnvironmentProvider]) -> Optional[_SandboxEnvi
 
 def provider_options(env: Env, provider: EnvironmentProvider, **options) -> dict:
     """The options provider takes: every one for a deploy(**options), else those it names, one it doesn't being dropped at deploy()'s
-    default; raises for a deploy refused (see ``deploy_refusal``)."""
+    default, and an idle timeout it doesn't take with a warning; raises for a deploy refused (see ``deploy_refusal``)."""
+    taken = inspect.signature(provider.deploy).parameters
+    takes_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in taken.values())
+    if not takes_any and "idle_timeout_seconds" not in taken and options.pop("idle_timeout_seconds", None) is not None:
+        logger.warning(f"env '{env.id}' has env_provider_type '{env.env_provider_type}', which doesn't take "
+                       "idle_timeout_seconds; it deploys without")
     if refusal := deploy_refusal(env, provider, options):
         raise ValueError(refusal)
-    taken = inspect.signature(provider.deploy).parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in taken.values()):
+    if takes_any:
         return options
     return {name: value for name, value in options.items() if name in taken}
 
