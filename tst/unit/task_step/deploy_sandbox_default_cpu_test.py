@@ -18,8 +18,10 @@ def _provider(default_cpu: float):
     sandbox = AsyncMock()
     sandbox.sandbox_id, sandbox.mode, sandbox.type = "sb-1", "vm", "vm"
     sandbox.tunnel_urls, sandbox.vnc_url, sandbox.network_policy = {}, None, NetworkPolicy()
-    provider = AsyncMock(DEPLOY_SANDBOX_CPU=default_cpu)
+    provider = AsyncMock(DEPLOY_SANDBOX_CPU=default_cpu, ON_THIS_MACHINE=False)
+    provider.links = (provider,)
     provider.create_vm.return_value = sandbox
+    provider.create_container.return_value = sandbox
     return provider
 
 
@@ -49,17 +51,21 @@ def test_a_stored_cpu_is_kept():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode, create, extra", [
+    ("vm", "create_vm", {}),
+    ("container", "create_container", {"image": "example.com/box:v1", "port": 80}),
+], ids=["vm", "container"])
 @pytest.mark.parametrize("step_cpu, default_cpu, requested", [
     (None, 1.0, 1.0),
     (None, 2.0, 2.0),
     (4.0, 1.0, 4.0),
 ], ids=["unsized-on-modal", "unsized-elsewhere", "sized"])
-async def test_the_provider_is_asked_for_the_resolved_cpu(step_cpu, default_cpu, requested):
-    step = DeploySandboxTaskStep(id="s", version=1, sandbox_name="box", sandbox_mode="vm", sandbox_type="any",
-                                 cpu=step_cpu)
+async def test_the_provider_is_asked_for_the_resolved_cpu(mode, create, extra, step_cpu, default_cpu, requested):
+    step = DeploySandboxTaskStep(id="s", version=1, sandbox_name="box", sandbox_mode=mode, sandbox_type="any",
+                                 cpu=step_cpu, **extra)
     provider = _provider(default_cpu)
 
     with patch("agent_env.providers.sandbox_providers.sandbox_provider.build_sandbox_provider", return_value=provider):
         await step.execute(TaskStepContext())
 
-    assert provider.create_vm.call_args.kwargs["cpu"] == requested
+    assert getattr(provider, create).call_args.kwargs["cpu"] == requested
