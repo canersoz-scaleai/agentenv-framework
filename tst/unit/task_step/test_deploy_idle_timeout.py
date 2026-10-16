@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_env.a2a_agent.a2a_agent import DEFAULT_A2A_PORT, A2AAgent, DeployedA2AAgent
+from agent_env.a2a_agent.a2a_agent import A2AAgent, DeployedA2AAgent
 from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.env.env import DeployedGatewayEnv
 from agent_env.env.envs._deployment import provider_options
@@ -146,22 +146,6 @@ def test_an_agents_recorded_idle_timeout_survives_its_stored_record():
     deployed = DeployedA2AAgent(agent_id="a", agent_version=1, a2a_url="https://agent.example", sandbox_id="sb",
                                 agent_card={}, idle_timeout_seconds=900)
     assert DeployedA2AAgent.from_dict(dataclasses.asdict(deployed)).idle_timeout_seconds == 900
-
-
-@pytest.mark.asyncio
-async def test_an_agent_on_a_linked_sandbox_records_the_idle_timeout_that_sandbox_was_deployed_with():
-    linked = MagicMock(idle_timeout=None)
-    provider = MagicMock(get_sandbox=AsyncMock(return_value=linked))
-    agent = MagicMock(metadata={})
-    agent.deploy = AsyncMock(side_effect=_Stop)
-    context = TaskStepContext(deployed_sandboxes=[DeployedSandbox(
-        sandbox_name="sbx", sandbox_id="s1", sandbox_mode="vm", tunnel_urls={str(DEFAULT_A2A_PORT): "https://sbx.example"},
-        idle_timeout_seconds=900)])
-    with patch.object(A2AAgent, "get", return_value=agent), \
-         patch("agent_env.providers.sandbox_providers.sandbox_provider.get_sandbox_provider", return_value=provider), \
-         pytest.raises(_Stop):
-        await DeployAgentTaskStep(id="ag", version=None, a2a_agent_id="a", sandbox_name="sbx").execute(context)
-    assert agent.deploy.await_args.kwargs["sandbox"].idle_timeout == 900
 
 
 @pytest.mark.asyncio

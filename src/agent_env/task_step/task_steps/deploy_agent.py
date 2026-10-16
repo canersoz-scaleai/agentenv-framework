@@ -345,8 +345,6 @@ class DeployAgentTaskStep(TaskStep):
                 build_sandbox_provider(ds.sandbox_type) if ds.sandbox_type else get_sandbox_provider()
             )
             linked_sandbox = await provider.get_sandbox(ds.sandbox_id)
-            # A reconnect can't tell its idle timeout; the record of its deploy can.
-            linked_sandbox.idle_timeout = ds.idle_timeout_seconds
             logger.info(
                 f"Linking agent '{self.agent_name}' to pre-existing sandbox "
                 f"'{self.sandbox_name}' (sandbox_id={ds.sandbox_id}, type={ds.sandbox_type})"
