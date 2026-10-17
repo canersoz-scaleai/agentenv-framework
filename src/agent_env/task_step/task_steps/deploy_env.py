@@ -31,7 +31,6 @@ class DeployEnvTaskStep(TaskStep):
         env_id: str,
         env_version: Optional[int] = None,
         ttl_seconds: int = TaskStep.DEFAULT_TTL_SECONDS,
-        idle_timeout_seconds: Optional[int] = None,
         disk_size_gb: float = 10,
         gateway_mode: str = GatewayMode.PERFORMANCE.value,
         cpu: Optional[float] = None,
@@ -44,6 +43,7 @@ class DeployEnvTaskStep(TaskStep):
         metadata: Optional[dict] = None,
         artifact_id: Optional[str] = None,
         artifact_version: Optional[int] = None,
+        idle_timeout_seconds: Optional[int] = None,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         self.env_id = env_id

@@ -230,3 +230,14 @@ def _env() -> MCPServerEnv:
 def test_a_provider_that_names_its_options_and_not_the_idle_timeout_is_refused_it():
     with pytest.raises(ValueError, match=r"doesn't take idle_timeout_seconds; name it in the provider's deploy\(\)"):
         provider_options(_env(), _NamedOptionsProvider(), ttl_seconds=60, idle_timeout_seconds=900)
+
+
+@pytest.mark.parametrize("make, attr, value", [
+    (lambda: DeployEnvTaskStep("d", None, "art-1", 2, 3600, 20), "disk_size_gb", 20),
+    (lambda: DeployAgentTaskStep("a", None, *([None] * 12), 3600, 2.0), "cpu", 2.0),
+    (lambda: DeploySandboxTaskStep("s", None, "sbx", "vm", None, 1.0, 2048, 10, 3600, [8000]), "exposed_ports", [8000]),
+    (lambda: DeployedAgent("a", "https://agent.example", None, None, None, None, None, None, None, True), "on_host", True),
+], ids=["deploy_env", "deploy_agent", "deploy_sandbox", "deployed_agent"])
+def test_the_idle_timeout_is_appended_so_a_positional_caller_keeps_its_meaning(make, attr, value):
+    made = make()
+    assert (getattr(made, attr), made.idle_timeout_seconds) == (value, None)

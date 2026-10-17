@@ -64,9 +64,9 @@ class DeployedAgent:
     instance_id: str | None = None
     role: str | None = None
     network_policy: dict | None = None
-    idle_timeout_seconds: int | None = None
     # Installed straight onto the sandbox host (install_agent host mode), not into a container.
     on_host: bool = False
+    idle_timeout_seconds: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> DeployedAgent:

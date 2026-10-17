@@ -36,7 +36,6 @@ class DeploySandboxTaskStep(TaskStep):
         memory_mb: int = 8192,
         disk_size_gb: float = 10,
         ttl_seconds: int = TaskStep.DEFAULT_TTL_SECONDS,
-        idle_timeout_seconds: Optional[int] = None,
         exposed_ports: Optional[list[int]] = None,
         boot_mode: Optional[str] = None,
         port: Optional[int] = None,
@@ -46,6 +45,7 @@ class DeploySandboxTaskStep(TaskStep):
         depends_on: Optional[list[TaskStepDependency]] = None,
         fail_task_on_error: bool = True,
         metadata: Optional[dict] = None,
+        idle_timeout_seconds: Optional[int] = None,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         if sandbox_mode not in _SUPPORTED_MODES:

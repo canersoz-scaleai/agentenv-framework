@@ -172,7 +172,6 @@ class DeployAgentTaskStep(TaskStep):
         litellm_base_url: Optional[str] = None,
         sandbox_type: Optional[str] = None,
         ttl_seconds: Optional[int] = None,
-        idle_timeout_seconds: Optional[int] = None,
         cpu: Optional[float] = None,
         memory_mb: Optional[int] = None,
         agent_snapshot_files_artifact_id: Optional[str] = None,
@@ -188,6 +187,7 @@ class DeployAgentTaskStep(TaskStep):
         fail_task_on_error: bool = True,
         metadata: Optional[dict] = None,
         agent_changelog_object_url: Optional[str] = None,
+        idle_timeout_seconds: Optional[int] = None,
     ):
         super().__init__(id, version, depends_on=depends_on, fail_task_on_error=fail_task_on_error)
         self.env_ids = env_ids or []
