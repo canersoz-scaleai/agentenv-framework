@@ -1,6 +1,6 @@
 """Idle timeout resolution: the run's ``user_overrides['idle_timeout_seconds']`` wins over the step's own value, else
-falls back to it, and an unset one is never passed on, so every sandbox keeps today's no-idle-limit default. An env or env
-provider that doesn't take one deploys without, with a warning, rather than being refused."""
+falls back to it, and an unset one is never passed on, so every sandbox keeps today's no-idle-limit default. An env that
+doesn't take one deploys without, with a warning; an env provider is held to the usual rule for the options it names."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from agent_env.artifact.artifacts.docker_image import DockerImageArtifact
 from agent_env.env.env import DeployedGatewayEnv
 from agent_env.env.envs._deployment import provider_options
 from agent_env.env.envs.mcp_server import MCPServerEnv
-from agent_env.env.gateway import GatewayMode
 from agent_env.providers.env_providers.env_provider import EnvironmentProvider
 from agent_env.providers.sandbox_providers.sandbox_provider import Accepts
 from agent_env.task_step.context import DeployedAgent, DeployedSandbox, TaskStepContext
@@ -228,13 +227,6 @@ def _env() -> MCPServerEnv:
                         env_provider_type="named_options")
 
 
-def test_a_provider_that_takes_no_idle_timeout_gets_the_rest_and_a_warning(caplog):
-    options = provider_options(_env(), _NamedOptionsProvider(), ttl_seconds=60, idle_timeout_seconds=900, attribution={})
-    assert options == {"ttl_seconds": 60, "attribution": {}}
-    assert "which doesn't take idle_timeout_seconds; it deploys without" in caplog.text
-
-
-def test_a_provider_that_takes_no_idle_timeout_is_still_refused_what_it_must_take():
-    with pytest.raises(ValueError, match=r"doesn't take gateway_mode;"):
-        provider_options(_env(), _NamedOptionsProvider(), ttl_seconds=60, idle_timeout_seconds=900,
-                         gateway_mode=GatewayMode.CONSISTENT)
+def test_a_provider_that_names_its_options_and_not_the_idle_timeout_is_refused_it():
+    with pytest.raises(ValueError, match=r"doesn't take idle_timeout_seconds; name it in the provider's deploy\(\)"):
+        provider_options(_env(), _NamedOptionsProvider(), ttl_seconds=60, idle_timeout_seconds=900)
