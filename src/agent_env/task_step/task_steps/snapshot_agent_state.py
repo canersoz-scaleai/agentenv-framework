@@ -6,10 +6,12 @@ import json
 import logging
 from typing import ClassVar, Optional
 
+from agent_env.store.ids import derive_id, is_local_id, validate_local_id
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity.refs import EntityRef, RefRole
 from agent_env.task_step.task_step import TaskStep, TaskStepDependency
 from agent_env.task_step.snapshot_utils import agent_state_capture
+from agent_env.task_step.snapshot_utils.snapshot_series import rollout_base
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,10 @@ class SnapshotAgentStateTaskStep(TaskStep):
     ``put_existing`` (no download/re-upload). Appends an entry recording
     ``{id, version, bundle_object_url, source_agent_name, source_context_id}`` to
     ``context.metadata['agent_snapshots']`` (a list of such entries).
+
+    Without an ``artifact_id`` the artifact is per run, derived from the instance id
+    (``<instance_id>__<step id>``), so concurrent runs of one task never version each
+    other's snapshot and a retry of one instance reuses its id.
 
     When ``env_id`` is set, the step ALSO reads each MCP service's current
     state from the deployed env (its ``data/get`` JSON, else its
@@ -49,7 +55,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
         self,
         id: str,
         version: Optional[int],
-        artifact_id: str,
+        artifact_id: Optional[str],
         prompt_id: str,
         agent_name: Optional[str] = None,
         env_id: Optional[str] = None,
@@ -84,13 +90,21 @@ class SnapshotAgentStateTaskStep(TaskStep):
     def from_dict(cls, data: dict) -> SnapshotAgentStateTaskStep:
         return cls(
             **cls._base_from_dict(data),
-            artifact_id=data["artifact_id"],
+            artifact_id=data.get("artifact_id"),
             prompt_id=data["prompt_id"],
             agent_name=data.get("agent_name"),
             env_id=data.get("env_id"),
             universe_artifact_id=data.get("universe_artifact_id"),
             timeout_seconds=data.get("timeout_seconds", cls.DEFAULT_TIMEOUT_SECONDS),
         )
+
+    def resolve_artifact_id(self, context: TaskStepContext) -> str:
+        if self.artifact_id:
+            return self.artifact_id
+        artifact_id = derive_id(rollout_base(self.id, context.instance_id), self.id)
+        if is_local_id(artifact_id):
+            validate_local_id(artifact_id)
+        return artifact_id
 
     async def execute(self, context: TaskStepContext) -> TaskStepContext:
         deployed = next((a for a in context.deployed_agents if a.agent_name == self.agent_name), None)
@@ -115,7 +129,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
             a2a_card=deployed.a2a_card or {},
             agent_name=self.agent_name,
             a2a_context_id=a2a_context_id,
-            artifact_id=self.artifact_id,
+            artifact_id=self.resolve_artifact_id(context),
             timeout_seconds=self.timeout_seconds,
             sandbox_type=deployed.sandbox_type,
         )
