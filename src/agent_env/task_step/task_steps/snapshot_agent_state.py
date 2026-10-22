@@ -25,7 +25,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
     agent's ``/ext/snapshot`` extension to write the conversation transcript to
     the object store, then wraps that prefix as a ``FileArtifactUniverse`` via
     ``put_existing`` (no download/re-upload). Appends an entry recording
-    ``{id, version, bundle_object_url, source_agent_name, source_context_id}`` to
+    ``{id, version, bundle_object_url, source_agent_name, source_context_id, capture_step_id}`` to
     ``context.metadata['agent_snapshots']`` (a list of such entries).
 
     Without an ``artifact_id`` the artifact is per run, derived from the instance id
@@ -98,7 +98,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
             timeout_seconds=data.get("timeout_seconds", cls.DEFAULT_TIMEOUT_SECONDS),
         )
 
-    def resolve_artifact_id(self, context: TaskStepContext) -> str:
+    def _resolve_artifact_id(self, context: TaskStepContext) -> str:
         if self.artifact_id:
             return self.artifact_id
         artifact_id = derive_id(rollout_base(self.id, context.instance_id), self.id)
@@ -129,7 +129,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
             a2a_card=deployed.a2a_card or {},
             agent_name=self.agent_name,
             a2a_context_id=a2a_context_id,
-            artifact_id=self.resolve_artifact_id(context),
+            artifact_id=self._resolve_artifact_id(context),
             timeout_seconds=self.timeout_seconds,
             sandbox_type=deployed.sandbox_type,
         )
@@ -141,6 +141,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
             "bundle_object_url": workspace.bundle_object_url,
             "source_agent_name": self.agent_name,
             "source_context_id": a2a_context_id,
+            "capture_step_id": self.id,
         })
 
         # Per-MCP-service state dump. Only runs when env_id +

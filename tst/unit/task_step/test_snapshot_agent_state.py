@@ -4,6 +4,7 @@ stored env card."""
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -302,6 +303,7 @@ async def test_without_an_artifact_id_each_run_snapshots_into_its_own_artifact(c
 
     assert captured_into == ["inst-a__t-agent-snapshot", "inst-a__t-agent-snapshot", "inst-b__t-agent-snapshot"]
     assert first.metadata["agent_snapshots"][0]["id"] == "inst-a__t-agent-snapshot"
+    assert first.metadata["agent_snapshots"][0]["capture_step_id"] == "t-agent-snapshot"
     assert other.metadata["agent_snapshots"][0]["id"] == "inst-b__t-agent-snapshot"
     assert step.artifact_id is None
 
@@ -316,7 +318,11 @@ async def test_an_explicit_artifact_id_is_used_for_every_run(captured_into):
 
 
 def test_a_local_instance_derives_a_local_artifact_id():
-    assert _per_run_step().resolve_artifact_id(_run_ctx("@local/runs/r1")) == "@local/runs/r1__t-agent-snapshot"
+    assert _per_run_step()._resolve_artifact_id(_run_ctx("@local/runs/r1")) == "@local/runs/r1__t-agent-snapshot"
+
+
+def test_without_an_instance_id_the_artifact_id_is_adhoc():
+    assert re.fullmatch(r"adhoc-[0-9a-f]{12}__t-agent-snapshot", _per_run_step()._resolve_artifact_id(_run_ctx(None)))
 
 
 @pytest.mark.parametrize("artifact_id", [None, "shared-snapshot"])
