@@ -334,6 +334,12 @@ async def test_a_per_run_capture_skips_an_agent_without_the_snapshot_extension(c
 
 
 @pytest.mark.asyncio
+async def test_a_per_run_capture_still_fails_on_an_agent_recorded_without_a_card():
+    with pytest.raises(RuntimeError, match="does not advertise the snapshot extension"):
+        await _per_run_step().execute(_run_ctx("inst-a", a2a_card=None))
+
+
+@pytest.mark.asyncio
 async def test_an_explicit_artifact_id_still_fails_on_an_agent_without_the_snapshot_extension():
     ctx = _run_ctx("inst-a", a2a_card=None)
     with pytest.raises(RuntimeError, match="does not advertise the snapshot extension"):
