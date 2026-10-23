@@ -1,12 +1,12 @@
-"""The images agent-env publishes, its infra images and the Claude Code agent's (``agent_env.env.published_images``), for
+"""The images agent-env publishes, its infra images and the shipped agents' (``agent_env.env.published_images``), for
 the release workflow's jobs that only read: this imports agent-env, so it runs where agent-env and its dependencies are
 installed, and no job that holds a token to push images or publish to PyPI runs it (those run ``infra_build.py``).
 
 ``plan`` prints each image's name, repository, tag, Dockerfile and context as JSON, ``--missing`` only those the
 registry hasn't published: it has no image under the tag, or refuses to show one, as GHCR does for a package that
 doesn't exist yet, so the first publish can start. ``--only infra`` lists only the infra images, and ``--only agents``
-only the agents' images, which install the agentenv-framework-protocol a release ships with, so a release builds them
-after it publishes the protocol. ``write PATH`` records the digest the registry serves under every
+only the agents' images, which a release builds after it publishes the protocol, as an agent's protocol floor may name
+it. ``write PATH`` records the digest the registry serves under every
 image's tag as a release wheel carries them, and fails if any is missing. ``public`` warns about each image a user, who
 pulls anonymously, can't. The registry is read with ``GHCR_TOKEN`` (as ``GITHUB_ACTOR``) when it's set, anonymously
 otherwise, and always anonymously by ``public``.

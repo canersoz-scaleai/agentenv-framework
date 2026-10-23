@@ -143,7 +143,9 @@ and `load`, restoring them into `target_context_id`. `load` runs on a fresh agen
 startup. The optional changelog uploads one increment per tool call and replays them in order.
 
 Reference: `ClaudeCodeAgent.save_snapshot` / `load_snapshot`. Changelog: `agents/pi/pi_agent.py`
-`enable_changelog` / `apply_changelog`, and `agents/pi/changelog.py`.
+`enable_changelog` / `apply_changelog`, and `agents/pi/changelog.py`, which captures in the agent's process; for a
+CLI that runs its tools itself, `ClaudeCodeChangelogAgent` and `agents/claude-code/tar_changelog.py`, which capture from
+the CLI's post-tool hook, and only where the host has GNU tar.
 
 ### `peer-agents/v1`, `/ext/peer-agents`
 
@@ -166,10 +168,10 @@ Reference: `enable(TRIGGERS_V1, ...)`. Overriding `decide` to change the decisio
 ### `attribution-probe/v1`, `/ext/attribution-probe`
 
 The agent reports the attribution it last sent with a model request. You implement `probe`, which also declares the
-extension. Neither shipped agent does.
+extension.
 
-Reference: `test_attribution_probe_reports_what_the_agent_last_sent` in
-`packages/agentenv-protocol/tests/test_a2a_agent.py`.
+Reference: `agents/codex/a2a_server.py` `probe_attribution`, and
+`test_attribution_probe_reports_what_the_agent_last_sent` in `packages/agentenv-protocol/tests/test_a2a_agent.py`.
 
 ### `install/v1` (no endpoint)
 

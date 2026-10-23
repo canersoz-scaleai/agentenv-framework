@@ -147,6 +147,14 @@ Out-of-tree code plugs in either through `config.toml`, as a `module:Class` poin
   installed bundle's env, agent or artifact by its id, or as the configured default agent: the planner
   pulls it into the run as one of the bundle's own (`bundle/plan.py`), and its ledger row is keyed by the
   installed bundle, so every bundle shares one write of it. Such an id takes no version pin.
+- A bundle can give its agents aliases in an `aliases.toml` at its root (`[agents] <folder> = ["<alias>", ...]`, read
+  by `plugins/_bundles.py`): the shipped `agents` bundle names Claude Code `claude-code`. A reference to an alias
+  names the agent its bundle gives it unless the run's bundle has an entity of that name or the store an agent of that
+  id, which wins. The planner pulls the agent in and writes the task naming it by its id (`Plan.aliases`); a step run
+  outside a bundle run gets it from `A2AAgent.get`, which reads the store first and an alias after (the planner reads
+  the store itself, as `STORE_GETTERS` does). agent-env's own bundles' aliases are theirs, and an alias two other
+  bundles give is refused, naming both. `agent-env a2a-agent list` lists the installed agents with their aliases, then
+  the store's; `a2a-agent get` prints the agent an alias names.
 - Environment providers have no table: an installed package registers one as an `agent_env.env_providers`
   entry point named its `type`, which records carry as `env_provider_type`.
 - `[plugins.<distribution name>]` is reserved for an installed plugin's own settings, read with
@@ -269,17 +277,18 @@ that the runs left no sandbox work folder, and that each published infra image's
 installed sources as from the checkout.
 `.github/workflows/publish-pypi.yml` runs on the `v*` tag the release automation pushes: it waits
 for `main`'s CI to pass on the tagged commit, publishes `agentenv-framework-protocol` and then
-`agentenv-framework` to PyPI, pinning the protocol in `pyproject.toml` and in each shipped env's and agent's
-`requirements.txt` (`.github/scripts/shipped_bundles.py pin` finds them, so a new agent is pinned with no workflow change,
+`agentenv-framework` to PyPI, pinning the protocol in `pyproject.toml` and in each shipped env's and artifact's
+`requirements.txt` (`.github/scripts/shipped_bundles.py pin` finds them, so a new env is pinned with no workflow change,
 and every job that reads those folders runs it first, so an image's tag, its build and the wheel see the same sources),
 and creates the GitHub release, whose notes are the titles of the pull
 requests merged since the previous release.
 Once the repository variable `PUBLISH_INFRA_IMAGES` is `true`, it also publishes the infra images agent-env
-ships and the Claude Code agent's (`agent_env.env.published_images`) whose `src-<hex>` tags GHCR lacks: after `main`'s CI passes, each is
+ships and the shipped agents', one per agent folder (`agent_env.env.published_images`), whose `src-<hex>` tags GHCR lacks: after `main`'s CI passes, each is
 built on a runner of each platform, checked, and tagged as one multi-platform image, and a tag that exists is
 never moved. The infra images are published before the protocol, and a failed infra image job sends neither package
-to PyPI. The agent's image installs the protocol the release pins, so each release builds it again once the protocol is
-on PyPI, and a failed agent image job keeps `agentenv-framework` off it. The wheel and the release notes record each
+to PyPI. An agent's `requirements.txt` keeps its protocol floor, unpinned, so its image is built again only when its
+folder changes (raise the floor when the agent needs a newer protocol), once the protocol is on PyPI, and a failed agent
+image job keeps `agentenv-framework` off it. The wheel and the release notes record each
 image's digest. Run by hand on `main`, the workflow publishes the images alone.
 Its jobs that run agent-env (`.github/scripts/infra_images.py`) hold no token that writes; the jobs that push
 images or publish to PyPI install nothing and check what they're handed (`.github/scripts/infra_build.py`,
