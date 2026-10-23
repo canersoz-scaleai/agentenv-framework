@@ -6,6 +6,7 @@ import json
 import logging
 from typing import ClassVar, Optional
 
+from agent_env.a2a_agent import A2AAgent
 from agent_env.store.ids import derive_id, is_local_id, validate_local_id
 from agent_env.task_step.context import TaskStepContext
 from agent_env.entity.refs import EntityRef, RefRole
@@ -30,7 +31,9 @@ class SnapshotAgentStateTaskStep(TaskStep):
 
     Without an ``artifact_id`` the artifact is per run, derived from the instance id
     (``<instance_id>__<step id>``), so concurrent runs of one task never version each
-    other's snapshot and a retry of one instance reuses its id.
+    other's snapshot and a retry of one instance reuses its id. In that mode an agent
+    that does not advertise the snapshot extension is skipped, recording no entry,
+    rather than failing the step; with an explicit ``artifact_id`` it still raises.
 
     When ``env_id`` is set, the step ALSO reads each MCP service's current
     state from the deployed env (its ``data/get`` JSON, else its
@@ -113,6 +116,12 @@ class SnapshotAgentStateTaskStep(TaskStep):
         a2a_url = deployed.a2a_url or deployed.api_url
         if not a2a_url:
             raise RuntimeError(f"Deployed agent '{self.agent_name}' has no a2a_url")
+        if not self.artifact_id and not A2AAgent.find_extension(deployed.a2a_card or {}, A2AAgent.EXT_SNAPSHOT):
+            logger.warning(
+                "snapshot_agent_state %s: agent '%s' does not advertise the snapshot extension; "
+                "skipping the per-run capture", self.id, self.agent_name,
+            )
+            return context
 
         prompt = next((p for p in context.prompt_responses if p.prompt_id == self.prompt_id), None)
         if prompt is None:

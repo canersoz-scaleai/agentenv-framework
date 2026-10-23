@@ -4,12 +4,14 @@ stored env card."""
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 import pytest
 
 import agent_env.artifact as artifact_mod
 import agent_env.config as config_mod
+from agent_env.a2a_agent import A2AAgent
 from agent_env.env import legacy_protocol
 from agent_env.env.env import DeployedGatewayEnv
 from agent_env.store import set_object_store
@@ -272,9 +274,12 @@ def _per_run_step(artifact_id=None):
     )
 
 
-def _run_ctx(instance_id):
+_SNAPSHOT_CARD = {"capabilities": {"extensions": [{"uri": A2AAgent.EXT_SNAPSHOT}]}}
+
+
+def _run_ctx(instance_id, a2a_card=_SNAPSHOT_CARD):
     ctx = TaskStepContext(instance_id=instance_id)
-    ctx.deployed_agents = [DeployedAgent(agent_name="agent", api_url="https://agent")]
+    ctx.deployed_agents = [DeployedAgent(agent_name="agent", api_url="https://agent", a2a_card=a2a_card)]
     ctx.prompt_responses = [PromptResponse(prompt_id="main", response="ok", a2a_context_id="ctx-1")]
     return ctx
 
@@ -315,6 +320,24 @@ async def test_an_explicit_artifact_id_is_used_for_every_run(captured_into):
         await step.execute(_run_ctx(instance_id))
 
     assert captured_into == ["shared-snapshot", "shared-snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_a_per_run_capture_skips_an_agent_without_the_snapshot_extension(captured_into, caplog):
+    ctx = _run_ctx("inst-a", a2a_card={"capabilities": {"extensions": []}})
+    with caplog.at_level(logging.WARNING, logger=mod.__name__):
+        assert await _per_run_step().execute(ctx) is ctx
+
+    assert captured_into == []
+    assert "agent_snapshots" not in ctx.metadata
+    assert "does not advertise the snapshot extension" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_artifact_id_still_fails_on_an_agent_without_the_snapshot_extension():
+    ctx = _run_ctx("inst-a", a2a_card=None)
+    with pytest.raises(RuntimeError, match="does not advertise the snapshot extension"):
+        await _per_run_step("shared-snapshot").execute(ctx)
 
 
 def test_a_local_instance_derives_a_local_artifact_id():
