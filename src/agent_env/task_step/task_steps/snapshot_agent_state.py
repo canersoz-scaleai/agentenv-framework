@@ -30,11 +30,12 @@ class SnapshotAgentStateTaskStep(TaskStep):
     ``context.metadata['agent_snapshots']`` (a list of such entries).
 
     Without an ``artifact_id`` the artifact is per run, derived from the instance id
-    (``<instance_id>__<step id>``), so concurrent runs of one task never version each
+    (``<instance_id>__<step id>-agent-state``), so concurrent runs of one task never version each
     other's snapshot and a retry of one instance reuses its id. In that mode an agent
     whose card does not advertise the snapshot extension is skipped, recording no entry,
-    rather than failing the step. With an explicit ``artifact_id``, or an agent recorded
-    without a card, it still raises.
+    rather than failing the step. With an explicit ``artifact_id``, an agent recorded
+    without a card, or a per-service state dump configured (it is written beside the
+    workspace capture, so it cannot run without one), it still raises.
 
     When ``env_id`` is set, the step ALSO reads each MCP service's current
     state from the deployed env (its ``data/get`` JSON, else its
@@ -82,6 +83,8 @@ class SnapshotAgentStateTaskStep(TaskStep):
 
     def to_dict(self) -> dict:
         base = super().to_dict()
+        # Written even when None: an older release then loads the step and fails only it at
+        # run time, where a missing key would make it refuse the whole task.
         base["artifact_id"] = self.artifact_id
         base["prompt_id"] = self.prompt_id
         base["agent_name"] = self.agent_name
@@ -102,10 +105,14 @@ class SnapshotAgentStateTaskStep(TaskStep):
             timeout_seconds=data.get("timeout_seconds", cls.DEFAULT_TIMEOUT_SECONDS),
         )
 
+    @property
+    def _dumps_service_state(self) -> bool:
+        return bool(self.env_id and self.universe_artifact_id)
+
     def _resolve_artifact_id(self, context: TaskStepContext) -> str:
         if self.artifact_id:
             return self.artifact_id
-        artifact_id = derive_id(rollout_base(self.id, context.instance_id), self.id)
+        artifact_id = derive_id(rollout_base(self.id, context.instance_id), f"{self.id}-agent-state")
         if is_local_id(artifact_id):
             validate_local_id(artifact_id)
         return artifact_id
@@ -119,6 +126,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
             raise RuntimeError(f"Deployed agent '{self.agent_name}' has no a2a_url")
         if (
             not self.artifact_id
+            and not self._dumps_service_state
             and deployed.a2a_card is not None
             and not A2AAgent.find_extension(deployed.a2a_card, A2AAgent.EXT_SNAPSHOT)
         ):
@@ -165,7 +173,7 @@ class SnapshotAgentStateTaskStep(TaskStep):
         # JSON-stringified `{service: object_url}` (unsigned object-store references).
         # A downstream verifier re-signs each value and hands the map to its test
         # script, which accepts either a single URL or this map.
-        if self.env_id and self.universe_artifact_id:
+        if self._dumps_service_state:
             await self._capture_universe_state(context, workspace.capture_prefix)
 
         return context

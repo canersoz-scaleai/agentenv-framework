@@ -306,10 +306,10 @@ async def test_without_an_artifact_id_each_run_snapshots_into_its_own_artifact(c
     for ctx in (first, retry, other):
         await step.execute(ctx)
 
-    assert captured_into == ["inst-a__t-agent-snapshot", "inst-a__t-agent-snapshot", "inst-b__t-agent-snapshot"]
-    assert first.metadata["agent_snapshots"][0]["id"] == "inst-a__t-agent-snapshot"
+    assert captured_into == ["inst-a__t-agent-snapshot-agent-state", "inst-a__t-agent-snapshot-agent-state", "inst-b__t-agent-snapshot-agent-state"]
+    assert first.metadata["agent_snapshots"][0]["id"] == "inst-a__t-agent-snapshot-agent-state"
     assert first.metadata["agent_snapshots"][0]["capture_step_id"] == "t-agent-snapshot"
-    assert other.metadata["agent_snapshots"][0]["id"] == "inst-b__t-agent-snapshot"
+    assert other.metadata["agent_snapshots"][0]["id"] == "inst-b__t-agent-snapshot-agent-state"
     assert step.artifact_id is None
 
 
@@ -334,6 +334,16 @@ async def test_a_per_run_capture_skips_an_agent_without_the_snapshot_extension(c
 
 
 @pytest.mark.asyncio
+async def test_a_per_run_capture_with_a_service_state_dump_still_fails_on_an_agent_without_the_extension():
+    step = mod.SnapshotAgentStateTaskStep(
+        id="t-agent-snapshot", version=None, artifact_id=None, prompt_id="main", agent_name="agent",
+        env_id="env-1", universe_artifact_id="uni-1",
+    )
+    with pytest.raises(RuntimeError, match="does not advertise the snapshot extension"):
+        await step.execute(_run_ctx("inst-a", a2a_card={"capabilities": {"extensions": []}}))
+
+
+@pytest.mark.asyncio
 async def test_a_per_run_capture_still_fails_on_an_agent_recorded_without_a_card():
     with pytest.raises(RuntimeError, match="does not advertise the snapshot extension"):
         await _per_run_step().execute(_run_ctx("inst-a", a2a_card=None))
@@ -347,11 +357,11 @@ async def test_an_explicit_artifact_id_still_fails_on_an_agent_without_the_snaps
 
 
 def test_a_local_instance_derives_a_local_artifact_id():
-    assert _per_run_step()._resolve_artifact_id(_run_ctx("@local/runs/r1")) == "@local/runs/r1__t-agent-snapshot"
+    assert _per_run_step()._resolve_artifact_id(_run_ctx("@local/runs/r1")) == "@local/runs/r1__t-agent-snapshot-agent-state"
 
 
 def test_without_an_instance_id_the_artifact_id_is_adhoc():
-    assert re.fullmatch(r"adhoc-[0-9a-f]{12}__t-agent-snapshot", _per_run_step()._resolve_artifact_id(_run_ctx(None)))
+    assert re.fullmatch(r"adhoc-[0-9a-f]{12}__t-agent-snapshot-agent-state", _per_run_step()._resolve_artifact_id(_run_ctx(None)))
 
 
 @pytest.mark.parametrize("artifact_id", [None, "shared-snapshot"])
